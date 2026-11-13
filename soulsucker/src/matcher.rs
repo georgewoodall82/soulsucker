@@ -1,0 +1,603 @@
+//! Local matching of MusicBrainz track titles against Soulseek filenames.
+//!
+//! The source files often carry artist/album prefixes, release tags, track
+//! numbers and inconsistent punctuation. Matching is deliberately fuzzy, but
+//! still conservative enough that a wrong track is worse than no source.
+
+use std::collections::{HashMap, HashSet};
+
+use strsim::normalized_levenshtein;
+use unicode_normalization::UnicodeNormalization;
+use unicode_normalization::char::is_combining_mark;
+
+use crate::util::{extension_of, remote_basename, stem};
+
+pub const MIN_MATCH_SCORE: f64 = 0.5;
+const MIN_FLAC_BYTES: u64 = 1_000_000;
+const MAX_FLAC_BYTES: u64 = 2_000_000_000;
+const MAX_FILES_PER_USER_PER_TRACK: usize = 3;
+
+#[derive(Debug, Clone)]
+pub struct RemoteFile {
+    pub path: String,
+    pub size: u64,
+    /// Soulseek file attribute 1: duration in seconds, when the peer sent it.
+    pub duration_secs: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchHit {
+    pub username: String,
+    pub free_slot: bool,
+    pub speed: u32,
+    pub files: Vec<RemoteFile>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TrackQuery {
+    pub disc: u32,
+    pub position: u32,
+    pub title: String,
+    pub expected_secs: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Candidate {
+    pub username: String,
+    pub path: String,
+    pub size: u64,
+    pub duration_secs: Option<u32>,
+    pub match_score: f64,
+    pub free_slot: bool,
+    pub user_speed: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct CandidateOptions {
+    pub per_track: usize,
+    pub length_tolerance: f64,
+    pub artist: String,
+    pub album: String,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedFile {
+    username: String,
+    path: String,
+    size: u64,
+    duration_secs: Option<u32>,
+    free_slot: bool,
+    user_speed: u32,
+    stem_norm: String,
+    stem_tokens: HashSet<String>,
+    path_norm: String,
+    file_track: Option<u32>,
+    file_disc: Option<u32>,
+}
+
+/// Build a ranked source list for every track from one pooled Soulseek search.
+pub fn build_candidates(
+    tracks: &[TrackQuery],
+    hits: &[SearchHit],
+    options: &CandidateOptions,
+) -> Vec<Vec<Candidate>> {
+    let artist_tokens = token_set(&normalize_text(&options.artist));
+    let album_tokens = token_set(&normalize_text(&options.album));
+
+    let mut prepared: Vec<PreparedFile> = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    for hit in hits {
+        for file in &hit.files {
+            let base = remote_basename(&file.path);
+            if !extension_of(base).eq_ignore_ascii_case("flac") {
+                continue;
+            }
+            let lower = base.to_ascii_lowercase();
+            if lower.contains("sample") || lower.contains("preview") || lower.contains("snippet") {
+                continue;
+            }
+            if file.size > 0 && (file.size < MIN_FLAC_BYTES || file.size > MAX_FLAC_BYTES) {
+                continue;
+            }
+            if !seen.insert((hit.username.clone(), file.path.clone())) {
+                continue;
+            }
+
+            let raw_stem = stem(base);
+            let (file_disc, file_track) = leading_track_number(raw_stem);
+            let clean_stem = strip_release_noise(raw_stem);
+            let stem_norm = normalize_text(&clean_stem);
+            if stem_norm.is_empty() {
+                continue;
+            }
+            let path_norm = normalize_text(&file.path);
+
+            prepared.push(PreparedFile {
+                username: hit.username.clone(),
+                path: file.path.clone(),
+                size: file.size,
+                duration_secs: file.duration_secs.filter(|seconds| *seconds > 0),
+                free_slot: hit.free_slot,
+                user_speed: hit.speed,
+                stem_tokens: token_set(&stem_norm),
+                stem_norm,
+                path_norm,
+                file_track,
+                file_disc,
+            });
+        }
+    }
+
+    let per_track: Vec<Vec<Candidate>> = tracks
+        .iter()
+        .map(|track| {
+            let track_norm = normalize_text(&track.title);
+            let track_tokens = token_set(&track_norm);
+            let mut candidates: Vec<Candidate> = Vec::new();
+
+            for file in &prepared {
+                let Some(mut score) = title_score(&track_norm, &track_tokens, file) else {
+                    continue;
+                };
+
+                if let (Some(expected), Some(reported)) =
+                    (track.expected_secs, file.duration_secs.map(f64::from))
+                {
+                    let diff = (expected - reported).abs();
+                    // A wildly different duration is almost always a different
+                    // recording; don't spend bandwidth on it.
+                    if diff > (options.length_tolerance * 6.0).max(90.0) {
+                        continue;
+                    }
+                }
+
+                if file.file_track == Some(track.position) {
+                    score += 0.03;
+                } else if file.file_track.is_some() && track.position > 0 {
+                    score -= 0.015;
+                }
+                if file.file_disc.is_some_and(|disc| disc == track.disc) {
+                    score += 0.01;
+                }
+
+                if token_subset(&album_tokens, &file.stem_tokens)
+                    || token_subset(&album_tokens, &token_set(&file.path_norm))
+                {
+                    score += 0.02;
+                }
+                if token_subset(&artist_tokens, &token_set(&file.path_norm)) {
+                    score += 0.01;
+                }
+
+                score = score.clamp(0.0, 1.0);
+                if score < MIN_MATCH_SCORE {
+                    continue;
+                }
+                candidates.push(Candidate {
+                    username: file.username.clone(),
+                    path: file.path.clone(),
+                    size: file.size,
+                    duration_secs: file.duration_secs,
+                    match_score: score,
+                    free_slot: file.free_slot,
+                    user_speed: file.user_speed,
+                });
+            }
+
+            candidates.sort_by(|a, b| {
+                let score_a = (a.match_score * 10.0).round() as i32;
+                let score_b = (b.match_score * 10.0).round() as i32;
+                let duration_a = duration_distance(track.expected_secs, a.duration_secs);
+                let duration_b = duration_distance(track.expected_secs, b.duration_secs);
+                score_b
+                    .cmp(&score_a)
+                    .then_with(|| b.free_slot.cmp(&a.free_slot))
+                    .then_with(|| b.user_speed.cmp(&a.user_speed))
+                    .then_with(|| {
+                        duration_a
+                            .partial_cmp(&duration_b)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .then_with(|| b.size.cmp(&a.size))
+            });
+
+            // Don't let one peer's folder of near-identical copies consume the
+            // whole retry budget.
+            let mut per_user: HashMap<String, usize> = HashMap::new();
+            let mut limited = Vec::new();
+            for candidate in candidates {
+                let count = per_user.entry(candidate.username.clone()).or_default();
+                if *count >= MAX_FILES_PER_USER_PER_TRACK {
+                    continue;
+                }
+                *count += 1;
+                limited.push(candidate);
+                if limited.len() >= options.per_track.max(1) {
+                    break;
+                }
+            }
+            limited
+        })
+        .collect();
+
+    // A remote file represents one track. Never hand the same source to two
+    // tracks: soulseek-rs-lib keys transfers by username+filename, so two
+    // tracks sharing one file can cancel each other.
+    let mut used_files: HashSet<(String, String)> = HashSet::new();
+    let mut used_paths: HashSet<String> = HashSet::new();
+    per_track
+        .into_iter()
+        .map(|mut candidates| {
+            candidates.retain(|candidate| {
+                used_files.insert((candidate.username.clone(), candidate.path.clone()))
+                    && used_paths.insert(candidate.path.to_ascii_lowercase())
+            });
+            candidates
+        })
+        .collect()
+}
+
+fn duration_distance(expected: Option<f64>, reported: Option<u32>) -> f64 {
+    match (expected, reported) {
+        (Some(expected), Some(reported)) => (expected - f64::from(reported)).abs(),
+        _ => f64::MAX,
+    }
+}
+
+/// Similarity between a track title and a candidate file stem.
+fn title_score(
+    track_norm: &str,
+    track_tokens: &HashSet<String>,
+    file: &PreparedFile,
+) -> Option<f64> {
+    if track_norm.is_empty() || file.stem_norm.is_empty() {
+        return None;
+    }
+    if track_norm == file.stem_norm {
+        return Some(1.0);
+    }
+
+    let padded_track = format!(" {track_norm} ");
+    let padded_file = format!(" {} ", file.stem_norm);
+    let contains = padded_file.contains(&padded_track);
+    let lev = normalized_levenshtein(track_norm, &file.stem_norm);
+    let jaccard = jaccard(track_tokens, &file.stem_tokens);
+
+    // A single word must be a whole-word match; "one" should not match
+    // "someone" just because a fuzzy ratio crosses the threshold.
+    if track_tokens.len() == 1 && !contains {
+        return None;
+    }
+
+    if contains {
+        Some(lev.max(jaccard).max(0.85))
+    } else {
+        Some(lev.max(jaccard))
+    }
+}
+
+/// Lowercase, strip accents, replace punctuation with spaces and collapse.
+pub fn normalize_text(s: &str) -> String {
+    let lowered = s.to_lowercase().replace('&', " and ");
+    let mut out = String::with_capacity(lowered.len());
+    let mut last_space = true;
+    for ch in lowered.nfkd() {
+        if is_combining_mark(ch) {
+            continue;
+        }
+        if ch.is_alphanumeric() {
+            for c in ch.to_lowercase() {
+                out.push(c);
+            }
+            last_space = false;
+        } else if !last_space {
+            out.push(' ');
+            last_space = true;
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Remove `[FLAC]`, `{WEB}`, and format-parentheses before matching.
+pub(crate) fn strip_release_noise(s: &str) -> String {
+    const KEYWORDS: &[&str] = &[
+        "flac",
+        "mp3",
+        "320",
+        "v0",
+        "v2",
+        "24bit",
+        "24-bit",
+        "16bit",
+        "16-bit",
+        "vinyl",
+        "web",
+        "cd",
+        "remaster",
+        "remastered",
+        "edition",
+        "deluxe",
+        "bonus",
+        "lossless",
+        "rip",
+        "scene",
+    ];
+
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '[' | '{' => {
+                let close = if chars[i] == '[' { ']' } else { '}' };
+                if let Some(offset) = chars[i + 1..].iter().position(|&c| c == close) {
+                    i += offset + 2;
+                } else {
+                    i += 1;
+                }
+            }
+            '(' => {
+                if let Some(offset) = chars[i + 1..].iter().position(|&c| c == ')') {
+                    let inside: String = chars[i + 1..i + 1 + offset].iter().collect();
+                    let lowered = inside.to_ascii_lowercase();
+                    if !KEYWORDS.iter().any(|kw| lowered.contains(kw)) {
+                        out.push('(');
+                        out.push_str(&inside);
+                        out.push(')');
+                    }
+                    i += offset + 2;
+                } else {
+                    i += 1;
+                }
+            }
+            ']' | '}' | ')' => i += 1,
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    strip_leading_track_number(out.trim())
+}
+
+fn strip_leading_track_number(s: &str) -> String {
+    let trimmed = s.trim_start();
+    let bytes = trimmed.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() && i < 2 {
+        i += 1;
+    }
+    if i == 0 || i >= bytes.len() {
+        return trimmed.to_string();
+    }
+    let sep = bytes[i] as char;
+    if !matches!(sep, ' ' | '-' | '.' | '_') {
+        return trimmed.to_string();
+    }
+    let mut end = i + 1;
+    // Multi-disc prefixes such as "1-01" or "2.03".
+    if matches!(sep, '-' | '.' | '_') {
+        let mut j = end;
+        while j < bytes.len() && bytes[j].is_ascii_digit() && j - end < 2 {
+            j += 1;
+        }
+        if j > end && (j == bytes.len() || matches!(bytes[j] as char, ' ' | '-' | '.' | '_')) {
+            end = j;
+        }
+    }
+    let rest = trimmed[end..].trim_start_matches([' ', '-', '.', '_']);
+    if rest.is_empty() {
+        trimmed.to_string()
+    } else {
+        rest.to_string()
+    }
+}
+
+fn leading_track_number(stem: &str) -> (Option<u32>, Option<u32>) {
+    let trimmed = stem.trim_start();
+    let bytes = trimmed.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() && i < 2 {
+        i += 1;
+    }
+    if i == 0 || i >= bytes.len() {
+        return (None, None);
+    }
+    let first: u32 = trimmed[..i].parse().unwrap_or(0);
+    let sep = bytes[i] as char;
+    if !matches!(sep, ' ' | '-' | '.' | '_') {
+        return (None, None);
+    }
+    if matches!(sep, '-' | '.' | '_') {
+        let mut j = i + 1;
+        while j < bytes.len() && bytes[j].is_ascii_digit() && j - (i + 1) < 2 {
+            j += 1;
+        }
+        if j > i + 1 && (j == bytes.len() || matches!(bytes[j] as char, ' ' | '-' | '.' | '_')) {
+            let second: u32 = trimmed[i + 1..j].parse().unwrap_or(0);
+            return (Some(first), Some(second));
+        }
+    }
+    (None, Some(first))
+}
+
+fn token_set(s: &str) -> HashSet<String> {
+    s.split_whitespace().map(str::to_string).collect()
+}
+
+fn token_subset(needle: &HashSet<String>, haystack: &HashSet<String>) -> bool {
+    !needle.is_empty() && needle.len() > 1 && needle.is_subset(haystack)
+}
+
+fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let intersection = a.intersection(b).count();
+    let union = a.len() + b.len() - intersection;
+    intersection as f64 / union as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(_user: &str, path: &str, size: u64) -> RemoteFile {
+        RemoteFile {
+            path: path.to_string(),
+            size,
+            duration_secs: None,
+        }
+    }
+
+    #[test]
+    fn normalization_handles_punctuation_accents_and_ampersands() {
+        assert_eq!(normalize_text("Beyoncé — Déjà Vu"), "beyonce deja vu");
+        assert_eq!(normalize_text("AC/DC & Friends"), "ac dc and friends");
+    }
+
+    #[test]
+    fn release_noise_is_stripped() {
+        assert_eq!(strip_release_noise("[FLAC] 01 - Song (Remastered)"), "Song");
+        assert_eq!(strip_release_noise("04. Song (Live)"), "Song (Live)");
+        assert_eq!(strip_release_noise("1-03 Song"), "Song");
+        assert_eq!(strip_release_noise("1979"), "1979");
+    }
+
+    #[test]
+    fn title_scoring_prefers_exact_and_containment() {
+        let f = PreparedFile {
+            username: "u".into(),
+            path: "x\\Metallica - Ride the Lightning - 01 - Fight Fire With Fire.flac".into(),
+            size: 30_000_000,
+            duration_secs: Some(285),
+            free_slot: true,
+            user_speed: 100,
+            stem_norm: normalize_text(&strip_release_noise(
+                "Metallica - Ride the Lightning - 01 - Fight Fire With Fire",
+            )),
+            stem_tokens: token_set(&normalize_text(
+                "Metallica Ride the Lightning 01 Fight Fire With Fire",
+            )),
+            path_norm: normalize_text(
+                "Metallica - Ride the Lightning - 01 - Fight Fire With Fire.flac",
+            ),
+            file_track: Some(1),
+            file_disc: None,
+        };
+        let title = normalize_text("Fight Fire With Fire");
+        let score = title_score(&title, &token_set(&title), &f).unwrap();
+        assert!(score >= 0.85, "{score}");
+    }
+
+    #[test]
+    fn a_short_single_word_does_not_match_a_longer_word() {
+        let f = PreparedFile {
+            username: "u".into(),
+            path: "someone.flac".into(),
+            size: 20_000_000,
+            duration_secs: None,
+            free_slot: true,
+            user_speed: 1,
+            stem_norm: "someone".into(),
+            stem_tokens: token_set("someone"),
+            path_norm: "someone flac".into(),
+            file_track: None,
+            file_disc: None,
+        };
+        let title = normalize_text("One");
+        assert!(title_score(&title, &token_set(&title), &f).is_none());
+    }
+
+    #[test]
+    fn candidates_are_ranked_and_junk_is_ignored() {
+        let tracks = vec![TrackQuery {
+            disc: 1,
+            position: 1,
+            title: "Fight Fire With Fire".into(),
+            expected_secs: Some(285.0),
+        }];
+        let hits = vec![SearchHit {
+            username: "fast".into(),
+            free_slot: true,
+            speed: 5000,
+            files: vec![
+                file("fast", "Metal\\01 - Fight Fire With Fire.flac", 30_000_000),
+                file(
+                    "fast",
+                    "Metal\\sample - Fight Fire With Fire.flac",
+                    30_000_000,
+                ),
+                file("fast", "Metal\\01 - Fight Fire With Fire.mp3", 8_000_000),
+            ],
+        }];
+        let options = CandidateOptions {
+            per_track: 12,
+            length_tolerance: 5.0,
+            artist: "Metallica".into(),
+            album: "Ride the Lightning".into(),
+        };
+        let out = build_candidates(&tracks, &hits, &options);
+        assert_eq!(out[0].len(), 1);
+        assert_eq!(out[0][0].username, "fast");
+    }
+
+    #[test]
+    fn one_remote_file_is_never_assigned_to_two_tracks() {
+        let tracks = vec![
+            TrackQuery {
+                disc: 1,
+                position: 1,
+                title: "Intro".into(),
+                expected_secs: None,
+            },
+            TrackQuery {
+                disc: 1,
+                position: 2,
+                title: "Intro".into(),
+                expected_secs: None,
+            },
+        ];
+        let hits = vec![SearchHit {
+            username: "one".into(),
+            free_slot: true,
+            speed: 100,
+            files: vec![file("one", "Album\\01 - Intro.flac", 20_000_000)],
+        }];
+        let options = CandidateOptions {
+            per_track: 12,
+            length_tolerance: 5.0,
+            artist: "Artist".into(),
+            album: "Album".into(),
+        };
+        let out = build_candidates(&tracks, &hits, &options);
+        assert_eq!(out[0].len() + out[1].len(), 1);
+    }
+
+    #[test]
+    fn one_source_is_limited_to_a_few_tries() {
+        let tracks = vec![TrackQuery {
+            disc: 1,
+            position: 1,
+            title: "Song".into(),
+            expected_secs: None,
+        }];
+        let files: Vec<_> = (0..10)
+            .map(|i| file("one", &format!("Album\\{i:02} - Song.flac"), 20_000_000))
+            .collect();
+        let hits = vec![SearchHit {
+            username: "one".into(),
+            free_slot: true,
+            speed: 100,
+            files,
+        }];
+        let options = CandidateOptions {
+            per_track: 12,
+            length_tolerance: 5.0,
+            artist: "Artist".into(),
+            album: "Album".into(),
+        };
+        let out = build_candidates(&tracks, &hits, &options);
+        assert_eq!(out[0].len(), MAX_FILES_PER_USER_PER_TRACK);
+    }
+}

@@ -1,0 +1,12 @@
+# Rust build output
+/soulsucker/target/
+
+# Python caches and packaging metadata
+**/__pycache__/
+**/.pytest_cache/
+**/*.egg-info/
+*.py[cod]
+
+# Editor and OS noise
+.DS_Store
+*.tmp
