@@ -126,6 +126,7 @@ Album phases: `Searching`, `Downloading`, `Complete`.
 
 - `search_releases` builds a Lucene query, fetches candidates, and ranks them.
 - **`ReleaseCandidate.score` is a penalty: lower is better.** The list sorts ascending. Tests assert a standard album scores lower than a deluxe edition.
+- `rank_candidates` infers the original country from the earliest official release with a country, then adds `FOREIGN_COUNTRY_PENALTY` to other pressings. The penalty is deliberately smaller than the edition/status penalties, so it breaks pressing ties without promoting deluxe or bootleg releases.
 - `get_release` requests `recordings+artist-credits+release-groups`, skips video media, numbers audio discs, and captures track/recording MBIDs and per-track artist credits.
 - `ReleaseInfo.primary_type` comes from the release group. `is_single()` makes `TracksView::build` save singles as loose files in the artist folder instead of creating an album folder.
 - `fetch_cover` order:

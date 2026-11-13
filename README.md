@@ -139,9 +139,10 @@ soulsucker --no-fingerprint
 
 ### What happens when you press Download
 
-1. MusicBrainz returns releases sorted **standard edition first**. Deluxe,
-   anniversary, live, expanded, bonus-heavy and bootleg releases are
-   penalised.
+1. MusicBrainz returns releases sorted **standard edition first**, preferring
+   the **original release country** inferred from the earliest official
+   release. Deluxe, anniversary, live, expanded, bonus-heavy and bootleg
+   releases are penalised.
 2. You pick a release; soulsucker fetches its full audio tracklist, including
    multi-disc releases and skipping DVD/Blu-ray mediums.
 3. The destination is created at `<music folder>/<Artist>/<Album>/`.

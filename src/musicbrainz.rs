@@ -424,7 +424,7 @@ fn candidates_from_search(
     artist: &str,
     album: &str,
 ) -> Vec<ReleaseCandidate> {
-    let mut out: Vec<ReleaseCandidate> = response
+    let out: Vec<ReleaseCandidate> = response
         .releases
         .into_iter()
         .map(|release| {
@@ -438,7 +438,7 @@ fn candidates_from_search(
                 primary_type: None,
                 secondary_types: Vec::new(),
             });
-            let mut candidate = ReleaseCandidate {
+            ReleaseCandidate {
                 mbid: release.id,
                 title: release.title,
                 artist: join_artist_credit(&release.artist_credit),
@@ -451,20 +451,39 @@ fn candidates_from_search(
                 secondary_types: release_group.secondary_types,
                 formats,
                 score: 0,
-            };
-            candidate.score = score_release(&candidate, artist, album);
-            candidate
+            }
         })
         .collect();
 
-    out.sort_by(|a, b| {
+    rank_candidates(out, artist, album)
+}
+
+fn rank_candidates(
+    mut candidates: Vec<ReleaseCandidate>,
+    artist: &str,
+    album: &str,
+) -> Vec<ReleaseCandidate> {
+    let original_countries = original_release_countries(&candidates);
+    for candidate in &mut candidates {
+        candidate.score = score_release(candidate, artist, album);
+        if !candidate.country.trim().is_empty()
+            && !original_countries.is_empty()
+            && !original_countries
+                .iter()
+                .any(|country| country.eq_ignore_ascii_case(candidate.country.trim()))
+        {
+            candidate.score += FOREIGN_COUNTRY_PENALTY;
+        }
+    }
+
+    candidates.sort_by(|a, b| {
         a.score
             .cmp(&b.score)
             .then_with(|| a.track_count.cmp(&b.track_count))
             .then_with(|| a.date.is_empty().cmp(&b.date.is_empty()))
             .then_with(|| a.date.cmp(&b.date))
     });
-    out
+    candidates
 }
 
 pub fn get_release(mbid: &str) -> Result<ReleaseInfo> {
@@ -881,6 +900,66 @@ fn is_video_medium(medium: &DetailMedium) -> bool {
     medium.title.as_deref().is_some_and(is_video_format)
 }
 
+/// Preferred-country releases get no penalty; other pressings get this one.
+const FOREIGN_COUNTRY_PENALTY: i32 = 12;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct PartialDate {
+    year: i32,
+    month: u8,
+    day: u8,
+}
+
+fn parse_partial_date(value: &str) -> Option<PartialDate> {
+    let mut parts = value.trim().split('-');
+    let year = parts.next()?.parse::<i32>().ok()?;
+    let month = parts.next().and_then(|part| part.parse().ok()).unwrap_or(0);
+    let day = parts.next().and_then(|part| part.parse().ok()).unwrap_or(0);
+    (year > 0 && month <= 12 && day <= 31).then_some(PartialDate { year, month, day })
+}
+
+/// The country (or countries tied) of the earliest official release in the
+/// search results. This is a good proxy for where the album was first issued.
+fn original_release_countries(candidates: &[ReleaseCandidate]) -> Vec<String> {
+    let mut earliest = None;
+    let mut countries: Vec<String> = Vec::new();
+
+    for candidate in candidates {
+        let country = candidate.country.trim();
+        if country.is_empty()
+            || (!candidate.status.is_empty() && !candidate.status.eq_ignore_ascii_case("official"))
+        {
+            continue;
+        }
+        let Some(date) = parse_partial_date(&candidate.date) else {
+            continue;
+        };
+
+        match earliest {
+            None => {
+                earliest = Some(date);
+                countries.push(country.to_ascii_uppercase());
+            }
+            Some(current) if date < current => {
+                earliest = Some(date);
+                countries.clear();
+                countries.push(country.to_ascii_uppercase());
+            }
+            Some(current)
+                if date == current
+                    && !countries
+                        .iter()
+                        .any(|known| known.eq_ignore_ascii_case(country)) =>
+            {
+                countries.push(country.to_ascii_uppercase());
+            }
+            _ => {}
+        }
+    }
+
+    countries
+}
+
 /// Lower score is more desirable.
 fn score_release(candidate: &ReleaseCandidate, query_artist: &str, query_album: &str) -> i32 {
     let mut score = 0.0f64;
@@ -1063,6 +1142,40 @@ mod tests {
         standard.score = score_release(&standard, "Metallica", "Ride the Lightning");
         deluxe.score = score_release(&deluxe, "Metallica", "Ride the Lightning");
         assert!(standard.score < deluxe.score);
+    }
+
+    #[test]
+    fn original_country_comes_from_the_earliest_official_release() {
+        let mut uk = candidate("Ride the Lightning", 8);
+        uk.country = "GB".into();
+        uk.date = "1984-07-27".into();
+        let mut us = candidate("Ride the Lightning", 8);
+        us.country = "US".into();
+        us.date = "1984-10-01".into();
+        let mut bootleg = candidate("Ride the Lightning", 8);
+        bootleg.country = "DE".into();
+        bootleg.date = "1984-01-01".into();
+        bootleg.status = "Bootleg".into();
+
+        assert_eq!(
+            original_release_countries(&[us, uk, bootleg]),
+            vec!["GB".to_string()]
+        );
+    }
+
+    #[test]
+    fn releases_from_the_original_country_are_preferred() {
+        let mut original = candidate("Ride the Lightning", 8);
+        original.country = "US".into();
+        original.date = "1984-07-27".into();
+        original.formats = vec!["Vinyl".into()];
+        let mut foreign = candidate("Ride the Lightning", 8);
+        foreign.country = "JP".into();
+        foreign.date = "1984-09-21".into();
+        foreign.formats = vec!["CD".into()];
+
+        let ranked = rank_candidates(vec![foreign, original], "Metallica", "Ride the Lightning");
+        assert_eq!(ranked[0].country, "US");
     }
 
     #[test]
