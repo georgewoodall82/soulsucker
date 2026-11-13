@@ -4,16 +4,14 @@ Practical notes for agents working on **soulsucker**.
 
 ## Scope
 
-- The active project is the Rust crate in **`soulsucker/`**.
-- `soulsucker-py/` is the original Python implementation. Treat it as reference only; do not modify it unless the user explicitly asks.
-- User-facing documentation lives in `soulsucker/README.md`. Update it when behavior, keys, flags, or settings change.
+- The Rust crate lives at the repository root.
+- User-facing documentation lives in `README.md`. Update it when behavior, keys, flags, or settings change.
 
 ## Quick commands
 
-Run from the workspace root:
+Run from the repository root:
 
 ```bash
-cd soulsucker
 cargo fmt
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
@@ -23,14 +21,14 @@ cargo build --release
 
 - Rust **1.91+**, edition **2024**.
 - The test suite is fast and offline. Keep it that way; do not add tests that hit MusicBrainz, iTunes, AcoustID, or Soulseek.
-- The release binary is `soulsucker/target/release/soulsucker`.
+- The release binary is `target/release/soulsucker`.
 - `cargo run --release` starts the TUI and needs a real terminal. Do not run the interactive TUI in a non-interactive shell; use `--help`, unit tests, and clippy for validation.
 - For manual testing without touching the user's real config/credentials, pass `--config /tmp/opencode/soulsucker-test.toml` (or set `SOULSUCKER_CONFIG`).
 
 ## Repository layout
 
 ```text
-soulsucker/
+.
 ├── Cargo.toml
 ├── README.md
 ├── LICENSE
@@ -47,8 +45,10 @@ soulsucker/
 │   ├── cli.rs           clap arguments and persistence semantics
 │   ├── input.rs         reusable text input editing
 │   └── util.rs          formatting, filename/path helpers, display width
-└── tests/fixtures/
-    └── silence.flac     tiny real FLAC used by the audio tagging test
+├── tests/fixtures/
+│   └── silence.flac     tiny real FLAC used by the audio tagging test
+└── .github/workflows/
+    └── release.yml      tag-triggered multi-platform GitHub release
 ```
 
 There is no library target. `src/main.rs` declares every module; add new modules there. Unit tests are inline `#[cfg(test)]` modules. Integration tests cannot import private crate internals, so put most tests next to the code they test.

@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -36,34 +37,29 @@ jobs:
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: soulsucker -> target
 
       - name: Build
-        working-directory: soulsucker
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
         shell: bash
-        working-directory: soulsucker
         run: |
-          mkdir -p ../dist/pkg
-          cp "target/${{ matrix.target }}/release/soulsucker" ../dist/pkg/
-          cp README.md LICENSE ../dist/pkg/
-          tar -czf "../dist/soulsucker-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" -C ../dist/pkg .
-          rm -rf ../dist/pkg
+          mkdir -p dist/pkg
+          cp "target/${{ matrix.target }}/release/soulsucker" dist/pkg/
+          cp README.md LICENSE dist/pkg/
+          tar -czf "dist/soulsucker-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" -C dist/pkg .
+          rm -rf dist/pkg
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        working-directory: soulsucker
         run: |
-          New-Item -ItemType Directory -Force ../dist/pkg | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/soulsucker.exe" ../dist/pkg/
-          Copy-Item README.md, LICENSE ../dist/pkg/
-          Compress-Archive -Path ../dist/pkg/* -DestinationPath "../dist/soulsucker-${env:GITHUB_REF_NAME}-${{ matrix.target }}.zip"
-          Remove-Item -Recurse -Force ../dist/pkg
+          New-Item -ItemType Directory -Force dist/pkg | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/soulsucker.exe" dist/pkg/
+          Copy-Item README.md, LICENSE dist/pkg/
+          Compress-Archive -Path dist/pkg/* -DestinationPath "dist/soulsucker-${env:GITHUB_REF_NAME}-${{ matrix.target }}.zip"
+          Remove-Item -Recurse -Force dist/pkg
 
       - uses: actions/upload-artifact@v7
         with:
@@ -74,6 +70,7 @@ jobs:
   release:
     name: Publish GitHub release
     needs: build
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
