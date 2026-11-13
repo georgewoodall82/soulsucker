@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-26
+            target: aarch64-apple-darwin
+          - os: macos-26-intel
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: soulsucker -> target
+
+      - name: Build
+        working-directory: soulsucker
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        working-directory: soulsucker
+        run: |
+          mkdir -p ../dist/pkg
+          cp "target/${{ matrix.target }}/release/soulsucker" ../dist/pkg/
+          cp README.md LICENSE ../dist/pkg/
+          tar -czf "../dist/soulsucker-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" -C ../dist/pkg .
+          rm -rf ../dist/pkg
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: soulsucker
+        run: |
+          New-Item -ItemType Directory -Force ../dist/pkg | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/soulsucker.exe" ../dist/pkg/
+          Copy-Item README.md, LICENSE ../dist/pkg/
+          Compress-Archive -Path ../dist/pkg/* -DestinationPath "../dist/soulsucker-${env:GITHUB_REF_NAME}-${{ matrix.target }}.zip"
+          Remove-Item -Recurse -Force ../dist/pkg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: soulsucker-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
