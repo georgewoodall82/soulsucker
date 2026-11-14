@@ -143,8 +143,9 @@ Album phases: `Searching`, `Downloading`, `Complete`.
 Turns Soulseek search hits into ranked per-track candidates.
 
 - Filters non-FLAC, tiny/huge files, samples/previews/snippets, and bad durations.
-- Scores title similarity, duration closeness, free slots, peer speed, and file size.
-- Deduplicates sources across the album so two tracks don't grab the same remote file.
+- Scores title similarity, duration closeness, track/disc numbers, free slots, peer speed, and file size.
+- Assigns each remote file globally to its best-matching track before applying per-track/per-user limits. A file is still only used for one track; do not revert to greedy per-track assignment, which lets an earlier track consume a similarly named later track's sources.
+- Rejects files whose reported duration is far from the expected track length, using `allowed_duration_drift` rather than a fixed 90-second window.
 - `normalize_text` is shared by MusicBrainz cover matching.
 - `strip_release_noise` removes format/edition noise and is also used by iTunes matching. It is `pub(crate)` for that reason.
 - Constraints such as `MIN_MATCH_SCORE`, size bounds, and per-user-per-track limits are intentional.

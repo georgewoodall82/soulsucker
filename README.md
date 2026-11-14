@@ -36,9 +36,11 @@ duration/fingerprint verification, and automatic retries:
   mode `0600`, and no longer requested at every launch.
 - **No per-track search spam.** One `artist album` search feeds every track;
   matching happens locally.
-- **Better source selection.** Matching score first, then free slots, peer
-  speed, duration closeness and file size. Reported durations are used to
-  rank sources before bytes are spent.
+- **Better source selection.** Each remote file is assigned to the track it
+  matches best, so similarly named tracks cannot steal each other's sources.
+  Matching score comes first, then free slots, peer speed, duration closeness
+  and file size. Reported durations are used to reject cross-track matches
+  before bytes are spent.
 - **Resilient transfers.** Per-attempt staging folders, queue/stall
   watchdogs, next-source fallback, and last-resort passes with more patience.
 - **Actual verification.** Finished files are checked against the

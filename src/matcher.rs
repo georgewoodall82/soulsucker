@@ -4,6 +4,7 @@
 //! numbers and inconsistent punctuation. Matching is deliberately fuzzy, but
 //! still conservative enough that a wrong track is worse than no source.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use strsim::normalized_levenshtein;
@@ -16,6 +17,10 @@ pub const MIN_MATCH_SCORE: f64 = 0.5;
 const MIN_FLAC_BYTES: u64 = 1_000_000;
 const MAX_FLAC_BYTES: u64 = 2_000_000_000;
 const MAX_FILES_PER_USER_PER_TRACK: usize = 3;
+const TRACK_NUMBER_BONUS: f64 = 0.05;
+const WRONG_TRACK_PENALTY: f64 = 0.10;
+const DISC_NUMBER_BONUS: f64 = 0.03;
+const WRONG_DISC_PENALTY: f64 = 0.05;
 
 #[derive(Debug, Clone)]
 pub struct RemoteFile {
@@ -128,113 +133,143 @@ pub fn build_candidates(
         }
     }
 
-    let per_track: Vec<Vec<Candidate>> = tracks
-        .iter()
-        .map(|track| {
-            let track_norm = normalize_text(&track.title);
-            let track_tokens = token_set(&track_norm);
-            let mut candidates: Vec<Candidate> = Vec::new();
+    struct FileMatch {
+        track: usize,
+        file: usize,
+        score: f64,
+        duration_distance: f64,
+    }
 
-            for file in &prepared {
-                let Some(mut score) = title_score(&track_norm, &track_tokens, file) else {
-                    continue;
-                };
+    // Score every file against every track first. Assigning greedily per track
+    // in album order lets an earlier track consume a similarly named later
+    // track's files ("In the Flesh?" vs "In the Flesh").
+    let mut matches: Vec<FileMatch> = Vec::new();
+    for (track_index, track) in tracks.iter().enumerate() {
+        let track_norm = normalize_text(&track.title);
+        let track_tokens = token_set(&track_norm);
 
-                if let (Some(expected), Some(reported)) =
-                    (track.expected_secs, file.duration_secs.map(f64::from))
-                {
-                    let diff = (expected - reported).abs();
-                    // A wildly different duration is almost always a different
-                    // recording; don't spend bandwidth on it.
-                    if diff > (options.length_tolerance * 6.0).max(90.0) {
-                        continue;
-                    }
-                }
+        for (file_index, file) in prepared.iter().enumerate() {
+            let Some(mut score) = title_score(&track_norm, &track_tokens, file) else {
+                continue;
+            };
 
-                if file.file_track == Some(track.position) {
-                    score += 0.03;
-                } else if file.file_track.is_some() && track.position > 0 {
-                    score -= 0.015;
-                }
-                if file.file_disc.is_some_and(|disc| disc == track.disc) {
-                    score += 0.01;
-                }
-
-                if token_subset(&album_tokens, &file.stem_tokens)
-                    || token_subset(&album_tokens, &token_set(&file.path_norm))
-                {
-                    score += 0.02;
-                }
-                if token_subset(&artist_tokens, &token_set(&file.path_norm)) {
-                    score += 0.01;
-                }
-
-                score = score.clamp(0.0, 1.0);
-                if score < MIN_MATCH_SCORE {
+            if let (Some(expected), Some(reported)) =
+                (track.expected_secs, file.duration_secs.map(f64::from))
+            {
+                // Reported FLAC lengths are normally accurate. A file belonging
+                // to a different track or edit is usually far enough away to
+                // reject here instead of spending bandwidth on it.
+                let allowed = allowed_duration_drift(expected, options.length_tolerance);
+                if (expected - reported).abs() > allowed {
                     continue;
                 }
-                candidates.push(Candidate {
-                    username: file.username.clone(),
-                    path: file.path.clone(),
-                    size: file.size,
-                    duration_secs: file.duration_secs,
-                    match_score: score,
-                    free_slot: file.free_slot,
-                    user_speed: file.user_speed,
-                });
             }
 
-            candidates.sort_by(|a, b| {
-                let score_a = (a.match_score * 10.0).round() as i32;
-                let score_b = (b.match_score * 10.0).round() as i32;
-                let duration_a = duration_distance(track.expected_secs, a.duration_secs);
-                let duration_b = duration_distance(track.expected_secs, b.duration_secs);
-                score_b
-                    .cmp(&score_a)
-                    .then_with(|| b.free_slot.cmp(&a.free_slot))
-                    .then_with(|| b.user_speed.cmp(&a.user_speed))
-                    .then_with(|| {
-                        duration_a
-                            .partial_cmp(&duration_b)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .then_with(|| b.size.cmp(&a.size))
+            if file.file_track == Some(track.position) {
+                score += TRACK_NUMBER_BONUS;
+            } else if file.file_track.is_some() && track.position > 0 {
+                score -= WRONG_TRACK_PENALTY;
+            }
+            if let Some(file_disc) = file.file_disc {
+                if file_disc == track.disc {
+                    score += DISC_NUMBER_BONUS;
+                } else {
+                    score -= WRONG_DISC_PENALTY;
+                }
+            }
+
+            if token_subset(&album_tokens, &file.stem_tokens)
+                || token_subset(&album_tokens, &token_set(&file.path_norm))
+            {
+                score += 0.02;
+            }
+            if token_subset(&artist_tokens, &token_set(&file.path_norm)) {
+                score += 0.01;
+            }
+
+            score = score.clamp(0.0, 1.0);
+            if score < MIN_MATCH_SCORE {
+                continue;
+            }
+            matches.push(FileMatch {
+                track: track_index,
+                file: file_index,
+                score,
+                duration_distance: duration_distance(track.expected_secs, file.duration_secs),
             });
+        }
+    }
 
-            // Don't let one peer's folder of near-identical copies consume the
-            // whole retry budget.
-            let mut per_user: HashMap<String, usize> = HashMap::new();
-            let mut limited = Vec::new();
-            for candidate in candidates {
-                let count = per_user.entry(candidate.username.clone()).or_default();
-                if *count >= MAX_FILES_PER_USER_PER_TRACK {
-                    continue;
-                }
-                *count += 1;
-                limited.push(candidate);
-                if limited.len() >= options.per_track.max(1) {
-                    break;
-                }
-            }
-            limited
-        })
-        .collect();
+    // Best match wins. A remote file is still only ever assigned to one track:
+    // soulseek-rs-lib keys transfers by username+filename, so two tracks
+    // sharing one file can cancel each other.
+    matches.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| {
+                a.duration_distance
+                    .partial_cmp(&b.duration_distance)
+                    .unwrap_or(Ordering::Equal)
+            })
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.track.cmp(&b.track))
+    });
 
-    // A remote file represents one track. Never hand the same source to two
-    // tracks: soulseek-rs-lib keys transfers by username+filename, so two
-    // tracks sharing one file can cancel each other.
-    let mut used_files: HashSet<(String, String)> = HashSet::new();
-    let mut used_paths: HashSet<String> = HashSet::new();
+    let mut per_track: Vec<Vec<Candidate>> = tracks.iter().map(|_| Vec::new()).collect();
+    let mut assigned: Vec<Option<usize>> = vec![None; prepared.len()];
+    let mut per_user: Vec<HashMap<String, usize>> = tracks.iter().map(|_| HashMap::new()).collect();
+
+    for candidate in matches {
+        if assigned[candidate.file].is_some()
+            || per_track[candidate.track].len() >= options.per_track.max(1)
+        {
+            continue;
+        }
+        let file = &prepared[candidate.file];
+        let count = per_user[candidate.track]
+            .entry(file.username.clone())
+            .or_default();
+        if *count >= MAX_FILES_PER_USER_PER_TRACK {
+            continue;
+        }
+        *count += 1;
+        assigned[candidate.file] = Some(candidate.track);
+        per_track[candidate.track].push(Candidate {
+            username: file.username.clone(),
+            path: file.path.clone(),
+            size: file.size,
+            duration_secs: file.duration_secs,
+            match_score: candidate.score,
+            free_slot: file.free_slot,
+            user_speed: file.user_speed,
+        });
+    }
+
+    for (track, candidates) in tracks.iter().zip(per_track.iter_mut()) {
+        candidates.sort_by(|a, b| {
+            let score_a = (a.match_score * 100.0).round() as i32;
+            let score_b = (b.match_score * 100.0).round() as i32;
+            let duration_a = duration_distance(track.expected_secs, a.duration_secs);
+            let duration_b = duration_distance(track.expected_secs, b.duration_secs);
+            score_b
+                .cmp(&score_a)
+                .then_with(|| b.free_slot.cmp(&a.free_slot))
+                .then_with(|| b.user_speed.cmp(&a.user_speed))
+                .then_with(|| {
+                    duration_a
+                        .partial_cmp(&duration_b)
+                        .unwrap_or(Ordering::Equal)
+                })
+                .then_with(|| b.size.cmp(&a.size))
+        });
+    }
+
     per_track
-        .into_iter()
-        .map(|mut candidates| {
-            candidates.retain(|candidate| {
-                used_files.insert((candidate.username.clone(), candidate.path.clone()))
-                    && used_paths.insert(candidate.path.to_ascii_lowercase())
-            });
-            candidates
-        })
-        .collect()
+}
+
+fn allowed_duration_drift(expected: f64, tolerance: f64) -> f64 {
+    ((expected * 0.1).max(tolerance * 5.0)).clamp(15.0, 60.0)
 }
 
 fn duration_distance(expected: Option<f64>, reported: Option<u32>) -> f64 {
@@ -572,6 +607,132 @@ mod tests {
         };
         let out = build_candidates(&tracks, &hits, &options);
         assert_eq!(out[0].len() + out[1].len(), 1);
+    }
+
+    fn file_with_duration(path: &str, size: u64, duration_secs: u32) -> RemoteFile {
+        RemoteFile {
+            path: path.to_string(),
+            size,
+            duration_secs: Some(duration_secs),
+        }
+    }
+
+    #[test]
+    fn similarly_named_tracks_get_their_own_sources() {
+        let tracks = vec![
+            TrackQuery {
+                disc: 1,
+                position: 1,
+                title: "In the Flesh?".into(),
+                expected_secs: None,
+            },
+            TrackQuery {
+                disc: 2,
+                position: 8,
+                title: "In the Flesh".into(),
+                expected_secs: None,
+            },
+        ];
+        let hits = vec![
+            SearchHit {
+                username: "a".into(),
+                free_slot: true,
+                speed: 100,
+                files: vec![
+                    file(
+                        "a",
+                        "Pink Floyd - The Wall\\1-01 - In the Flesh_.flac",
+                        20_000_000,
+                    ),
+                    file(
+                        "a",
+                        "Pink Floyd - The Wall\\2-08 - In the Flesh.flac",
+                        25_000_000,
+                    ),
+                ],
+            },
+            SearchHit {
+                username: "b".into(),
+                free_slot: true,
+                speed: 100,
+                files: vec![file(
+                    "b",
+                    "Pink Floyd - The Wall\\2-08 - In the Flesh.flac",
+                    25_000_000,
+                )],
+            },
+        ];
+        let options = CandidateOptions {
+            per_track: 12,
+            length_tolerance: 5.0,
+            artist: "Pink Floyd".into(),
+            album: "The Wall".into(),
+        };
+        let out = build_candidates(&tracks, &hits, &options);
+
+        assert_eq!(out[0].len(), 1);
+        assert!(out[0][0].path.contains("1-01"));
+        assert_eq!(out[1].len(), 2);
+        assert!(
+            out[1]
+                .iter()
+                .all(|candidate| candidate.path.contains("2-08"))
+        );
+    }
+
+    #[test]
+    fn duration_keeps_similarly_named_tracks_apart() {
+        let tracks = vec![
+            TrackQuery {
+                disc: 1,
+                position: 1,
+                title: "In the Flesh?".into(),
+                expected_secs: Some(199.6),
+            },
+            TrackQuery {
+                disc: 2,
+                position: 8,
+                title: "In the Flesh".into(),
+                expected_secs: Some(256.7),
+            },
+        ];
+        let hits = vec![
+            SearchHit {
+                username: "a".into(),
+                free_slot: true,
+                speed: 100,
+                files: vec![
+                    file_with_duration("The Wall\\In the Flesh_.flac", 20_000_000, 199),
+                    file_with_duration("The Wall\\In the Flesh.flac", 25_000_000, 257),
+                ],
+            },
+            SearchHit {
+                username: "b".into(),
+                free_slot: true,
+                speed: 100,
+                files: vec![file_with_duration(
+                    "The Wall\\In the Flesh.flac",
+                    25_000_000,
+                    257,
+                )],
+            },
+        ];
+        let options = CandidateOptions {
+            per_track: 12,
+            length_tolerance: 5.0,
+            artist: "Pink Floyd".into(),
+            album: "The Wall".into(),
+        };
+        let out = build_candidates(&tracks, &hits, &options);
+
+        assert_eq!(out[0].len(), 1);
+        assert_eq!(out[0][0].duration_secs, Some(199));
+        assert_eq!(out[1].len(), 2);
+        assert!(
+            out[1]
+                .iter()
+                .all(|candidate| candidate.duration_secs == Some(257))
+        );
     }
 
     #[test]
