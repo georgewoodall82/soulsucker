@@ -1220,6 +1220,8 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
     frame.render_widget(block, list_area);
     let width = inner.width as usize;
     let selected = app.settings.selected;
+    let update_label = app.update_state.label();
+    let update_level = app.update_state.level();
     let mut items = Vec::with_capacity(app.settings.fields.len());
     for (index, field) in app.settings.fields.iter().enumerate() {
         let is_selected = selected == index;
@@ -1235,11 +1237,13 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
                 }
             }
             SettingKind::Bool => format!("[{}]", field.value),
+            SettingKind::Action => update_label.to_string(),
             _ => field.value.clone(),
         };
         let value_color = match field.kind {
             SettingKind::Bool if field.value == "on" => SUCCESS,
             SettingKind::Secret if field.value.is_empty() => MUTED,
+            SettingKind::Action => toast_style(update_level).1,
             _ => TEXT,
         };
         let hint_width = width.saturating_sub(2 + 2 + label_width + value_width + 3);
@@ -1272,10 +1276,18 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
             ))),
             error_area,
         );
+    } else if let Some((status, level)) = app.update_state.status() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                util::truncate(&status, error_area.width as usize),
+                Style::default().fg(toast_style(level).1),
+            ))),
+            error_area,
+        );
     } else {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "Enter edits the selected field; Control+S saves. Esc leaves without saving.",
+                "Enter edits, toggles or runs an action · Ctrl+S saves · Esc leaves",
                 Style::default().fg(BORDER),
             ))),
             error_area,
@@ -1429,7 +1441,7 @@ fn render_help(app: &App, frame: &mut Frame, area: Rect) {
         crate::app::Screen::Settings => {
             lines.push(help_section("Settings"));
             lines.push(help_line("↑ ↓", "select a field"));
-            lines.push(help_line("Enter", "edit / toggle"));
+            lines.push(help_line("Enter", "edit / toggle / check updates"));
             lines.push(help_line("Ctrl+S", "save and go back"));
             lines.push(help_line("Esc", "discard and go back"));
         }

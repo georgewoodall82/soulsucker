@@ -48,6 +48,7 @@ jobs:
           mkdir -p dist/pkg
           cp "target/${{ matrix.target }}/release/soulsucker" dist/pkg/
           cp README.md LICENSE dist/pkg/
+          cp "target/${{ matrix.target }}/release/soulsucker" "dist/soulsucker-${GITHUB_REF_NAME}-${{ matrix.target }}"
           tar -czf "dist/soulsucker-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" -C dist/pkg .
           rm -rf dist/pkg
 
@@ -58,6 +59,7 @@ jobs:
           New-Item -ItemType Directory -Force dist/pkg | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/soulsucker.exe" dist/pkg/
           Copy-Item README.md, LICENSE dist/pkg/
+          Copy-Item "target/${{ matrix.target }}/release/soulsucker.exe" "dist/soulsucker-${env:GITHUB_REF_NAME}-${{ matrix.target }}.exe"
           Compress-Archive -Path dist/pkg/* -DestinationPath "dist/soulsucker-${env:GITHUB_REF_NAME}-${{ matrix.target }}.zip"
           Remove-Item -Recurse -Force dist/pkg
 

@@ -8,6 +8,7 @@ mod matcher;
 mod musicbrainz;
 mod session;
 mod ui;
+mod update;
 mod util;
 
 use anyhow::{Context, Result};
@@ -21,6 +22,7 @@ fn main() -> Result<()> {
     if args.yes && (args.artist().is_none() || args.album().is_none()) {
         anyhow::bail!("--yes needs both an artist and an album");
     }
+    update::cleanup_old_binary();
 
     // The library writes warnings to stderr. While the TUI owns the terminal,
     // buffer those lines and flush them after the alternate screen is gone.

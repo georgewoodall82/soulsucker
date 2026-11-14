@@ -1,5 +1,6 @@
 //! Application state, screen flow and keyboard handling.
 
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -18,6 +19,7 @@ use crate::session::{
     self, DownloadOptions, DownloadRequest, LogLevel, SessionHandle, SlskEvent, TrackMeta,
     TrackStatus, TrackUpdate,
 };
+use crate::update::{self, UpdateOutcome};
 use crate::util;
 
 const TOAST_DURATION: Duration = Duration::from_secs(4);
@@ -54,6 +56,73 @@ pub enum UiEvent {
         generation: u64,
         event: SlskEvent,
     },
+    UpdateStarted(String),
+    UpdateDone(Result<UpdateOutcome, String>),
+}
+
+#[derive(Debug, Clone, Default)]
+pub enum UpdateState {
+    #[default]
+    Idle,
+    Checking,
+    Downloading {
+        version: String,
+    },
+    Done(UpdateOutcome),
+    Failed(String),
+}
+
+impl UpdateState {
+    pub fn busy(&self) -> bool {
+        matches!(self, Self::Checking | Self::Downloading { .. })
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Idle => "check",
+            Self::Checking => "checking…",
+            Self::Downloading { .. } => "updating…",
+            Self::Done(UpdateOutcome::Updated { .. }) => "restart",
+            Self::Done(UpdateOutcome::UpToDate { .. }) => "up to date",
+            Self::Done(UpdateOutcome::NewerLocal { .. }) => "newer",
+            Self::Failed(_) => "failed",
+        }
+    }
+
+    pub fn level(&self) -> LogLevel {
+        match self {
+            Self::Failed(_) => LogLevel::Error,
+            Self::Done(UpdateOutcome::Updated { .. })
+            | Self::Done(UpdateOutcome::UpToDate { .. }) => LogLevel::Success,
+            _ => LogLevel::Info,
+        }
+    }
+
+    pub fn status(&self) -> Option<(String, LogLevel)> {
+        match self {
+            Self::Idle => None,
+            Self::Checking => Some((
+                "Checking GitHub for the latest release…".to_string(),
+                LogLevel::Info,
+            )),
+            Self::Downloading { version } => {
+                Some((format!("Downloading soulsucker {version}…"), LogLevel::Info))
+            }
+            Self::Done(UpdateOutcome::UpToDate { current, latest }) => Some((
+                format!("soulsucker {current} is up to date (latest {latest})"),
+                LogLevel::Success,
+            )),
+            Self::Done(UpdateOutcome::NewerLocal { current, latest }) => Some((
+                format!("Local build {current} is newer than the latest release ({latest})"),
+                LogLevel::Info,
+            )),
+            Self::Done(UpdateOutcome::Updated { version }) => Some((
+                format!("Updated to {version} — restart soulsucker to use it"),
+                LogLevel::Success,
+            )),
+            Self::Failed(error) => Some((format!("Update failed: {error}"), LogLevel::Error)),
+        }
+    }
 }
 
 pub struct LogEntry {
@@ -466,6 +535,7 @@ pub enum SettingKey {
     ListenPort,
     MbLimit,
     DiscPrefixTracks,
+    CheckUpdates,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -475,6 +545,7 @@ pub enum SettingKind {
     Int { min: i64, max: i64 },
     Float { min: f64, max: f64 },
     Bool,
+    Action,
 }
 
 impl SettingKind {
@@ -484,6 +555,10 @@ impl SettingKind {
 
     pub fn is_bool(self) -> bool {
         matches!(self, Self::Bool)
+    }
+
+    pub fn is_action(self) -> bool {
+        matches!(self, Self::Action)
     }
 }
 
@@ -638,6 +713,13 @@ impl SettingsForm {
                 .to_string(),
                 SettingKind::Bool,
             ),
+            field(
+                SettingKey::CheckUpdates,
+                "Check for updates",
+                "GitHub latest release",
+                "check".to_string(),
+                SettingKind::Action,
+            ),
         ];
         let mut list_state = ratatui::widgets::ListState::default();
         list_state.select(Some(0));
@@ -666,7 +748,7 @@ impl SettingsForm {
         let Some(field) = self.fields.get(self.selected) else {
             return;
         };
-        if field.kind.is_bool() {
+        if field.kind.is_bool() || field.kind.is_action() {
             return;
         }
         self.editing = Some(EditState {
@@ -756,6 +838,7 @@ impl SettingsForm {
                 SettingKey::DiscPrefixTracks => {
                     config.disc_prefix_track_numbers = value == "on";
                 }
+                SettingKey::CheckUpdates => {}
             }
         }
         if let Some(error) = config.validate().first() {
@@ -814,6 +897,7 @@ fn validate_field(kind: SettingKind, value: &str) -> Result<String, String> {
             Ok(format_number(parsed))
         }
         SettingKind::Bool => Ok(if value == "on" { "on" } else { "off" }.to_string()),
+        SettingKind::Action => Ok(value.to_string()),
     }
 }
 
@@ -906,6 +990,7 @@ pub struct App {
     pub fpcalc_available: bool,
     pub config_path_label: String,
     pub session_generation: u64,
+    pub update_state: UpdateState,
 }
 
 impl App {
@@ -960,6 +1045,7 @@ impl App {
             fpcalc_available: acoustid::fpcalc_path().is_some(),
             config_path_label,
             session_generation: 0,
+            update_state: UpdateState::Idle,
         };
 
         if let Some(warning) = config_warning {
@@ -1120,6 +1206,41 @@ impl App {
                     }
                 }
             }
+            UiEvent::UpdateStarted(version) => {
+                self.update_state = UpdateState::Downloading {
+                    version: version.clone(),
+                };
+                self.push_log(LogLevel::Info, format!("Downloading soulsucker {version}…"));
+                self.toast(LogLevel::Info, format!("Updating to {version}…"));
+            }
+            UiEvent::UpdateDone(result) => match result {
+                Ok(outcome) => {
+                    let (level, message) = match &outcome {
+                        UpdateOutcome::UpToDate { current, latest } => (
+                            LogLevel::Success,
+                            format!("soulsucker {current} is up to date (latest {latest})"),
+                        ),
+                        UpdateOutcome::NewerLocal { current, latest } => (
+                            LogLevel::Info,
+                            format!(
+                                "Local build {current} is newer than the latest release ({latest})"
+                            ),
+                        ),
+                        UpdateOutcome::Updated { version } => (
+                            LogLevel::Success,
+                            format!("Updated to soulsucker {version} — restart to use it"),
+                        ),
+                    };
+                    self.push_log(level, message.clone());
+                    self.toast(level, message);
+                    self.update_state = UpdateState::Done(outcome);
+                }
+                Err(error) => {
+                    self.push_log(LogLevel::Error, format!("Update failed: {error}"));
+                    self.toast(LogLevel::Error, "Update failed");
+                    self.update_state = UpdateState::Failed(error);
+                }
+            },
         }
     }
 
@@ -1350,6 +1471,60 @@ impl App {
         } else {
             self.screen = Screen::Setup;
             self.setup = SetupForm::from_config(&self.cfg);
+        }
+    }
+
+    fn check_for_updates(&mut self) {
+        if self.update_state.busy() {
+            return;
+        }
+        if matches!(
+            self.update_state,
+            UpdateState::Done(UpdateOutcome::Updated { .. })
+        ) {
+            self.toast(
+                LogLevel::Warn,
+                "Restart soulsucker to finish the previous update",
+            );
+            return;
+        }
+        self.update_state = UpdateState::Checking;
+        self.settings.error = None;
+        self.push_log(
+            LogLevel::Info,
+            "Checking GitHub for the latest soulsucker release…",
+        );
+        self.toast(LogLevel::Info, "Checking for updates…");
+        let tx = self.events_tx.clone();
+        let current = env!("CARGO_PKG_VERSION").to_string();
+        let spawned = thread::Builder::new()
+            .name("soulsucker-update".to_string())
+            .spawn(move || {
+                let result = (|| -> anyhow::Result<UpdateOutcome> {
+                    let release = update::latest_release()?;
+                    match update::compare_versions(&release.version, &current)? {
+                        Ordering::Greater => {
+                            let asset = update::platform_asset(&release)?;
+                            let version = release.version.clone();
+                            let _ = tx.send(UiEvent::UpdateStarted(version.clone()));
+                            update::install(asset)?;
+                            Ok(UpdateOutcome::Updated { version })
+                        }
+                        Ordering::Equal => Ok(UpdateOutcome::UpToDate {
+                            current: current.clone(),
+                            latest: release.version,
+                        }),
+                        Ordering::Less => Ok(UpdateOutcome::NewerLocal {
+                            current: current.clone(),
+                            latest: release.version,
+                        }),
+                    }
+                })();
+                let _ = tx.send(UiEvent::UpdateDone(result.map_err(|err| err.to_string())));
+            });
+        if spawned.is_err() {
+            self.update_state = UpdateState::Failed("could not start the update worker".into());
+            self.toast(LogLevel::Error, "Could not start the update worker");
         }
     }
 
@@ -2204,12 +2379,11 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                if self
-                    .settings
-                    .selected_field()
-                    .is_some_and(|field| field.kind.is_bool())
-                {
+                let kind = self.settings.selected_field().map(|field| field.kind);
+                if kind.is_some_and(SettingKind::is_bool) {
                     self.settings.toggle_selected();
+                } else if kind.is_some_and(SettingKind::is_action) {
+                    self.check_for_updates();
                 } else {
                     self.settings.begin_edit();
                 }

@@ -55,6 +55,9 @@ duration/fingerprint verification, and automatic retries:
 - **Skip or force.** Valid existing tracks are skipped by default; `--force`
   downloads them again. A stray/empty file with the right name is validated and
   replaced rather than trusted.
+- **In-app updates.** Settings → **Check for updates** asks GitHub for the
+  latest release, and when it is newer downloads the matching binary and
+  replaces the running executable. Restart soulsucker to use it.
 
 ## Requirements
 
@@ -230,15 +233,23 @@ is in flight; `Esc` cancels the request so you can open it.
 | Key | Action |
 | --- | --- |
 | `↑` `↓` `Home` `End` | Select a field |
-| `Enter` | Edit / toggle |
+| `Enter` | Edit / toggle / run action |
 | `Ctrl+S` | Save and return |
 | `Esc` | Discard and return |
 
 Settings covers credentials, the AcoustID key, fingerprint on/off, music
 folder, parallel downloads, search/queue/stall timeouts, length tolerance,
 AcoustID score, last-resort passes and patience, sources per track, listener
-port (0 = automatic), MusicBrainz result count, and disc-prefixed track numbers
-for players that ignore disc tags (Tesla and similar car stereos).
+port (0 = automatic), MusicBrainz result count, disc-prefixed track numbers
+for players that ignore disc tags (Tesla and similar car stereos), and checking
+for updates.
+
+**Check for updates** compares the running version with the latest public
+GitHub release. If a newer release exists, it downloads the matching raw
+binary, checks the executable header, and replaces the running file atomically.
+The current process keeps running the old version until you restart. Automatic
+updates work with the prebuilt Linux x86_64, macOS ARM64/Intel, and Windows
+x86_64 releases.
 
 ## Configuration
 
@@ -327,6 +338,9 @@ contain peer-supplied text, so treat them as untrusted.
   the disc tag and sorts only by track number. Enable Settings →
   **Disc-prefixed tracks** (or `disc_prefix_track_numbers = true`) and rerun
   with `--force` to retag; tracks then appear as `101…`, `201…`.
+- **Update failed with a permission error.** soulsucker cannot replace a binary
+  in a read-only or system-owned directory. Move it somewhere writable, install
+  it under your home directory, or download the release asset manually.
 - **Firewalled peer.** Soulseek can broker connections, but two peers both
   behind strict NAT may not be able to transfer. The app simply tries another
   source.

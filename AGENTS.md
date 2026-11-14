@@ -43,6 +43,7 @@ cargo build --release
 │   ├── audio.rs         FLAC inspection, metadata tagging, cover embedding
 │   ├── config.rs        TOML config, normalization, secure atomic saves
 │   ├── cli.rs           clap arguments and persistence semantics
+│   ├── update.rs        GitHub release check, download, self-replacement
 │   ├── input.rs         reusable text input editing
 │   └── util.rs          formatting, filename/path helpers, display width
 ├── tests/fixtures/
@@ -61,6 +62,7 @@ The app uses **threads + `std::sync::mpsc`**, not async/Tokio.
 main
  └─ App (UI thread: crossterm + ratatui)
      ├─ MusicBrainz worker threads ──> UiEvent::MbSearch / UiEvent::MbRelease
+     ├─ update worker ───────────────> UiEvent::UpdateStarted / UiEvent::UpdateDone
      └─ SessionHandle ──> session thread (owns soulseek-rs Client)
            ├─ search worker ────────> SessionCommand::SearchDone
            ├─ verification workers ─> SessionCommand::Verified
@@ -168,6 +170,14 @@ Turns Soulseek search hits into ranked per-track candidates.
 - Tagging is best-effort: a tag/cover failure must not fail the download.
 - `disc_prefix_track_numbers` (opt-in) writes disc-prefixed tags (`101…113`, `201…213`) for multi-disc releases so players that ignore the disc tag, notably Tesla's USB player, keep the discs in order. Filenames still use the `1-01` form.
 
+### `update.rs`
+
+- `Settings → Check for updates` calls `latest_release()` on a named worker thread, compares the GitHub tag with `env!("CARGO_PKG_VERSION")`, and installs a newer release automatically.
+- Release assets must include the raw binary `soulsucker-<tag>-<target>` (plus `.exe` on Windows); the archive alone is not enough. The release workflow uploads both.
+- `install` downloads to a temporary file beside the current executable, checks the file magic, makes it executable, and renames it into place. Unix replaces the running inode atomically; Windows renames the old `.exe` aside and removes it on the next start.
+- Never run the update check or download on the UI thread. Keep the network work in the worker and report through `UiEvent`.
+- Supported targets: Linux x86_64 GNU, macOS ARM64/Intel, Windows x86_64 MSVC. Other platforms get a clear error instead of a partial update.
+
 ### `config.rs`
 
 - TOML config contains the Soulseek password and AcoustID key in plaintext. Use `config::save`; it validates, writes atomically, tightens permissions to `0600` on Unix, and handles replacement safely. Do not add a plain `fs::write` path.
@@ -194,6 +204,7 @@ These are easy to break and hard to debug.
 5. **Existing files are only trusted after validation.** `existing_file_is_valid` requires a readable FLAC and a duration within tolerance. Size alone is not enough. Existing valid tracks are skipped and are not retagged; use `--force` for that.
 6. **Promotion must preserve an existing file on failure.** `promote_file` uses a backup/rename fallback; keep that behavior.
 7. **Ownership of the Soulseek client matters.** `Arc<Client>` is shared with workers, but the session thread owns connect/reconnect/shutdown. Do not call blocking client operations from the UI thread.
+8. **Self-updates must stay atomic and off the UI thread.** Download to a temporary file beside the running executable, verify it, then rename it into place. The release workflow must publish raw `soulsucker-<tag>-<target>` binaries; the updater cannot extract archives.
 
 ## Config/CLI change checklist
 
@@ -216,6 +227,7 @@ When adding or changing a setting:
 - **Retry/queue/stall behavior:** `session.rs` (`advance_after_failure`, `start_candidate`, `poll_downloads`, `schedule`).
 - **Verification behavior:** `acoustid.rs` and `session.rs` (`begin_verification`/`verified`).
 - **Tag fields or cover handling:** `audio.rs`, `session.rs` (`TrackTags` construction), then the audio unit test.
+- **Update behavior:** `update.rs`, the Settings action in `app.rs`/`ui.rs`, and raw asset packaging in `.github/workflows/release.yml`.
 - **UI formatting/truncation:** `util.rs` and `ui.rs`.
 
 ## Testing notes
