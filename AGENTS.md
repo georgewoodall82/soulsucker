@@ -126,7 +126,7 @@ Album phases: `Searching`, `Downloading`, `Complete`.
 
 - `search_releases` builds a Lucene query, fetches candidates, and ranks them.
 - **`ReleaseCandidate.score` is a penalty: lower is better.** The list sorts ascending. Tests assert a standard album scores lower than a deluxe edition.
-- `rank_candidates` infers the original country from the earliest official release with a country, then adds `FOREIGN_COUNTRY_PENALTY` to other pressings. The penalty is deliberately smaller than the edition/status penalties, so it breaks pressing ties without promoting deluxe or bootleg releases.
+- `rank_candidates` infers the original release date/country from the earliest official release with a country, then adds `FOREIGN_COUNTRY_PENALTY` to other pressings and a capped `LATER_RELEASE_PENALTY_PER_YEAR` to later reissues. Both are deliberately smaller than the edition/status penalties, so they break pressing ties without promoting deluxe or bootleg releases. Dates with missing month/day are compared as end-of-period, so a bare `1979` does not beat `1979-11-30`.
 - `get_release` requests `recordings+artist-credits+release-groups`, skips video media, numbers audio discs, and captures track/recording MBIDs and per-track artist credits.
 - `ReleaseInfo.primary_type` comes from the release group. `is_single()` makes `TracksView::build` save singles as loose files in the artist folder instead of creating an album folder.
 - `fetch_cover` order:
@@ -153,6 +153,7 @@ Turns Soulseek search hits into ranked per-track candidates.
 
 - Duration checking always runs, even without an AcoustID key or `fpcalc`.
 - Fingerprint verification is best-effort: missing key, missing `fpcalc`, timeout, or AcoustID outage falls back to accepting on duration.
+- A top-cluster recording from the selected release group is accepted even when its recording MBID differs; reissues and early CD pressings often use alternate edits of the same track.
 - A clear top-cluster mismatch rejects the file.
 - `fpcalc` is run with a timeout and killed if it hangs.
 - AcoustID requests are throttled and cached where appropriate.

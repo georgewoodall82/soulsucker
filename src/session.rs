@@ -1274,6 +1274,7 @@ impl Session {
                 expected_secs: track.meta.expected_secs,
                 tolerance_secs: album.job.options.length_tolerance,
                 recording_mbid: track.meta.recording_mbid.clone(),
+                release_group_mbid: album.job.release_group_mbid.clone(),
                 api_key: album.job.options.api_key.clone(),
                 min_score: album.job.options.fingerprint_min_score,
             };

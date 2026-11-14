@@ -25,6 +25,7 @@ pub struct VerifySpec {
     pub expected_secs: Option<f64>,
     pub tolerance_secs: f64,
     pub recording_mbid: String,
+    pub release_group_mbid: String,
     pub api_key: String,
     pub min_score: f64,
 }
@@ -54,6 +55,7 @@ impl VerifyResult {
 #[derive(Debug, Clone, PartialEq)]
 pub enum FingerprintVerdict {
     Match(f64),
+    MatchReleaseGroup(f64, String),
     Mismatch(f64, String),
     Unknown(String),
 }
@@ -72,6 +74,14 @@ pub struct AcoustidRecording {
     pub id: String,
     #[serde(default)]
     pub title: String,
+    #[serde(default)]
+    pub releasegroups: Vec<AcoustidReleaseGroup>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AcoustidReleaseGroup {
+    #[serde(default)]
+    pub id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -251,7 +261,7 @@ fn acoustid_lookup(
     api_key: &str,
 ) -> Result<Vec<AcoustidCluster>> {
     let body = format!(
-        "format=json&client={}&meta=recordings&duration={}&fingerprint={}",
+        "format=json&client={}&meta=recordings+releasegroups&duration={}&fingerprint={}",
         form_encode(api_key),
         duration.round().max(0.0) as u64,
         form_encode(fingerprint)
@@ -332,10 +342,23 @@ fn mbid_known(mbid: &str, api_key: &str) -> bool {
     }
 }
 
+fn recording_label(recording: &AcoustidRecording) -> String {
+    if recording.title.is_empty() {
+        format!("[{}]", &recording.id[..recording.id.len().min(8)])
+    } else {
+        format!(
+            "“{}” [{}]",
+            recording.title,
+            &recording.id[..recording.id.len().min(8)]
+        )
+    }
+}
+
 /// Decide what a set of AcoustID clusters means for an expected recording.
 pub fn evaluate_lookup(
     clusters: &[AcoustidCluster],
     expected_mbid: &str,
+    expected_release_group: &str,
     min_score: f64,
     expected_known: bool,
 ) -> FingerprintVerdict {
@@ -372,25 +395,35 @@ pub fn evaluate_lookup(
         return FingerprintVerdict::Match(top);
     }
 
+    // Reissues and compilations sometimes use a different recording ID for
+    // the same performance (an album edit, a differently indexed pressing, or
+    // a remaster). If the fingerprint points at another recording from the
+    // selected album, the audio is still the track we asked for.
+    let release_group = expected_release_group.trim();
+    if !release_group.is_empty()
+        && let Some(recording) = tier
+            .iter()
+            .flat_map(|cluster| cluster.recordings.iter())
+            .find(|recording| {
+                recording
+                    .releasegroups
+                    .iter()
+                    .any(|group| group.id.eq_ignore_ascii_case(release_group))
+            })
+    {
+        return FingerprintVerdict::MatchReleaseGroup(top, recording_label(recording));
+    }
+
     if !expected_known {
         return FingerprintVerdict::Unknown(
             "expected recording unknown to AcoustID — kept on duration".to_string(),
         );
     }
 
-    let first = tier.first().and_then(|cluster| cluster.recordings.first());
-    let label = first
-        .map(|recording| {
-            if recording.title.is_empty() {
-                format!("[{}]", &recording.id[..recording.id.len().min(8)])
-            } else {
-                format!(
-                    "“{}” [{}]",
-                    recording.title,
-                    &recording.id[..recording.id.len().min(8)]
-                )
-            }
-        })
+    let label = tier
+        .first()
+        .and_then(|cluster| cluster.recordings.first())
+        .map(recording_label)
         .unwrap_or_else(|| "another recording".to_string());
     FingerprintVerdict::Mismatch(top, label)
 }
@@ -494,11 +527,15 @@ pub fn verify_file(path: &Path, spec: &VerifySpec, on_phase: &dyn Fn(&str)) -> V
     match evaluate_lookup(
         &clusters,
         &spec.recording_mbid,
+        &spec.release_group_mbid,
         spec.min_score,
         expected_known,
     ) {
         FingerprintVerdict::Match(score) => VerifyResult::accept(format!(
             "duration {duration_note} · AcoustID match {score:.2}"
+        )),
+        FingerprintVerdict::MatchReleaseGroup(score, label) => VerifyResult::accept(format!(
+            "duration {duration_note} · AcoustID match {score:.2} (alternate pressing {label})"
         )),
         FingerprintVerdict::Unknown(detail) => {
             VerifyResult::accept(format!("duration {duration_note} · {detail}"))
@@ -521,8 +558,22 @@ mod tests {
                 .map(|id| AcoustidRecording {
                     id: (*id).to_string(),
                     title: format!("title {id}"),
+                    releasegroups: Vec::new(),
                 })
                 .collect(),
+        }
+    }
+
+    fn cluster_in_release_group(score: f64, id: &str, release_group: &str) -> AcoustidCluster {
+        AcoustidCluster {
+            score,
+            recordings: vec![AcoustidRecording {
+                id: id.to_string(),
+                title: format!("title {id}"),
+                releasegroups: vec![AcoustidReleaseGroup {
+                    id: release_group.to_string(),
+                }],
+            }],
         }
     }
 
@@ -530,7 +581,7 @@ mod tests {
     fn expected_recording_in_the_top_cluster_is_a_match() {
         let clusters = vec![cluster(0.94, &["expected", "other"]), cluster(0.4, &["x"])];
         assert_eq!(
-            evaluate_lookup(&clusters, "expected", 0.8, true),
+            evaluate_lookup(&clusters, "expected", "", 0.8, true),
             FingerprintVerdict::Match(0.94)
         );
     }
@@ -539,8 +590,35 @@ mod tests {
     fn a_lower_ranked_appearance_does_not_count() {
         let clusters = vec![cluster(0.94, &["other"]), cluster(0.5, &["expected"])];
         assert!(matches!(
-            evaluate_lookup(&clusters, "expected", 0.8, true),
+            evaluate_lookup(&clusters, "expected", "", 0.8, true),
             FingerprintVerdict::Mismatch(_, _)
+        ));
+    }
+
+    #[test]
+    fn an_alternate_recording_in_the_same_release_group_is_a_match() {
+        let clusters = vec![cluster_in_release_group(0.95, "standard", "the-wall")];
+        assert!(matches!(
+            evaluate_lookup(&clusters, "1985-edit", "the-wall", 0.8, true),
+            FingerprintVerdict::MatchReleaseGroup(0.95, _)
+        ));
+    }
+
+    #[test]
+    fn an_alternate_recording_in_another_release_group_is_a_mismatch() {
+        let clusters = vec![cluster_in_release_group(0.95, "live", "live-album")];
+        assert!(matches!(
+            evaluate_lookup(&clusters, "studio", "the-wall", 0.8, true),
+            FingerprintVerdict::Mismatch(_, _)
+        ));
+    }
+
+    #[test]
+    fn a_release_group_match_does_not_require_the_expected_recording_to_be_known() {
+        let clusters = vec![cluster_in_release_group(0.95, "standard", "the-wall")];
+        assert!(matches!(
+            evaluate_lookup(&clusters, "1985-edit", "the-wall", 0.8, false),
+            FingerprintVerdict::MatchReleaseGroup(_, _)
         ));
     }
 
@@ -548,7 +626,7 @@ mod tests {
     fn an_unknown_expected_recording_is_kept_on_duration() {
         let clusters = vec![cluster(0.94, &["other"])];
         assert!(matches!(
-            evaluate_lookup(&clusters, "expected", 0.8, false),
+            evaluate_lookup(&clusters, "expected", "", 0.8, false),
             FingerprintVerdict::Unknown(_)
         ));
     }
@@ -557,7 +635,7 @@ mod tests {
     fn weak_evidence_is_unknown() {
         let clusters = vec![cluster(0.5, &["expected"])];
         assert!(matches!(
-            evaluate_lookup(&clusters, "expected", 0.8, true),
+            evaluate_lookup(&clusters, "expected", "", 0.8, true),
             FingerprintVerdict::Unknown(_)
         ));
     }
@@ -566,7 +644,7 @@ mod tests {
     fn a_non_ascii_recording_id_does_not_panic_the_label() {
         let clusters = vec![cluster(0.94, &["ééééééééé"])];
         assert!(matches!(
-            evaluate_lookup(&clusters, "expected", 0.8, true),
+            evaluate_lookup(&clusters, "expected", "", 0.8, true),
             FingerprintVerdict::Mismatch(_, _)
         ));
     }
@@ -574,8 +652,27 @@ mod tests {
     #[test]
     fn an_empty_database_answer_is_unknown() {
         assert!(matches!(
-            evaluate_lookup(&[], "expected", 0.8, true),
+            evaluate_lookup(&[], "expected", "", 0.8, true),
             FingerprintVerdict::Unknown(_)
         ));
+    }
+
+    #[test]
+    fn lookup_response_parses_release_groups() {
+        let data: LookupResponse = serde_json::from_str(
+            r#"{
+                "status": "ok",
+                "results": [{
+                    "score": 0.95,
+                    "recordings": [{
+                        "id": "recording",
+                        "title": "Song",
+                        "releasegroups": [{"id": "group", "title": "Album"}]
+                    }]
+                }]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(data.results[0].recordings[0].releasegroups[0].id, "group");
     }
 }

@@ -463,16 +463,26 @@ fn rank_candidates(
     artist: &str,
     album: &str,
 ) -> Vec<ReleaseCandidate> {
-    let original_countries = original_release_countries(&candidates);
+    let original = original_release(&candidates);
     for candidate in &mut candidates {
         candidate.score = score_release(candidate, artist, album);
         if !candidate.country.trim().is_empty()
-            && !original_countries.is_empty()
-            && !original_countries
+            && !original.countries.is_empty()
+            && !original
+                .countries
                 .iter()
                 .any(|country| country.eq_ignore_ascii_case(candidate.country.trim()))
         {
             candidate.score += FOREIGN_COUNTRY_PENALTY;
+        }
+        if let (Some(original_date), Some(date)) =
+            (original.date, parse_partial_date(&candidate.date))
+            && date > original_date
+        {
+            let years_late = (date.year - original_date.year).max(0) as f64;
+            candidate.score += (years_late * LATER_RELEASE_PENALTY_PER_YEAR)
+                .min(MAX_LATER_RELEASE_PENALTY)
+                .round() as i32;
         }
     }
 
@@ -902,6 +912,10 @@ fn is_video_medium(medium: &DetailMedium) -> bool {
 
 /// Preferred-country releases get no penalty; other pressings get this one.
 const FOREIGN_COUNTRY_PENALTY: i32 = 12;
+/// Later pressings get a small tie-break penalty so the original release wins
+/// when everything else is equal. The cap keeps it below edition penalties.
+const LATER_RELEASE_PENALTY_PER_YEAR: f64 = 0.5;
+const MAX_LATER_RELEASE_PENALTY: f64 = 6.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct PartialDate {
@@ -913,51 +927,76 @@ struct PartialDate {
 fn parse_partial_date(value: &str) -> Option<PartialDate> {
     let mut parts = value.trim().split('-');
     let year = parts.next()?.parse::<i32>().ok()?;
-    let month = parts.next().and_then(|part| part.parse().ok()).unwrap_or(0);
-    let day = parts.next().and_then(|part| part.parse().ok()).unwrap_or(0);
-    (year > 0 && month <= 12 && day <= 31).then_some(PartialDate { year, month, day })
+    // Missing components mean "unknown within this period". Treat them as the
+    // end of the period so a bare `1979` does not look earlier than
+    // `1979-11-30` and hijack the original-country inference.
+    let month = match parts.next() {
+        None => 12,
+        Some(part) => part
+            .parse::<u8>()
+            .ok()
+            .filter(|month| (1..=12).contains(month))?,
+    };
+    let day = match parts.next() {
+        None => 31,
+        Some(part) => part
+            .parse::<u8>()
+            .ok()
+            .filter(|day| (1..=31).contains(day))?,
+    };
+    (year > 0).then_some(PartialDate { year, month, day })
 }
 
-/// The country (or countries tied) of the earliest official release in the
-/// search results. This is a good proxy for where the album was first issued.
-fn original_release_countries(candidates: &[ReleaseCandidate]) -> Vec<String> {
-    let mut earliest = None;
-    let mut countries: Vec<String> = Vec::new();
+#[derive(Debug, Default)]
+struct OriginalRelease {
+    date: Option<PartialDate>,
+    countries: Vec<String>,
+}
+
+/// The earliest official release in the search results, plus its country (or
+/// countries tied for that date). This is a good proxy for the album's first
+/// issue and where it came from.
+fn original_release(candidates: &[ReleaseCandidate]) -> OriginalRelease {
+    let mut original = OriginalRelease::default();
 
     for candidate in candidates {
-        let country = candidate.country.trim();
-        if country.is_empty()
-            || (!candidate.status.is_empty() && !candidate.status.eq_ignore_ascii_case("official"))
-        {
+        if !candidate.status.is_empty() && !candidate.status.eq_ignore_ascii_case("official") {
             continue;
         }
         let Some(date) = parse_partial_date(&candidate.date) else {
             continue;
         };
+        let country = candidate.country.trim();
 
-        match earliest {
+        match original.date {
             None => {
-                earliest = Some(date);
-                countries.push(country.to_ascii_uppercase());
+                original.date = Some(date);
+                if !country.is_empty() {
+                    original.countries.push(country.to_ascii_uppercase());
+                }
             }
             Some(current) if date < current => {
-                earliest = Some(date);
-                countries.clear();
-                countries.push(country.to_ascii_uppercase());
+                original.date = Some(date);
+                original.countries.clear();
+                if !country.is_empty() {
+                    original.countries.push(country.to_ascii_uppercase());
+                }
             }
             Some(current)
                 if date == current
-                    && !countries
+                    && !country.is_empty()
+                    && !original
+                        .countries
                         .iter()
                         .any(|known| known.eq_ignore_ascii_case(country)) =>
             {
-                countries.push(country.to_ascii_uppercase());
+                original.countries.push(country.to_ascii_uppercase());
             }
             _ => {}
         }
     }
 
-    countries
+    original
 }
 
 /// Lower score is more desirable.
@@ -1158,9 +1197,41 @@ mod tests {
         bootleg.status = "Bootleg".into();
 
         assert_eq!(
-            original_release_countries(&[us, uk, bootleg]),
+            original_release(&[us, uk, bootleg]).countries,
             vec!["GB".to_string()]
         );
+    }
+
+    #[test]
+    fn a_year_only_date_does_not_beat_a_specific_date_in_the_same_year() {
+        let mut specific = candidate("The Wall", 26);
+        specific.country = "GB".into();
+        specific.date = "1979-11-30".into();
+        let mut vague = candidate("The Wall", 26);
+        vague.country = "SE".into();
+        vague.date = "1979".into();
+
+        assert_eq!(
+            original_release(&[vague, specific]).countries,
+            vec!["GB".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_original_release_outranks_a_later_reissue() {
+        let mut original = candidate("The Wall", 26);
+        original.artist = "Pink Floyd".into();
+        original.date = "1979-11-30".into();
+        original.country = "US".into();
+        original.formats = vec!["12\" Vinyl".into(), "12\" Vinyl".into()];
+        let mut reissue = candidate("The Wall", 26);
+        reissue.artist = "Pink Floyd".into();
+        reissue.date = "1985".into();
+        reissue.country = "US".into();
+        reissue.formats = vec!["CD".into(), "CD".into()];
+
+        let ranked = rank_candidates(vec![reissue, original], "Pink Floyd", "The Wall");
+        assert_eq!(ranked[0].date, "1979-11-30");
     }
 
     #[test]
