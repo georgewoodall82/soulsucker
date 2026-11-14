@@ -49,6 +49,9 @@ pub struct Config {
     pub listen_port: u16,
     /// Number of MusicBrainz release candidates to request.
     pub mb_limit: usize,
+    /// Write disc-prefixed track numbers (101, 201, ...) for players that
+    /// ignore the disc tag, such as Tesla's USB player.
+    pub disc_prefix_track_numbers: bool,
 
     /// Runtime-only: enable verbose logging from the Soulseek library.
     #[serde(skip)]
@@ -74,6 +77,7 @@ impl Default for Config {
             candidates_per_track: 12,
             listen_port: 0,
             mb_limit: 25,
+            disc_prefix_track_numbers: false,
             verbose_lib: false,
         }
     }

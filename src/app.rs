@@ -465,6 +465,7 @@ pub enum SettingKey {
     Candidates,
     ListenPort,
     MbLimit,
+    DiscPrefixTracks,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -625,6 +626,18 @@ impl SettingsForm {
                 config.mb_limit.to_string(),
                 SettingKind::Int { min: 1, max: 100 },
             ),
+            field(
+                SettingKey::DiscPrefixTracks,
+                "Disc-prefixed tracks",
+                "Tesla-friendly 101, 201",
+                if config.disc_prefix_track_numbers {
+                    "on"
+                } else {
+                    "off"
+                }
+                .to_string(),
+                SettingKind::Bool,
+            ),
         ];
         let mut list_state = ratatui::widgets::ListState::default();
         list_state.select(Some(0));
@@ -740,6 +753,9 @@ impl SettingsForm {
                 }
                 SettingKey::ListenPort => config.listen_port = parse_u16(&value, index, field)?,
                 SettingKey::MbLimit => config.mb_limit = parse_usize(&value, index, field)?,
+                SettingKey::DiscPrefixTracks => {
+                    config.disc_prefix_track_numbers = value == "on";
+                }
             }
         }
         if let Some(error) = config.validate().first() {
@@ -1482,6 +1498,7 @@ impl App {
             last_resort_rounds: self.cfg.last_resort_rounds,
             last_resort_stall: Duration::from_secs(self.cfg.last_resort_stall_timeout_secs),
             candidates_per_track: self.cfg.candidates_per_track,
+            disc_prefix_track_numbers: self.cfg.disc_prefix_track_numbers,
         };
         let request = DownloadRequest {
             job_id,
@@ -2359,11 +2376,17 @@ mod tests {
             .find(|field| field.key == SettingKey::Fingerprint)
             .unwrap()
             .value = "off".into();
+        form.fields
+            .iter_mut()
+            .find(|field| field.key == SettingKey::DiscPrefixTracks)
+            .unwrap()
+            .value = "on".into();
 
         let config = form.to_config(&base).unwrap();
         assert_eq!(config.max_concurrent, 8);
         assert_eq!(config.music_dir, "/tmp/music");
         assert!(!config.fingerprint);
+        assert!(config.disc_prefix_track_numbers);
         assert_eq!(config.username, "user");
     }
 

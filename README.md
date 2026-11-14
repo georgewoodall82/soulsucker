@@ -49,7 +49,9 @@ duration/fingerprint verification, and automatic retries:
   release — canonical album/artist/title/date, track/disc numbers, MusicBrainz
   IDs, and cover art from the iTunes Search API (with the Cover Art Archive as
   a fallback) — and files are named `01 - Title.flac` (or `1-01 - Title.flac`
-  for multi-disc releases).
+  for multi-disc releases). An optional **disc-prefixed track numbers** setting
+  writes tags like `101…113` and `201…213` for players that ignore the disc tag
+  (Tesla's USB player, for example).
 - **Skip or force.** Valid existing tracks are skipped by default; `--force`
   downloads them again. A stray/empty file with the right name is validated and
   replaced rather than trusted.
@@ -170,7 +172,8 @@ soulsucker --no-fingerprint
    track/disc numbers, and MusicBrainz IDs. Cover art is fetched from the
    iTunes Search API first, with the Cover Art Archive as a fallback.
    Embedded art from the source is replaced, so a file cannot keep a cover
-   from a different edition.
+   from a different edition. If **disc-prefixed track numbers** is enabled,
+   multi-disc track tags become `101…113`, `201…213`, and so on.
 
 ## Keys
 
@@ -234,7 +237,8 @@ is in flight; `Esc` cancels the request so you can open it.
 Settings covers credentials, the AcoustID key, fingerprint on/off, music
 folder, parallel downloads, search/queue/stall timeouts, length tolerance,
 AcoustID score, last-resort passes and patience, sources per track, listener
-port (0 = automatic), and MusicBrainz result count.
+port (0 = automatic), MusicBrainz result count, and disc-prefixed track numbers
+for players that ignore disc tags (Tesla and similar car stereos).
 
 ## Configuration
 
@@ -258,11 +262,18 @@ last_resort_stall_timeout_secs = 60
 candidates_per_track = 12
 listen_port = 0
 mb_limit = 25
+disc_prefix_track_numbers = false
 ```
 
 `listen_port = 0` asks the OS for a free port, which is friendlier than a
 fixed port when several apps use the network. If you need port forwarding,
 set a specific port and forward it on your router.
+
+`disc_prefix_track_numbers = false` keeps standard per-disc track tags. Set it
+to `true` for players that ignore the disc tag (notably Tesla's USB player):
+multi-disc tracks are then tagged `101…113`, `201…213`, and so on. Album names
+and filenames stay unchanged. The setting applies when tags are written, so
+enable it and rerun with `--force` to retag an existing download.
 
 ## CLI options
 
@@ -312,6 +323,10 @@ contain peer-supplied text, so treat them as untrusted.
 - **Stale partial files.** They live in the destination folder's hidden
   `.soulsucker-staging` directory and are cleaned up at the start of the next
   download for that release. Quitting also tries to remove them.
+- **Two track 1s on a multi-disc album (Tesla).** Tesla's USB player ignores
+  the disc tag and sorts only by track number. Enable Settings →
+  **Disc-prefixed tracks** (or `disc_prefix_track_numbers = true`) and rerun
+  with `--force` to retag; tracks then appear as `101…`, `201…`.
 - **Firewalled peer.** Soulseek can broker connections, but two peers both
   behind strict NAT may not be able to transfer. The app simply tries another
   source.

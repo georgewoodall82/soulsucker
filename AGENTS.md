@@ -166,6 +166,7 @@ Turns Soulseek search hits into ranked per-track candidates.
 - When a cover is supplied, all embedded pictures are replaced with it.
 - `write_cover` is used for late-arriving covers and leaves the other tags untouched.
 - Tagging is best-effort: a tag/cover failure must not fail the download.
+- `disc_prefix_track_numbers` (opt-in) writes disc-prefixed tags (`101…113`, `201…213`) for multi-disc releases so players that ignore the disc tag, notably Tesla's USB player, keep the discs in order. Filenames still use the `1-01` form.
 
 ### `config.rs`
 

@@ -109,6 +109,7 @@ pub struct DownloadOptions {
     pub last_resort_rounds: u32,
     pub last_resort_stall: Duration,
     pub candidates_per_track: usize,
+    pub disc_prefix_track_numbers: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +152,7 @@ impl std::fmt::Debug for DownloadOptions {
             .field("last_resort_rounds", &self.last_resort_rounds)
             .field("last_resort_stall", &self.last_resort_stall)
             .field("candidates_per_track", &self.candidates_per_track)
+            .field("disc_prefix_track_numbers", &self.disc_prefix_track_numbers)
             .finish()
     }
 }
@@ -1410,16 +1412,26 @@ impl Session {
             .iter()
             .filter(|meta| meta.disc == track.meta.disc)
             .count() as u32;
+        let disc_total = album.job.disc_total();
+        let prefix_tracks = album.job.options.disc_prefix_track_numbers && disc_total > 1;
+        let track_number = tagged_track_number(
+            track.meta.disc,
+            track.meta.position,
+            disc_total,
+            prefix_tracks,
+        );
+        let track_total =
+            tagged_track_number(track.meta.disc, disc_track_total, disc_total, prefix_tracks);
         let tags = TrackTags {
             title: &track.meta.title,
             artist: &track.meta.artist,
             album_artist: &album.job.artist,
             album: &album.job.album,
             date,
-            track: track.meta.position,
-            track_total: disc_track_total,
+            track: track_number,
+            track_total,
             disc: track.meta.disc,
-            disc_total: album.job.disc_total(),
+            disc_total,
             release_mbid: &album.job.release_mbid,
             release_group_mbid: &album.job.release_group_mbid,
             recording_mbid: &track.meta.recording_mbid,
@@ -2088,6 +2100,17 @@ fn promote_file(source: &Path, target: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Some players (notably Tesla's USB player) ignore the disc tag and sort only
+/// by track number. Opt-in disc-prefixed numbers keep both discs in order:
+/// disc 1 becomes 101..113 and disc 2 becomes 201..213.
+fn tagged_track_number(disc: u32, position: u32, disc_count: u32, prefix: bool) -> u32 {
+    if prefix && disc_count > 1 {
+        disc.max(1) * 100 + position
+    } else {
+        position
+    }
+}
+
 /// Build a final track filename. Multi-disc releases get a `1-01` prefix.
 pub fn track_filename(
     disc: u32,
@@ -2108,6 +2131,16 @@ pub fn track_filename(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disc_prefixed_track_numbers_keep_discs_in_order() {
+        assert_eq!(tagged_track_number(1, 1, 2, true), 101);
+        assert_eq!(tagged_track_number(1, 13, 2, true), 113);
+        assert_eq!(tagged_track_number(2, 1, 2, true), 201);
+        assert_eq!(tagged_track_number(2, 13, 2, true), 213);
+        assert_eq!(tagged_track_number(1, 1, 1, true), 1);
+        assert_eq!(tagged_track_number(2, 8, 2, false), 8);
+    }
 
     #[test]
     fn filenames_are_zero_padded_and_disc_aware() {
@@ -2183,6 +2216,7 @@ mod tests {
                     last_resort_rounds: 1,
                     last_resort_stall: Duration::from_secs(10),
                     candidates_per_track: 12,
+                    disc_prefix_track_numbers: false,
                 },
                 force: false,
             },
