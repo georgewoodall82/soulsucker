@@ -66,8 +66,8 @@ duration/fingerprint verification, and automatic retries:
 
 - Rust **1.91+** (edition 2024).
 - A Soulseek account.
-- FFmpeg **8.x** libraries. Building needs the development headers; running
-  needs the shared libraries (usually installed with `ffmpeg`).
+- FFmpeg **8.x** development libraries to build from source. Prebuilt release
+  binaries link FFmpeg statically and need no runtime libraries.
 - A terminal at least **60×20** cells (the TUI asks for this if it is too small).
 - Optional: [`fpcalc`](https://acoustid.org/chromaprint) from
   `chromaprint-tools` for audio fingerprinting.
