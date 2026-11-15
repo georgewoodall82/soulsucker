@@ -20,7 +20,7 @@ cargo build --release
 cargo build --release --features ffmpeg-static
 ```
 
-- `ffmpeg-static` compiles FFmpeg from source and statically links it. Use it for release artifacts; it needs `git`, `make`, `nasm`, and a C compiler. The normal build links the system FFmpeg development libraries.
+- `ffmpeg-static` compiles FFmpeg from source and statically links it. Use it for release artifacts; it needs `git`, `make`, `nasm`, and a C compiler. The normal build links the system FFmpeg development libraries. MP3 encoding uses the bundled LAME source from `mp3lame-encoder`, so no system LAME library is needed.
 
 - Rust **1.91+**, edition **2024**.
 - FFmpeg **8.x** development libraries are required (`ffmpeg-devel` on Fedora, `libavcodec-dev libavformat-dev libavfilter-dev libavutil-dev libswresample-dev` on Debian/Ubuntu). `ffmpeg-next` links the system libraries.
@@ -44,15 +44,16 @@ cargo build --release --features ffmpeg-static
 │   ├── musicbrainz.rs   release search/ranking, release details, cover lookup
 │   ├── matcher.rs       local fuzzy matching and source selection
 │   ├── acoustid.rs      fpcalc + AcoustID verification
-│   ├── normalize.rs     two-pass EBU R128 loudness normalization via FFmpeg
-│   ├── audio.rs         FLAC inspection, metadata tagging, cover embedding
+│   ├── normalize.rs     two-pass EBU R128 normalization + FLAC/MP3 output
+│   ├── audio.rs         FLAC/MP3 inspection, metadata tagging, cover embedding
 │   ├── config.rs        TOML config, normalization, secure atomic saves
 │   ├── cli.rs           clap arguments and persistence semantics
 │   ├── update.rs        GitHub release check, download, self-replacement
 │   ├── input.rs         reusable text input editing
 │   └── util.rs          formatting, filename/path helpers, display width
 ├── tests/fixtures/
-│   └── silence.flac     tiny real FLAC used by the audio tagging test
+│   ├── silence.flac     tiny real FLAC used by the audio tagging test
+│   └── silence.mp3      tiny 320 kbps MP3 used by the MP3 audio tests
 ├── vendor/
 │   └── ffmpeg-sys-next  patched 8.1 crate (MSVC CPU flags)
 └── .github/workflows/
@@ -72,7 +73,7 @@ main
      ├─ update worker ───────────────> UiEvent::UpdateStarted / UiEvent::UpdateDone
      └─ SessionHandle ──> session thread (owns soulseek-rs Client)
            ├─ search worker ─────────> SessionCommand::SearchDone
-           ├─ verify + normalize ────> SessionCommand::Verified
+           ├─ verify + process ──────> SessionCommand::Verified
            └─ cover worker ──────────> SessionCommand::CoverReady
 ```
 
@@ -93,7 +94,7 @@ Owns all UI state: `Screen`, `SearchView`, `TracksView`, `DownloadView`, `Settin
 Important patterns:
 
 - Screens: `Setup`, `Search`, `Tracks`, `Download`, `Settings`.
-- `TracksView::build` owns destination paths: album releases go to `<music_dir>/<Artist>/<Album>/`, while MusicBrainz release-group type `Single` is saved as loose files in `<music_dir>/<Artist>/`. Changing this layout means changing `TracksView::build` and its path tests.
+- `TracksView::build` owns destination paths: album releases go to `<music_dir>/<Artist>/<Album>/`, while MusicBrainz release-group type `Single` is saved as loose files in `<music_dir>/<Artist>/`. The extension comes from `audio_quality` (`.flac` or `.mp3`). Changing this layout means changing `TracksView::build` and its path tests.
 - `UiEvent` includes a `generation`; ignore stale results when the generation no longer matches.
 - `App::run` drains events, renders, polls keys, then ticks. Don't do blocking work here.
 - MusicBrainz search/release requests are spawned as named threads.
@@ -123,8 +124,8 @@ Main flow:
 3. `schedule` starts tracks up to `max_concurrent`.
 4. `start_candidate` downloads into a unique per-attempt staging directory.
 5. `poll_downloads` watches queue/stall/progress, rejects bad attempts, and queues completed files for verification.
-6. `begin_verification` removes the library download record, finds the staged non-`.part` file, and verifies it in a worker. When `normalize_loudness` is enabled, the same worker runs the two-pass normalizer after verification and sends back the normalized staging path.
-7. `verified` promotes the (possibly normalized) file to its final name, writes MusicBrainz tags and cover art, and marks the track done.
+6. `begin_verification` removes the library download record, finds the staged non-`.part` file, and verifies it in a worker. Duration and AcoustID checks always run before any normalization or conversion. When `normalize_loudness` or MP3 output requires processing, the same worker runs `normalize::process_file` and sends back the processed staging path.
+7. `verified` promotes the (possibly normalized/converted) file to its final name, writes MusicBrainz tags and cover art, and marks the track done. A conversion failure for a FLAC-to-MP3 track rejects that source and tries the next one; a failed normalization of an already-correct format keeps the original.
 8. Failures go through `fail_attempt` and then `advance_after_failure`: next candidate, last-resort rounds, or `Failed`.
 9. `check_completion` fires when every track is `Done`, `Failed`, or `Cancelled`.
 
@@ -151,7 +152,9 @@ Album phases: `Searching`, `Downloading`, `Complete`.
 
 Turns Soulseek search hits into ranked per-track candidates.
 
-- Filters non-FLAC, tiny/huge files, samples/previews/snippets, and bad durations.
+- In FLAC mode, filters non-FLAC, tiny/huge files, samples/previews/snippets, and bad durations.
+- In MP3 320 mode, accepts FLAC as a fallback and only MP3 files identified as 320 kbps from Soulseek's bitrate attribute or size/duration (or an explicit `320` filename when attributes are missing). Low-bitrate MP3s are ignored.
+- Candidate ranking still puts match score first; equal score bands prefer MP3 over FLAC in MP3 mode, then free slots, peer speed, duration closeness and file size.
 - Scores title similarity, duration closeness, track/disc numbers, free slots, peer speed, and file size.
 - Assigns each remote file globally to its best-matching track before applying per-track/per-user limits. A file is still only used for one track; do not revert to greedy per-track assignment, which lets an earlier track consume a similarly named later track's sources.
 - Rejects files whose reported duration is far from the expected track length, using `allowed_duration_drift` rather than a fixed 90-second window.
@@ -165,13 +168,15 @@ Turns Soulseek search hits into ranked per-track candidates.
 - Fingerprint verification is best-effort: missing key, missing `fpcalc`, timeout, or AcoustID outage falls back to accepting on duration.
 - A top-cluster recording from the selected release group is accepted even when its recording MBID differs; reissues and early CD pressings often use alternate edits of the same track.
 - A clear top-cluster mismatch rejects the file.
+- MP3 320 mode also rejects a lossy source whose actual bitrate is below 300 kbps.
 - `fpcalc` is run with a timeout and killed if it hangs.
 - AcoustID requests are throttled and cached where appropriate.
 
 ### `audio.rs`
 
-- `duration_secs` requires a real FLAC container and a positive duration.
-- `write_tags` overwrites canonical MusicBrainz fields and strips non-primary tag blocks from FLACs (e.g. stray ID3v2/APE) so old source metadata cannot survive.
+- `duration_secs` accepts FLAC and MP3, requires a positive duration, and rejects a file whose actual format does not match its extension.
+- `bitrate_kbps` reads the MP3 audio bitrate; MP3 320 mode uses it to reject mislabeled lossy sources after download.
+- `write_tags` overwrites canonical MusicBrainz fields and strips non-primary tag blocks (e.g. stray ID3v2/APE on FLAC, ID3v1/APE on MP3) so old source metadata cannot survive.
 - When a cover is supplied, all embedded pictures are replaced with it.
 - `write_cover` is used for late-arriving covers and leaves the other tags untouched.
 - Tagging is best-effort: a tag/cover failure must not fail the download.
@@ -180,13 +185,14 @@ Turns Soulseek search hits into ranked per-track candidates.
 
 ### `normalize.rs`
 
-- `normalize_loudness` (opt-in) runs a two-pass EBU R128 pass on downloaded FLACs before tagging.
+- `normalize_loudness` (opt-in) runs a two-pass EBU R128 pass on downloaded tracks before tagging. In MP3 320 mode a FLAC source always needs a conversion pass after verification; when normalization is enabled it shares the second pass.
 - Targets: **-16 LUFS** integrated, **-1.5 dBTP** true peak, **11 LU** loudness range. Keep these safe defaults unless the user asks otherwise.
-- Pass one builds an `abuffer -> loudnorm` graph, writes JSON stats through `loudnorm`'s `stats_file`, and only pulls/discards frames. Pass two reopens the source, applies `measured_*` values with `linear=true`, and encodes FLAC to a temporary file beside the source.
-- The output uses an explicit `aformat` stage and fixed encoder frame size; FLAC requires fixed-size frames. `encode_stream` counts encoded samples.
+- Pass one builds an `abuffer -> loudnorm` graph, writes JSON stats through `loudnorm`'s `stats_file`, and only pulls/discards frames. Pass two reopens the source, applies `measured_*` values with `linear=true`, and writes a temporary FLAC or 320 kbps MP3 beside the source.
+- MP3 encoding uses the bundled `mp3lame-encoder`/LAME library (LGPL) at 320 kbps CBR. FFmpeg still handles decoding, resampling, channel conversion and `loudnorm`; high-resolution sources are resampled to 44.1/48 kHz and multichannel sources are downmixed to stereo.
+- FLAC output uses an explicit `aformat` stage and fixed encoder frame size; FLAC requires fixed-size frames. `encode_stream` counts encoded samples.
 - FFmpeg's FLAC muxer would store total samples through a zero-size side-data packet, but this FFmpeg build rejects it. `update_flac_total_samples` patches the 36-bit STREAMINFO field after muxing so duration and seeking work.
-- Normalization is best-effort: on failure, keep and tag the original file. The source is never modified in place; the temp file is returned and promoted by the session thread.
-- Never run normalization on the UI or session loop. It belongs in the verification worker.
+- Normalization/processing is best-effort: on failure, keep an already-correct source and tag it; if a FLAC still needs MP3 conversion, reject the attempt. The source is never modified in place; the temp file is returned and promoted by the session thread.
+- Never run normalization or conversion on the UI or session loop. It belongs in the verification worker.
 - Set FFmpeg's log level to quiet: the TUI owns the terminal and FFmpeg must not write diagnostics to it.
 
 ### `update.rs`
@@ -201,6 +207,7 @@ Turns Soulseek search hits into ranked per-track candidates.
 
 - TOML config contains the Soulseek password and AcoustID key in plaintext. Use `config::save`; it validates, writes atomically, tightens permissions to `0600` on Unix, and handles replacement safely. Do not add a plain `fs::write` path.
 - `Config::normalize` clamps hand-edited/CLI values into usable ranges. Any new numeric setting needs a sensible normalize rule.
+- `audio_quality` is `"flac"` (default) or `"mp3_320"`; unknown hand-edited values fall back to FLAC rather than discarding the whole config.
 - `Config`'s `Debug` implementation redacts secrets. Keep it that way.
 - Config path: `SOULSUCKER_CONFIG` if set, otherwise the platform config dir from `directories::ProjectDirs` (normally `~/.config/soulsucker/config.toml`). `--config FILE` overrides for the run.
 
@@ -220,11 +227,11 @@ These are easy to break and hard to debug.
 2. **Keep cancelled records when the library asks.** If `cancel_download` returns true, leave the library's `Cancelled` entry in place. It is what lets the library deny a late peer transfer offer. Only call `remove_download` when cancellation returned false.
 3. **The library flattens downloads by basename.** Two tracks or attempts with the same filename can collide. Every attempt gets its own staging directory under `.soulsucker-staging`; do not download directly to a final path.
 4. **Ignore stale async results.** Before mutating state, check `generation` (UI events), `job_id`, `search_attempt`, or `attempt_no` as appropriate. Late results from a previous album/attempt must be discarded.
-5. **Existing files are only trusted after validation.** `existing_file_is_valid` requires a readable FLAC and a duration within tolerance. Size alone is not enough. Existing valid tracks are skipped and are not retagged; use `--force` for that.
+5. **Existing files are only trusted after validation.** `existing_file_is_valid` requires a readable FLAC or MP3 whose actual format matches the `.flac`/`.mp3` extension and a duration within tolerance. Size alone is not enough. Existing valid tracks are skipped and are not retagged; use `--force` for that.
 6. **Promotion must preserve an existing file on failure.** `promote_file` uses a backup/rename fallback; keep that behavior.
 7. **Ownership of the Soulseek client matters.** `Arc<Client>` is shared with workers, but the session thread owns connect/reconnect/shutdown. Do not call blocking client operations from the UI thread.
 8. **Self-updates must stay atomic and off the UI thread.** Download to a temporary file beside the running executable, verify it, then rename it into place. The release workflow must publish raw `soulsucker-<tag>-<target>` binaries; the updater cannot extract archives.
-9. **Normalization must never destroy a download.** Encode to a temporary file, verify the result, and keep the original if anything fails. Run it in a worker, never on the UI or session loop.
+9. **Normalization and conversion must never destroy a download.** Encode to a temporary file, verify the result, and keep an already-correct source if processing fails. A FLAC source that still needs MP3 conversion must be rejected rather than promoted under a `.mp3` name. Run it in a worker, never on the UI or session loop.
 
 ## Config/CLI change checklist
 
@@ -246,7 +253,7 @@ When adding or changing a setting:
 - **Matching/scoring changes:** `matcher.rs`; update its tests. Remember cover matching depends on `normalize_text`/`strip_release_noise`.
 - **Retry/queue/stall behavior:** `session.rs` (`advance_after_failure`, `start_candidate`, `poll_downloads`, `schedule`).
 - **Verification behavior:** `acoustid.rs` and `session.rs` (`begin_verification`/`verified`).
-- **Loudness normalization:** `normalize.rs`, then the `normalize_loudness` option in `config.rs`/`app.rs`/`session.rs`.
+- **Loudness normalization / audio quality:** `normalize.rs`, then the `normalize_loudness` and `audio_quality` paths through `config.rs`/`app.rs`/`session.rs`.
 - **Tag fields or cover handling:** `audio.rs`, `session.rs` (`TrackTags` construction), then the audio unit test.
 - **Update behavior:** `update.rs`, the Settings action in `app.rs`/`ui.rs`, and raw asset packaging in `.github/workflows/release.yml`.
 - **UI formatting/truncation:** `util.rs` and `ui.rs`.
@@ -254,7 +261,7 @@ When adding or changing a setting:
 ## Testing notes
 
 - Run `cargo test`; currently all tests are unit tests and run offline.
-- Audio tests use `tests/fixtures/silence.flac`; the tag test writes a real FLAC, rewrites tags/cover, and reads them back.
+- Audio tests use `tests/fixtures/silence.flac` and `tests/fixtures/silence.mp3`; they write real files, rewrite tags/cover, and read them back. Keep tests offline and avoid requiring FFmpeg to process a real file.
 - Include regression tests for state-machine bugs. Existing examples cover stale search results, stale verification results, promotion rollback, token changes, and cover replacement.
 - If you need a live API check, do it manually (e.g. a temporary ignored test) and remove it before finishing. Do not leave network-dependent tests enabled.
 - Before finishing: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, and usually `cargo build --release`.
@@ -263,7 +270,7 @@ When adding or changing a setting:
 
 - Use `anyhow::Result` internally; convert to `String` for events/UI.
 - Name spawned threads (`soulseek-connect`, `soulsucker-verify`, `cover-art`, etc.) to make logs diagnosable.
-- Prefer existing dependencies (`ureq`, `serde`, `ratatui`, `lofty`, `strsim`, `ffmpeg-next`) over adding new crates.
+- Prefer existing dependencies (`ureq`, `serde`, `ratatui`, `lofty`, `strsim`, `ffmpeg-next`, `mp3lame-encoder`) over adding new crates.
 - Keep the `ffmpeg-sys-next` patch minimal. It only skips GCC CPU flags on MSVC; see `vendor/README.md`.
 - Respect external rate limits and use the existing throttles/User-Agents.
 - Keep TUI text width-safe and sanitize untrusted peer/source names.

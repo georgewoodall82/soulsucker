@@ -2,7 +2,8 @@
 //!
 //! One background thread owns the library client. Tracks are downloaded into
 //! per-attempt staging folders (the library flattens files by basename), then
-//! verified, tagged and moved to their final `01 - Title.flac` names.
+//! verified, optionally normalized/converted, tagged and moved to their final
+//! numbered names.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,7 +17,7 @@ use soulseek_rs::{Client, ClientSettings, DownloadStatus, PeerAddress, SoulseekR
 
 use crate::acoustid::{self, VerifyResult, VerifySpec};
 use crate::audio::{self, TrackTags};
-use crate::config::Config;
+use crate::config::{AudioQuality, Config};
 use crate::matcher::{self, Candidate, CandidateOptions, RemoteFile, SearchHit, TrackQuery};
 use crate::musicbrainz;
 use crate::normalize;
@@ -113,6 +114,7 @@ pub struct DownloadOptions {
     pub disc_prefix_track_numbers: bool,
     pub album_artist_for_tracks: bool,
     pub normalize_loudness: bool,
+    pub audio_quality: AudioQuality,
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +160,7 @@ impl std::fmt::Debug for DownloadOptions {
             .field("disc_prefix_track_numbers", &self.disc_prefix_track_numbers)
             .field("album_artist_for_tracks", &self.album_artist_for_tracks)
             .field("normalize_loudness", &self.normalize_loudness)
+            .field("audio_quality", &self.audio_quality)
             .finish()
     }
 }
@@ -801,6 +804,7 @@ impl Session {
                     length_tolerance: album.job.options.length_tolerance,
                     artist: album.job.artist.clone(),
                     album: album.job.album.clone(),
+                    quality: album.job.options.audio_quality,
                 };
                 let candidates = matcher::build_candidates(&queries, &hits, &options);
                 let mut per_track = Vec::with_capacity(candidates.len());
@@ -817,7 +821,7 @@ impl Session {
                     if sources.is_empty() {
                         track.status = TrackStatus::Failed;
                         track.speed = 0.0;
-                        track.note = "no matching FLAC source found".to_string();
+                        track.note = "no matching source found".to_string();
                         let _ = events.send(SlskEvent::Track(track.update(job_id)));
                     } else {
                         track.candidates = sources;
@@ -837,7 +841,8 @@ impl Session {
                 let _ = events.send(SlskEvent::Log(
                     LogLevel::Info,
                     format!(
-                        "Found {total_candidates} matching FLAC source(s) from {} peer(s); {matched}/{} tracks have a source.",
+                        "Found {total_candidates} matching {} source(s) from {} peer(s); {matched}/{} tracks have a source.",
+                        album.job.options.audio_quality.source_label(),
                         hits.len(),
                         album.tracks.len()
                     ),
@@ -1265,7 +1270,16 @@ impl Session {
             return;
         };
 
-        let (update, spec, position, title, source, normalize_loudness) = {
+        let (
+            update,
+            spec,
+            position,
+            title,
+            source,
+            normalize_loudness,
+            audio_quality,
+            source_is_mp3,
+        ) = {
             let Some(track) = album.tracks.get_mut(index) else {
                 return;
             };
@@ -1276,7 +1290,7 @@ impl Session {
             let deadline = verification_deadline(
                 Instant::now(),
                 track.meta.expected_secs,
-                album.job.options.normalize_loudness,
+                album.job.options.normalize_loudness || album.job.options.audio_quality.is_mp3(),
             );
             track.verifying = Some(VerifyingAttempt {
                 attempt_no,
@@ -1284,6 +1298,7 @@ impl Session {
                 deadline,
             });
             let update = track.update(job_id);
+            let source_is_mp3 = normalize::source_is_mp3(&staged);
             let spec = VerifySpec {
                 expected_secs: track.meta.expected_secs,
                 tolerance_secs: album.job.options.length_tolerance,
@@ -1291,6 +1306,8 @@ impl Session {
                 release_group_mbid: album.job.release_group_mbid.clone(),
                 api_key: album.job.options.api_key.clone(),
                 min_score: album.job.options.fingerprint_min_score,
+                min_mp3_bitrate_kbps: (album.job.options.audio_quality.is_mp3() && source_is_mp3)
+                    .then_some(300),
             };
             (
                 update,
@@ -1299,6 +1316,8 @@ impl Session {
                 track.meta.title.clone(),
                 track.source.clone(),
                 album.job.options.normalize_loudness,
+                album.job.options.audio_quality,
+                source_is_mp3,
             )
         };
         let _ = events.send(SlskEvent::Track(update.clone()));
@@ -1318,23 +1337,44 @@ impl Session {
                     phase_update.note = phase.to_string();
                     let _ = events.send(SlskEvent::Track(phase_update));
                 };
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     acoustid::verify_file(&path, &spec, &on_phase)
                 }))
                 .unwrap_or_else(|_| VerifyResult {
                     accepted: false,
                     note: "verification worker panicked".to_string(),
                 });
+                if result.accepted && !normalize::source_compatible(&path, audio_quality) {
+                    result = VerifyResult {
+                        accepted: false,
+                        note: format!("downloaded file is not a {} source", audio_quality.label()),
+                    };
+                }
                 let mut result_path = path.clone();
-                if result.accepted && normalize_loudness {
-                    on_phase("normalizing loudness (two-pass)…");
-                    match normalize::normalize_file(&path) {
-                        Ok(normalized) => result_path = normalized,
-                        Err(err) => {
+                if result.accepted
+                    && normalize::needs_processing(&path, audio_quality, normalize_loudness)
+                {
+                    on_phase(normalize::processing_phase(
+                        &path,
+                        audio_quality,
+                        normalize_loudness,
+                    ));
+                    match normalize::process_file(&path, audio_quality, normalize_loudness) {
+                        Ok(processed) => result_path = processed,
+                        Err(err) if source_is_mp3 == audio_quality.is_mp3() => {
                             let _ = events.send(SlskEvent::Log(
                                 LogLevel::Warn,
-                                format!("{position:02} {title}: loudness not normalized ({err})"),
+                                format!("{position:02} {title}: audio not processed ({err})"),
                             ));
+                        }
+                        Err(err) => {
+                            result = VerifyResult {
+                                accepted: false,
+                                note: format!(
+                                    "could not convert to {} ({err})",
+                                    audio_quality.label()
+                                ),
+                            };
                         }
                     }
                 }
@@ -1995,7 +2035,7 @@ fn advance_after_failure(album: &mut AlbumState, index: usize, events: &Sender<S
     }
     track.status = TrackStatus::Failed;
     track.note = if track.candidates.is_empty() {
-        "no matching FLAC source found".to_string()
+        "no matching source found".to_string()
     } else {
         format!("all {} sources failed", track.candidates.len())
     };
@@ -2024,6 +2064,7 @@ fn convert_hits(results: Vec<soulseek_rs::SearchResult>) -> Vec<SearchHit> {
                     path: file.name,
                     size: file.size,
                     duration_secs: file.attribs.get(&1).copied().filter(|seconds| *seconds > 0),
+                    bitrate_kbps: file.attribs.get(&0).copied().filter(|kbps| *kbps > 0),
                 })
                 .collect();
             if files.is_empty() {
@@ -2072,7 +2113,9 @@ fn staged_file(dir: &Path) -> Option<PathBuf> {
         let Some(name) = path.file_name() else {
             continue;
         };
-        if util::extension_of(&name.to_string_lossy()).eq_ignore_ascii_case("flac") {
+        if util::extension_of(&name.to_string_lossy()).eq_ignore_ascii_case("flac")
+            || util::extension_of(&name.to_string_lossy()).eq_ignore_ascii_case("mp3")
+        {
             candidates.push(path);
         }
     }
@@ -2105,7 +2148,7 @@ fn backup_path(target: &Path) -> PathBuf {
     let name = target
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("track.flac");
+        .unwrap_or("track");
     let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
     parent.join(format!(
         ".{name}.{}.{}.soulsucker-old",
@@ -2157,15 +2200,15 @@ fn tagged_artist<'a>(
     }
 }
 
-/// Verification normally has a fixed deadline. A two-pass normalize can take
-/// much longer than a fingerprint check, so scale the allowance with the
-/// expected track length and cap it at 30 minutes.
+/// Verification normally has a fixed deadline. Two-pass normalization or MP3
+/// conversion can take much longer than a fingerprint check, so scale the
+/// allowance with the expected track length and cap it at 30 minutes.
 fn verification_deadline(
     started: Instant,
     expected_secs: Option<f64>,
-    normalize_loudness: bool,
+    audio_processing: bool,
 ) -> Instant {
-    if normalize_loudness {
+    if audio_processing {
         let expected = expected_secs.unwrap_or(300.0).max(0.0);
         started + VERIFY_DEADLINE + Duration::from_secs_f64((expected * 2.0).min(1800.0))
     } else {
@@ -2181,20 +2224,21 @@ fn tagged_track_number(disc: u32, position: u32, disc_count: u32, prefix: bool) 
     }
 }
 
-/// Build a final track filename. Multi-disc releases get a `1-01` prefix.
-pub fn track_filename(
+/// Build a final track filename with a specific extension.
+pub fn track_filename_with_ext(
     disc: u32,
     position: u32,
     title: &str,
     disc_count: u32,
     track_count: u32,
+    extension: &str,
 ) -> String {
     let width = track_count.to_string().len().max(2);
     let title = util::sanitize_filename(title);
     if disc_count > 1 {
-        format!("{disc}-{position:0width$} - {title}.flac")
+        format!("{disc}-{position:0width$} - {title}.{extension}")
     } else {
-        format!("{position:0width$} - {title}.flac")
+        format!("{position:0width$} - {title}.{extension}")
     }
 }
 
@@ -2213,7 +2257,7 @@ mod tests {
     }
 
     #[test]
-    fn normalization_extends_the_verification_deadline() {
+    fn audio_processing_extends_the_verification_deadline() {
         let start = Instant::now();
         assert_eq!(
             verification_deadline(start, Some(300.0), false),
@@ -2242,18 +2286,25 @@ mod tests {
     #[test]
     fn filenames_are_zero_padded_and_disc_aware() {
         assert_eq!(
-            track_filename(1, 1, "Fight Fire With Fire", 1, 8),
+            track_filename_with_ext(1, 1, "Fight Fire With Fire", 1, 8, "flac"),
             "01 - Fight Fire With Fire.flac"
         );
         assert_eq!(
-            track_filename(2, 10, "Song/Two", 2, 10),
+            track_filename_with_ext(2, 10, "Song/Two", 2, 10, "flac"),
             "2-10 - Song_Two.flac"
+        );
+        assert_eq!(
+            track_filename_with_ext(1, 1, "Fight Fire With Fire", 1, 8, "mp3"),
+            "01 - Fight Fire With Fire.mp3"
         );
     }
 
     #[test]
     fn wide_track_numbers_use_more_padding() {
-        assert_eq!(track_filename(1, 3, "Track", 1, 120), "003 - Track.flac");
+        assert_eq!(
+            track_filename_with_ext(1, 3, "Track", 1, 120, "flac"),
+            "003 - Track.flac"
+        );
     }
 
     fn album_with_exhausted_track(rounds_left: u32) -> AlbumState {
@@ -2316,6 +2367,7 @@ mod tests {
                     disc_prefix_track_numbers: false,
                     album_artist_for_tracks: false,
                     normalize_loudness: false,
+                    audio_quality: AudioQuality::Flac,
                 },
                 force: false,
             },
@@ -2557,6 +2609,34 @@ mod tests {
     }
 
     #[test]
+    fn existing_mp3_files_are_validated_by_duration_and_extension() {
+        let dir = std::env::temp_dir().join(format!("soulsucker-mp3-valid-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("song.mp3");
+        fs::write(&path, include_bytes!("../tests/fixtures/silence.mp3")).unwrap();
+        let meta = TrackMeta {
+            index: 0,
+            disc: 1,
+            position: 1,
+            title: "Song".into(),
+            artist: "Artist".into(),
+            expected_secs: Some(1.0),
+            recording_mbid: "rec".into(),
+            track_mbid: "track".into(),
+            final_path: path.clone(),
+        };
+        assert!(existing_file_is_valid(&meta, 0.1).is_some());
+
+        let wrong_extension = dir.join("song.flac");
+        fs::copy(&path, &wrong_extension).unwrap();
+        let mut wrong_meta = meta;
+        wrong_meta.final_path = wrong_extension;
+        assert!(existing_file_is_valid(&wrong_meta, 0.1).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn staged_file_ignores_part_files() {
         let dir =
             std::env::temp_dir().join(format!("soulsucker-staged-test-{}", std::process::id()));
@@ -2566,6 +2646,9 @@ mod tests {
         assert!(staged_file(&dir).is_none());
         fs::write(dir.join("song.flac"), b"done").unwrap();
         assert_eq!(staged_file(&dir).unwrap().file_name().unwrap(), "song.flac");
+        fs::remove_file(dir.join("song.flac")).unwrap();
+        fs::write(dir.join("song.mp3"), b"done").unwrap();
+        assert_eq!(staged_file(&dir).unwrap().file_name().unwrap(), "song.mp3");
         let _ = fs::remove_dir_all(&dir);
     }
 }

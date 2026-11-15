@@ -210,7 +210,7 @@ fn footer_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     if app.screen == crate::app::Screen::Settings {
         return vec![
             ("↑↓", "select"),
-            ("Enter", "edit/toggle"),
+            ("Enter", "edit/toggle/cycle"),
             ("Ctrl+S", "save & back"),
             ("Esc", "discard & back"),
         ];
@@ -1237,6 +1237,7 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
                 }
             }
             SettingKind::Bool => format!("[{}]", field.value),
+            SettingKind::Choice(_) => format!("‹ {} ›", field.value),
             SettingKind::Action => update_label.to_string(),
             _ => field.value.clone(),
         };
@@ -1287,7 +1288,7 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
     } else {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "Enter edits, toggles or runs an action · Ctrl+S saves · Esc leaves",
+                "Enter edits, toggles, cycles or runs an action · Ctrl+S saves · Esc leaves",
                 Style::default().fg(BORDER),
             ))),
             error_area,
@@ -1441,7 +1442,10 @@ fn render_help(app: &App, frame: &mut Frame, area: Rect) {
         crate::app::Screen::Settings => {
             lines.push(help_section("Settings"));
             lines.push(help_line("↑ ↓", "select a field"));
-            lines.push(help_line("Enter", "edit / toggle / check updates"));
+            lines.push(help_line(
+                "Enter",
+                "edit / toggle / cycle option / check updates",
+            ));
             lines.push(help_line("Ctrl+S", "save and go back"));
             lines.push(help_line("Esc", "discard and go back"));
         }
@@ -1690,6 +1694,7 @@ mod tests {
         app.screen = Screen::Settings;
         let settings_text = render_text(&mut app, 110, 34);
         assert!(settings_text.contains("Settings"));
+        assert!(settings_text.contains("Audio quality"));
         assert!(settings_text.contains("Parallel downloads"));
 
         app.help_open = true;

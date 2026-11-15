@@ -1,9 +1,9 @@
 # soulsucker ♫
 
 A terminal album downloader that is actually pleasant to use. Pick a release
-from **MusicBrainz**, and soulsucker finds matching **FLAC** files on
-**Soulseek**, downloads them in parallel, verifies what it got, and files
-cleanly numbered tracks into an artist/album library.
+from **MusicBrainz**, and soulsucker finds matching **FLAC** or **320 kbps MP3**
+files on **Soulseek**, downloads them in parallel, verifies what it got, and
+files cleanly numbered tracks into an artist/album library.
 
 Built in Rust with [`ratatui`](https://ratatui.rs/) for the TUI,
 [`clap`](https://clap.rs/) for the command line, and
@@ -49,9 +49,13 @@ duration/fingerprint verification, and automatic retries:
   release — canonical album/artist/title/date, track/disc numbers, MusicBrainz
   IDs, and cover art from the iTunes Search API (with the Cover Art Archive as
   a fallback) — and files are named `01 - Title.flac` (or `1-01 - Title.flac`
-  for multi-disc releases). An optional **disc-prefixed track numbers** setting
-  writes tags like `101…113` and `201…213` for players that ignore the disc tag
-  (Tesla's USB player, for example).
+  for multi-disc releases; `.mp3` in MP3 mode). An optional **disc-prefixed
+  track numbers** setting writes tags like `101…113` and `201…213` for players
+  that ignore the disc tag (Tesla's USB player, for example).
+- **FLAC or MP3 320.** Choose lossless FLAC or 320 kbps MP3 in Settings. MP3
+  mode prefers a verified 320 kbps MP3 source; when none is available it takes
+  a FLAC source and converts it after verification. The conversion and loudness
+  normalization share the same second pass.
 - **Loudness normalization.** An optional two-pass EBU R128 pass brings each
   download to -16 LUFS with a -1.5 dBTP true-peak ceiling, so quiet and loud
   albums sit at a similar level in a car or on a portable player.
@@ -67,7 +71,8 @@ duration/fingerprint verification, and automatic retries:
 - Rust **1.91+** (edition 2024).
 - A Soulseek account.
 - FFmpeg **8.x** development libraries to build from source. Prebuilt release
-  binaries link FFmpeg statically and need no runtime libraries.
+  binaries link FFmpeg and the bundled LAME MP3 encoder statically and need no
+  runtime libraries.
 - A terminal at least **60×20** cells (the TUI asks for this if it is too small).
 - Optional: [`fpcalc`](https://acoustid.org/chromaprint) from
   `chromaprint-tools` for audio fingerprinting.
@@ -180,26 +185,31 @@ soulsucker --no-fingerprint
    as loose files directly in `<music folder>/<Artist>/`, alongside the album
    folders.
 4. One Soulseek search for `"artist album"` runs for the configured timeout.
-5. Every FLAC result is matched against every track locally. Junk (`sample`,
-   `preview`, `snippet`), non-FLAC files and tiny files are ignored. A
-   candidate whose reported duration is wildly different from MusicBrainz is
-   dropped.
+5. In FLAC mode, every FLAC result is matched against every track locally. In
+   MP3 320 mode, MP3 results identified as 320 kbps are preferred and FLAC is
+   kept as a fallback. Junk (`sample`, `preview`, `snippet`), the wrong format,
+   tiny files and wildly wrong durations are ignored.
 6. Tracks download in parallel. Each attempt gets its own hidden staging
    folder inside the destination folder, so partial files can never be mistaken
    for finished ones.
 7. When a transfer completes, its duration is checked. With an AcoustID key
    and `fpcalc`, the Chromaprint fingerprint is also checked: the expected
    MusicBrainz recording must appear in AcoustID's **top-scoring cluster**.
+   MP3 sources are also checked for a genuine 320 kbps bitrate.
 8. A wrong version, a stall, a queue timeout or a rejected transfer moves on
    to the next-best source. If every source fails, the list is retried in
    last-resort passes with longer patience.
-9. Accepted files are renamed, then retagged from the chosen MusicBrainz
-   release: title, track artist, album artist, album, release date,
-   track/disc numbers, and MusicBrainz IDs. Cover art is fetched from the
-   iTunes Search API first, with the Cover Art Archive as a fallback.
-   Embedded art from the source is replaced, so a file cannot keep a cover
-   from a different edition. If **disc-prefixed track numbers** is enabled,
-   multi-disc track tags become `101…113`, `201…213`, and so on.
+9. Only after verification, an accepted file is normalized and/or converted.
+   In MP3 mode a FLAC source becomes a 320 kbps MP3 here; with loudness
+   normalization enabled, that conversion shares the second normalization
+   pass.
+10. Accepted files are renamed, then retagged from the chosen MusicBrainz
+    release: title, track artist, album artist, album, release date,
+    track/disc numbers, and MusicBrainz IDs. Cover art is fetched from the
+    iTunes Search API first, with the Cover Art Archive as a fallback.
+    Embedded art from the source is replaced, so a file cannot keep a cover
+    from a different edition. If **disc-prefixed track numbers** is enabled,
+    multi-disc track tags become `101…113`, `201…213`, and so on.
 
 ## Keys
 
@@ -256,17 +266,17 @@ is in flight; `Esc` cancels the request so you can open it.
 | Key | Action |
 | --- | --- |
 | `↑` `↓` `Home` `End` | Select a field |
-| `Enter` | Edit / toggle / run action |
+| `Enter` | Edit / toggle / cycle / run action |
 | `Ctrl+S` | Save and return |
 | `Esc` | Discard and return |
 
 Settings covers credentials, the AcoustID key, fingerprint on/off, music
-folder, parallel downloads, search/queue/stall timeouts, length tolerance,
-AcoustID score, last-resort passes and patience, sources per track, listener
-port (0 = automatic), MusicBrainz result count, disc-prefixed track numbers
-and album-artist track tags for players that ignore disc tags or group by
-track artist (Tesla and similar car stereos), two-pass loudness
-normalization, and checking for updates.
+folder, audio quality (FLAC or MP3 320), parallel downloads, search/queue/stall
+timeouts, length tolerance, AcoustID score, last-resort passes and patience,
+sources per track, listener port (0 = automatic), MusicBrainz result count,
+disc-prefixed track numbers and album-artist track tags for players that ignore
+disc tags or group by track artist (Tesla and similar car stereos), two-pass
+loudness normalization, and checking for updates.
 
 **Check for updates** compares the running version with the latest public
 GitHub release. If a newer release exists, it downloads the matching raw
@@ -285,6 +295,7 @@ password = "your-password"
 acoustid_key = "your-acoustid-key"
 
 music_dir = "/home/you/Music"
+audio_quality = "flac"
 max_concurrent = 4
 search_timeout_secs = 20
 queue_timeout_secs = 30
@@ -306,6 +317,16 @@ normalize_loudness = false
 fixed port when several apps use the network. If you need port forwarding,
 set a specific port and forward it on your router.
 
+`audio_quality = "flac"` keeps lossless output. Set it to `"mp3_320"` to write
+320 kbps MP3 files instead. MP3 mode prefers a Soulseek source whose reported
+bitrate or size/duration identifies a 320 kbps MP3; every downloaded MP3 is
+also checked after transfer so a mislabeled 128 kbps file is rejected. If no
+320 kbps MP3 source is available, soulsucker downloads a FLAC and converts it
+after the duration and AcoustID checks. MP3 sources are kept untouched when
+normalization is off; with normalization on they are decoded and re-encoded at
+320 kbps as part of the two-pass normalization. If conversion fails for a
+FLAC-to-MP3 track, that source is rejected and the next source is tried.
+
 `disc_prefix_track_numbers = false` keeps standard per-disc track tags. Set it
 to `true` for players that ignore the disc tag (notably Tesla's USB player):
 multi-disc tracks are then tagged `101…113`, `201…213`, and so on. Album names
@@ -321,13 +342,16 @@ when tags are written, so enable it and rerun with `--force` to retag an
 existing download.
 
 `normalize_loudness = true` runs a two-pass EBU R128 normalization on each
-downloaded FLAC before it is tagged. The first pass measures the track with
+downloaded track before it is tagged. The first pass measures the track with
 FFmpeg's `loudnorm` filter; the second pass applies **-16 LUFS** integrated
 loudness, a **-1.5 dBTP** true-peak ceiling, and an **11 LU** loudness range.
-The audio is re-encoded losslessly, and the normalized file replaces the
-original only after the entire encode succeeds. If normalization fails, the
-download is kept and tagged unnormalized. Existing files are skipped unless you
-rerun with `--force`.
+FLAC output is re-encoded losslessly. In MP3 320 mode the same second pass also
+performs the FLAC-to-MP3 conversion, so there is no separate conversion pass.
+The processed file replaces the original only after the entire encode succeeds.
+If normalization fails, an already-correct source is kept and tagged
+unprocessed; a FLAC source that still needs MP3 conversion is rejected so
+another source can be tried. Existing files are skipped unless you rerun with
+`--force`.
 
 ## CLI options
 
@@ -367,9 +391,9 @@ contain peer-supplied text, so treat them as untrusted.
   displace one of them.
 - **MusicBrainz is busy.** The app retries `429/502/503` responses with a
   backoff. If it still fails, wait a moment and press `r`.
-- **No matching FLAC sources.** Soulseek is peer-to-peer: availability changes
-  by the minute. Try a longer search timeout, another pressing/edition, or
-  search again later.
+- **No matching sources.** Soulseek is peer-to-peer: availability changes by
+  the minute. Try a longer search timeout, another pressing/edition, set
+  **Audio quality** to FLAC, or search again later.
 - **A track keeps failing.** Open the activity log (`Tab`) to see whether it
   was a queue timeout, a stall, a duration mismatch or an AcoustID mismatch.
 - **Fingerprinting does not run.** Install `fpcalc` and/or add an AcoustID
@@ -402,3 +426,7 @@ downloads; it does not share folders. Be excellent: respect artists and other
 users, and only download material you have the rights to.
 
 This project is not affiliated with Soulseek, MusicBrainz or AcoustID.
+
+MP3 encoding uses the bundled [LAME](https://lame.sourceforge.io/) library,
+which is licensed under the LGPL. The project source is available in this
+repository.

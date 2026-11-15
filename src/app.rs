@@ -12,7 +12,7 @@ use ratatui::DefaultTerminal;
 
 use crate::acoustid;
 use crate::cli::Args;
-use crate::config::{self, Config};
+use crate::config::{self, AudioQuality, Config};
 use crate::input::TextInput;
 use crate::musicbrainz::{self, ReleaseCandidate, ReleaseInfo};
 use crate::session::{
@@ -270,26 +270,29 @@ impl TracksView {
         };
         let track_count = release.tracks.len() as u32;
         let disc_count = release.disc_count();
+        let extension = config.audio_quality.extension();
         let mut used = HashSet::new();
         let mut tracks = Vec::with_capacity(release.tracks.len());
 
         for track in &release.tracks {
             let base = if single {
-                format!("{}.flac", util::sanitize_filename(&track.title))
+                format!("{}.{extension}", util::sanitize_filename(&track.title))
             } else {
-                session::track_filename(
+                session::track_filename_with_ext(
                     track.disc,
                     track.position,
                     &track.title,
                     disc_count,
                     track_count,
+                    extension,
                 )
             };
             let mut filename = base.clone();
             if used.contains(&filename) {
-                let stem = base.strip_suffix(".flac").unwrap_or(&base);
-                for suffix in 2..100 {
-                    let candidate = format!("{stem} ({suffix}).flac");
+                let suffix = format!(".{extension}");
+                let stem = base.strip_suffix(&suffix).unwrap_or(&base);
+                for number in 2..100 {
+                    let candidate = format!("{stem} ({number}){suffix}");
                     if !used.contains(&candidate) {
                         filename = candidate;
                         break;
@@ -523,6 +526,7 @@ pub enum SettingKey {
     AcoustId,
     Fingerprint,
     MusicDir,
+    Quality,
     MaxConcurrent,
     SearchTimeout,
     QueueTimeout,
@@ -547,6 +551,7 @@ pub enum SettingKind {
     Int { min: i64, max: i64 },
     Float { min: f64, max: f64 },
     Bool,
+    Choice(&'static [&'static str]),
     Action,
 }
 
@@ -557,6 +562,10 @@ impl SettingKind {
 
     pub fn is_bool(self) -> bool {
         matches!(self, Self::Bool)
+    }
+
+    pub fn is_choice(self) -> bool {
+        matches!(self, Self::Choice(_))
     }
 
     pub fn is_action(self) -> bool {
@@ -622,6 +631,13 @@ impl SettingsForm {
                 "album folders go here",
                 config.music_dir.clone(),
                 SettingKind::Text,
+            ),
+            field(
+                SettingKey::Quality,
+                "Audio quality",
+                "MP3 320 falls back to FLAC",
+                config.audio_quality.label().to_string(),
+                SettingKind::Choice(&["FLAC", "MP3 320"]),
             ),
             field(
                 SettingKey::MaxConcurrent,
@@ -774,7 +790,7 @@ impl SettingsForm {
         let Some(field) = self.fields.get(self.selected) else {
             return;
         };
-        if field.kind.is_bool() || field.kind.is_action() {
+        if field.kind.is_bool() || field.kind.is_choice() || field.kind.is_action() {
             return;
         }
         self.editing = Some(EditState {
@@ -809,8 +825,18 @@ impl SettingsForm {
         let Some(field) = self.fields.get_mut(self.selected) else {
             return;
         };
-        if field.kind.is_bool() {
-            field.value = if field.value == "on" { "off" } else { "on" }.to_string();
+        match field.kind {
+            SettingKind::Bool => {
+                field.value = if field.value == "on" { "off" } else { "on" }.to_string();
+            }
+            SettingKind::Choice(options) if !options.is_empty() => {
+                let current = options
+                    .iter()
+                    .position(|option| *option == field.value)
+                    .unwrap_or(0);
+                field.value = options[(current + 1) % options.len()].to_string();
+            }
+            _ => {}
         }
     }
 
@@ -832,6 +858,10 @@ impl SettingsForm {
                 SettingKey::AcoustId => config.acoustid_key = value.trim().to_string(),
                 SettingKey::Fingerprint => config.fingerprint = value == "on",
                 SettingKey::MusicDir => config.music_dir = value.trim().to_string(),
+                SettingKey::Quality => {
+                    config.audio_quality = AudioQuality::parse(&value)
+                        .ok_or_else(|| (index, format!("{}: invalid quality", field.label)))?
+                }
                 SettingKey::MaxConcurrent => {
                     config.max_concurrent = parse_usize(&value, index, field)?
                 }
@@ -929,6 +959,13 @@ fn validate_field(kind: SettingKind, value: &str) -> Result<String, String> {
             Ok(format_number(parsed))
         }
         SettingKind::Bool => Ok(if value == "on" { "on" } else { "off" }.to_string()),
+        SettingKind::Choice(options) => {
+            if options.contains(&value) {
+                Ok(value.to_string())
+            } else {
+                Err("choose a listed option".to_string())
+            }
+        }
         SettingKind::Action => Ok(value.to_string()),
     }
 }
@@ -1361,7 +1398,7 @@ impl App {
                                 TrackStatus::Done | TrackStatus::Failed | TrackStatus::Cancelled
                             )
                         {
-                            row.note = "no matching FLAC source".to_string();
+                            row.note = "no matching source".to_string();
                         } else if row.status == TrackStatus::Queued {
                             row.note = format!("{count} source(s) available");
                         }
@@ -1708,6 +1745,7 @@ impl App {
             disc_prefix_track_numbers: self.cfg.disc_prefix_track_numbers,
             album_artist_for_tracks: self.cfg.album_artist_for_tracks,
             normalize_loudness: self.cfg.normalize_loudness,
+            audio_quality: self.cfg.audio_quality,
         };
         let request = DownloadRequest {
             job_id,
@@ -1850,6 +1888,7 @@ impl App {
             || old.password != new_config.password
             || old.listen_port != new_config.listen_port;
         let folder_changed = old.music_dir != new_config.music_dir;
+        let quality_changed = old.audio_quality != new_config.audio_quality;
         self.persisted_cfg = new_config.clone();
         self.cfg = new_config;
         self.fingerprint_override = None;
@@ -1873,10 +1912,16 @@ impl App {
             }
         }
         self.screen = self.previous_screen;
-        if pending_waiting && folder_changed {
+        if pending_waiting && (folder_changed || quality_changed) {
+            let kept = match (folder_changed, quality_changed) {
+                (true, true) => "music folder and audio quality",
+                (true, false) => "music folder",
+                (false, true) => "audio quality",
+                (false, false) => unreachable!(),
+            };
             self.toast(
                 LogLevel::Warn,
-                "Settings saved; the pending download keeps the old music folder",
+                format!("Settings saved; the pending download keeps the old {kept}"),
             );
         } else {
             self.toast(LogLevel::Success, "Settings saved");
@@ -2414,7 +2459,7 @@ impl App {
             }
             KeyCode::Enter => {
                 let kind = self.settings.selected_field().map(|field| field.kind);
-                if kind.is_some_and(SettingKind::is_bool) {
+                if kind.is_some_and(|kind| kind.is_bool() || kind.is_choice()) {
                     self.settings.toggle_selected();
                 } else if kind.is_some_and(SettingKind::is_action) {
                     self.check_for_updates();
@@ -2426,7 +2471,7 @@ impl App {
                 if self
                     .settings
                     .selected_field()
-                    .is_some_and(|field| field.kind.is_bool())
+                    .is_some_and(|field| field.kind.is_bool() || field.kind.is_choice())
                 {
                     self.settings.toggle_selected();
                 }
@@ -2536,6 +2581,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mp3_layout_uses_mp3_filenames() {
+        let config = Config {
+            music_dir: "/tmp/soulsucker-layout".into(),
+            audio_quality: AudioQuality::Mp3,
+            ..Config::default()
+        };
+        let tracks = TracksView::build(release_for_test("Album"), &config);
+        assert_eq!(
+            tracks.tracks[0].meta.final_path,
+            PathBuf::from("/tmp/soulsucker-layout/Artist/Album/01 - Song.mp3")
+        );
+        let single = TracksView::build(release_for_test("Single"), &config);
+        assert_eq!(
+            single.tracks[0].meta.final_path,
+            PathBuf::from("/tmp/soulsucker-layout/Artist/Song.mp3")
+        );
+    }
+
     fn phase_update(attempt: usize) -> TrackUpdate {
         TrackUpdate {
             job_id: 1,
@@ -2599,6 +2663,11 @@ mod tests {
             .find(|field| field.key == SettingKey::NormalizeLoudness)
             .unwrap()
             .value = "on".into();
+        form.fields
+            .iter_mut()
+            .find(|field| field.key == SettingKey::Quality)
+            .unwrap()
+            .value = "MP3 320".into();
 
         let config = form.to_config(&base).unwrap();
         assert_eq!(config.max_concurrent, 8);
@@ -2607,6 +2676,7 @@ mod tests {
         assert!(config.disc_prefix_track_numbers);
         assert!(config.album_artist_for_tracks);
         assert!(config.normalize_loudness);
+        assert_eq!(config.audio_quality, AudioQuality::Mp3);
         assert_eq!(config.username, "user");
     }
 

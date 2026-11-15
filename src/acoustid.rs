@@ -28,6 +28,8 @@ pub struct VerifySpec {
     pub release_group_mbid: String,
     pub api_key: String,
     pub min_score: f64,
+    /// Reject lossy sources below this bitrate (used by MP3 320 mode).
+    pub min_mp3_bitrate_kbps: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -459,6 +461,23 @@ pub fn verify_file(path: &Path, spec: &VerifySpec, on_phase: &dyn Fn(&str)) -> V
         ),
         None => crate::util::fmt_duration(duration),
     };
+
+    if let Some(min_kbps) = spec.min_mp3_bitrate_kbps {
+        match audio::bitrate_kbps(path) {
+            Ok(Some(kbps)) if kbps >= min_kbps => {}
+            Ok(Some(kbps)) => {
+                return VerifyResult::reject(format!(
+                    "MP3 bitrate {kbps} kbps — expected 320 kbps"
+                ));
+            }
+            Ok(None) => {
+                return VerifyResult::reject("could not read the MP3 bitrate".to_string());
+            }
+            Err(err) => {
+                return VerifyResult::reject(format!("could not read the MP3 bitrate ({err})"));
+            }
+        }
+    }
 
     if spec.recording_mbid.is_empty() {
         return VerifyResult::accept(format!(

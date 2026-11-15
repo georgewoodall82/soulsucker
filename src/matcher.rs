@@ -11,16 +11,40 @@ use strsim::normalized_levenshtein;
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;
 
+use crate::config::AudioQuality;
 use crate::util::{extension_of, remote_basename, stem};
 
 pub const MIN_MATCH_SCORE: f64 = 0.5;
 const MIN_FLAC_BYTES: u64 = 1_000_000;
 const MAX_FLAC_BYTES: u64 = 2_000_000_000;
+const MIN_MP3_BYTES: u64 = 300_000;
+const MAX_MP3_BYTES: u64 = 500_000_000;
+const MP3_320_MIN_KBPS: f64 = 300.0;
+const MAX_ESTIMATED_MP3_KBPS: f64 = 400.0;
 const MAX_FILES_PER_USER_PER_TRACK: usize = 3;
 const TRACK_NUMBER_BONUS: f64 = 0.05;
 const WRONG_TRACK_PENALTY: f64 = 0.10;
 const DISC_NUMBER_BONUS: f64 = 0.03;
 const WRONG_DISC_PENALTY: f64 = 0.05;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceFormat {
+    Flac,
+    Mp3,
+}
+
+impl SourceFormat {
+    fn from_path(path: &str) -> Option<Self> {
+        let extension = extension_of(remote_basename(path));
+        if extension.eq_ignore_ascii_case("flac") {
+            Some(Self::Flac)
+        } else if extension.eq_ignore_ascii_case("mp3") {
+            Some(Self::Mp3)
+        } else {
+            None
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RemoteFile {
@@ -28,6 +52,8 @@ pub struct RemoteFile {
     pub size: u64,
     /// Soulseek file attribute 1: duration in seconds, when the peer sent it.
     pub duration_secs: Option<u32>,
+    /// Soulseek file attribute 0: bitrate in kbps, when the peer sent it.
+    pub bitrate_kbps: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +89,7 @@ pub struct CandidateOptions {
     pub length_tolerance: f64,
     pub artist: String,
     pub album: String,
+    pub quality: AudioQuality,
 }
 
 #[derive(Debug, Clone)]
@@ -94,14 +121,24 @@ pub fn build_candidates(
     for hit in hits {
         for file in &hit.files {
             let base = remote_basename(&file.path);
-            if !extension_of(base).eq_ignore_ascii_case("flac") {
+            let Some(format) = SourceFormat::from_path(&file.path) else {
                 continue;
+            };
+            match format {
+                SourceFormat::Flac => {}
+                SourceFormat::Mp3
+                    if options.quality.is_mp3() && mp3_bitrate_is_320(file, &file.path) => {}
+                SourceFormat::Mp3 => continue,
             }
+            let (min_bytes, max_bytes) = match format {
+                SourceFormat::Flac => (MIN_FLAC_BYTES, MAX_FLAC_BYTES),
+                SourceFormat::Mp3 => (MIN_MP3_BYTES, MAX_MP3_BYTES),
+            };
             let lower = base.to_ascii_lowercase();
             if lower.contains("sample") || lower.contains("preview") || lower.contains("snippet") {
                 continue;
             }
-            if file.size > 0 && (file.size < MIN_FLAC_BYTES || file.size > MAX_FLAC_BYTES) {
+            if file.size > 0 && (file.size < min_bytes || file.size > max_bytes) {
                 continue;
             }
             if !seen.insert((hit.username.clone(), file.path.clone())) {
@@ -215,7 +252,6 @@ pub fn build_candidates(
             .then_with(|| a.file.cmp(&b.file))
             .then_with(|| a.track.cmp(&b.track))
     });
-
     let mut per_track: Vec<Vec<Candidate>> = tracks.iter().map(|_| Vec::new()).collect();
     let mut assigned: Vec<Option<usize>> = vec![None; prepared.len()];
     let mut per_user: Vec<HashMap<String, usize>> = tracks.iter().map(|_| HashMap::new()).collect();
@@ -254,6 +290,11 @@ pub fn build_candidates(
             let duration_b = duration_distance(track.expected_secs, b.duration_secs);
             score_b
                 .cmp(&score_a)
+                .then_with(|| {
+                    let a_mp3 = SourceFormat::from_path(&a.path) == Some(SourceFormat::Mp3);
+                    let b_mp3 = SourceFormat::from_path(&b.path) == Some(SourceFormat::Mp3);
+                    b_mp3.cmp(&a_mp3)
+                })
                 .then_with(|| b.free_slot.cmp(&a.free_slot))
                 .then_with(|| b.user_speed.cmp(&a.user_speed))
                 .then_with(|| {
@@ -277,6 +318,22 @@ fn duration_distance(expected: Option<f64>, reported: Option<u32>) -> f64 {
         (Some(expected), Some(reported)) => (expected - f64::from(reported)).abs(),
         _ => f64::MAX,
     }
+}
+
+/// A 320 kbps MP3 can be identified from Soulseek's bitrate attribute, or
+/// estimated from size and duration. Peers that send neither must at least put
+/// "320" in the filename; a 128 kbps file is worse than falling back to FLAC.
+fn mp3_bitrate_is_320(file: &RemoteFile, path: &str) -> bool {
+    if let Some(kbps) = file.bitrate_kbps.filter(|kbps| *kbps > 0) {
+        return f64::from(kbps) >= MP3_320_MIN_KBPS;
+    }
+    if let Some(seconds) = file.duration_secs.filter(|seconds| *seconds > 0)
+        && file.size > 0
+    {
+        let estimated = file.size as f64 * 8.0 / f64::from(seconds) / 1000.0;
+        return (MP3_320_MIN_KBPS..=MAX_ESTIMATED_MP3_KBPS).contains(&estimated);
+    }
+    path.to_ascii_lowercase().contains("320")
 }
 
 /// Similarity between a track title and a candidate file stem.
@@ -482,6 +539,7 @@ mod tests {
             path: path.to_string(),
             size,
             duration_secs: None,
+            bitrate_kbps: None,
         }
     }
 
@@ -569,6 +627,7 @@ mod tests {
         let options = CandidateOptions {
             per_track: 12,
             length_tolerance: 5.0,
+            quality: AudioQuality::Flac,
             artist: "Metallica".into(),
             album: "Ride the Lightning".into(),
         };
@@ -602,6 +661,7 @@ mod tests {
         let options = CandidateOptions {
             per_track: 12,
             length_tolerance: 5.0,
+            quality: AudioQuality::Flac,
             artist: "Artist".into(),
             album: "Album".into(),
         };
@@ -614,7 +674,98 @@ mod tests {
             path: path.to_string(),
             size,
             duration_secs: Some(duration_secs),
+            bitrate_kbps: None,
         }
+    }
+
+    #[test]
+    fn mp3_mode_prefers_a_verified_320_over_flac() {
+        let tracks = vec![TrackQuery {
+            disc: 1,
+            position: 1,
+            title: "Fight Fire With Fire".into(),
+            expected_secs: Some(240.0),
+        }];
+        let hits = vec![SearchHit {
+            username: "peer".into(),
+            free_slot: true,
+            speed: 1000,
+            files: vec![
+                file_with_duration("Metal\\01 - Fight Fire With Fire.flac", 40_000_000, 240),
+                file_with_duration("Metal\\01 - Fight Fire With Fire.mp3", 9_600_000, 240),
+            ],
+        }];
+        let options = CandidateOptions {
+            per_track: 12,
+            length_tolerance: 5.0,
+            quality: AudioQuality::Mp3,
+            artist: "Metallica".into(),
+            album: "Ride the Lightning".into(),
+        };
+        let out = build_candidates(&tracks, &hits, &options);
+        assert_eq!(out[0].len(), 2);
+        assert!(out[0][0].path.ends_with(".mp3"));
+        assert!(out[0][1].path.ends_with(".flac"));
+    }
+
+    #[test]
+    fn mp3_mode_rejects_low_bitrate_mp3_and_falls_back_to_flac() {
+        let tracks = vec![TrackQuery {
+            disc: 1,
+            position: 1,
+            title: "Fight Fire With Fire".into(),
+            expected_secs: Some(240.0),
+        }];
+        let hits = vec![SearchHit {
+            username: "peer".into(),
+            free_slot: true,
+            speed: 1000,
+            files: vec![
+                file_with_duration("Metal\\01 - Fight Fire With Fire.mp3", 3_840_000, 240),
+                file_with_duration("Metal\\01 - Fight Fire With Fire.flac", 40_000_000, 240),
+            ],
+        }];
+        let options = CandidateOptions {
+            per_track: 12,
+            length_tolerance: 5.0,
+            quality: AudioQuality::Mp3,
+            artist: "Metallica".into(),
+            album: "Ride the Lightning".into(),
+        };
+        let out = build_candidates(&tracks, &hits, &options);
+        assert_eq!(out[0].len(), 1);
+        assert!(out[0][0].path.ends_with(".flac"));
+    }
+
+    #[test]
+    fn reported_mp3_bitrate_can_select_a_file_without_duration() {
+        let tracks = vec![TrackQuery {
+            disc: 1,
+            position: 1,
+            title: "Song".into(),
+            expected_secs: None,
+        }];
+        let hits = vec![SearchHit {
+            username: "peer".into(),
+            free_slot: true,
+            speed: 1000,
+            files: vec![RemoteFile {
+                path: "Album\\01 - Song.mp3".into(),
+                size: 9_000_000,
+                duration_secs: None,
+                bitrate_kbps: Some(320),
+            }],
+        }];
+        let options = CandidateOptions {
+            per_track: 12,
+            length_tolerance: 5.0,
+            quality: AudioQuality::Mp3,
+            artist: "Artist".into(),
+            album: "Album".into(),
+        };
+        let out = build_candidates(&tracks, &hits, &options);
+        assert_eq!(out[0].len(), 1);
+        assert_eq!(out[0][0].path, "Album\\01 - Song.mp3");
     }
 
     #[test]
@@ -665,6 +816,7 @@ mod tests {
         let options = CandidateOptions {
             per_track: 12,
             length_tolerance: 5.0,
+            quality: AudioQuality::Flac,
             artist: "Pink Floyd".into(),
             album: "The Wall".into(),
         };
@@ -720,6 +872,7 @@ mod tests {
         let options = CandidateOptions {
             per_track: 12,
             length_tolerance: 5.0,
+            quality: AudioQuality::Flac,
             artist: "Pink Floyd".into(),
             album: "The Wall".into(),
         };
@@ -755,6 +908,7 @@ mod tests {
         let options = CandidateOptions {
             per_track: 12,
             length_tolerance: 5.0,
+            quality: AudioQuality::Flac,
             artist: "Artist".into(),
             album: "Album".into(),
         };

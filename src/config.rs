@@ -10,11 +10,83 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::util::{default_music_dir, expand_tilde};
 
 pub const APP_NAME: &str = "soulsucker";
+
+/// Format written to the music folder.
+///
+/// MP3 mode still accepts FLAC sources and converts them after verification;
+/// FLAC mode only downloads FLAC.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AudioQuality {
+    #[default]
+    Flac,
+    Mp3,
+}
+
+impl AudioQuality {
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Flac => "flac",
+            Self::Mp3 => "mp3",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Flac => "FLAC",
+            Self::Mp3 => "MP3 320",
+        }
+    }
+
+    /// Describes acceptable Soulseek sources in logs and status messages.
+    pub fn source_label(self) -> &'static str {
+        match self {
+            Self::Flac => "FLAC",
+            Self::Mp3 => "MP3 320 or FLAC",
+        }
+    }
+
+    pub fn is_mp3(self) -> bool {
+        matches!(self, Self::Mp3)
+    }
+
+    /// Serialized config value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Flac => "flac",
+            Self::Mp3 => "mp3_320",
+        }
+    }
+
+    /// Parse a config value or a Settings label.
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+        match value.as_str() {
+            "flac" | "lossless" => Some(Self::Flac),
+            "mp3" | "mp3_320" | "320" | "mp3_320kbps" => Some(Self::Mp3),
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for AudioQuality {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for AudioQuality {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        // A typo in a hand-edited config should fall back to FLAC instead of
+        // discarding the whole file (and the stored credentials with it).
+        let value = String::deserialize(deserializer)?;
+        Ok(Self::parse(&value).unwrap_or_default())
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -25,6 +97,8 @@ pub struct Config {
 
     /// Root folder that album folders are created inside.
     pub music_dir: String,
+    /// Output format: lossless FLAC or 320 kbps MP3.
+    pub audio_quality: AudioQuality,
 
     /// Maximum number of tracks downloading at once.
     pub max_concurrent: usize,
@@ -71,6 +145,7 @@ impl Default for Config {
             password: String::new(),
             acoustid_key: String::new(),
             music_dir: default_music_dir().to_string_lossy().into_owned(),
+            audio_quality: AudioQuality::Flac,
             max_concurrent: 4,
             search_timeout_secs: 20,
             queue_timeout_secs: 30,
@@ -98,6 +173,7 @@ impl std::fmt::Debug for Config {
             .field("password", &"<redacted>")
             .field("acoustid_key", &"<redacted>")
             .field("music_dir", &self.music_dir)
+            .field("audio_quality", &self.audio_quality)
             .field("max_concurrent", &self.max_concurrent)
             .field("fingerprint", &self.fingerprint)
             .finish_non_exhaustive()
@@ -438,13 +514,30 @@ mod tests {
             password: "secret".into(),
             acoustid_key: "key".into(),
             max_concurrent: 7,
+            audio_quality: AudioQuality::Mp3,
             ..Config::default()
         };
         let text = toml::to_string_pretty(&config).unwrap();
+        assert!(text.contains("audio_quality = \"mp3_320\""));
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.username, "someone");
         assert_eq!(back.max_concurrent, 7);
+        assert_eq!(back.audio_quality, AudioQuality::Mp3);
         assert_eq!(back.music_dir, config.music_dir);
+    }
+
+    #[test]
+    fn audio_quality_accepts_common_spellings_and_defaults_to_flac() {
+        assert_eq!(AudioQuality::parse("FLAC"), Some(AudioQuality::Flac));
+        assert_eq!(AudioQuality::parse("mp3"), Some(AudioQuality::Mp3));
+        assert_eq!(AudioQuality::parse("MP3 320"), Some(AudioQuality::Mp3));
+        assert_eq!(AudioQuality::parse("mp3_320"), Some(AudioQuality::Mp3));
+        assert_eq!(AudioQuality::parse("nonsense"), None);
+
+        let config: Config =
+            toml::from_str("username = \"u\"\npassword = \"p\"\naudio_quality = \"nonsense\"\n")
+                .unwrap();
+        assert_eq!(config.audio_quality, AudioQuality::Flac);
     }
 
     #[cfg(unix)]

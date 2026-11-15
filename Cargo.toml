@@ -3,7 +3,7 @@ name = "soulsucker"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.91"
-description = "A polished TUI album downloader: MusicBrainz + Soulseek FLAC"
+description = "A polished TUI album downloader: MusicBrainz + Soulseek FLAC/MP3"
 license = "MIT"
 default-run = "soulsucker"
 
@@ -28,6 +28,7 @@ ffmpeg-next = { version = "8.1", default-features = false, features = [
     "software-resampling",
 ] }
 lofty = "0.25"
+mp3lame-encoder = { version = "0.3", features = ["std"] }
 ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

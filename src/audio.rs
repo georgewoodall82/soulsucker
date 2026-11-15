@@ -12,14 +12,36 @@ use lofty::tag::{Accessor, ItemKey, Tag, TagType};
 pub fn duration_secs(path: &Path) -> Result<f64> {
     let tagged = lofty::read_from_path(path)
         .with_context(|| format!("could not read audio file {}", path.display()))?;
-    if tagged.file_type() != FileType::Flac {
-        return Err(anyhow!("not a FLAC file"));
-    }
+    ensure_supported(path, tagged.file_type())?;
     let duration = tagged.properties().duration().as_secs_f64();
     if duration <= 0.0 {
-        return Err(anyhow!("FLAC file reports a zero duration"));
+        return Err(anyhow!("audio file reports a zero duration"));
     }
     Ok(duration)
+}
+
+/// Audio bitrate in kbps for a supported file.
+pub fn bitrate_kbps(path: &Path) -> Result<Option<u32>> {
+    let tagged = lofty::read_from_path(path)
+        .with_context(|| format!("could not read audio file {}", path.display()))?;
+    ensure_supported(path, tagged.file_type())?;
+    Ok(tagged.properties().audio_bitrate())
+}
+
+fn ensure_supported(path: &Path, file_type: FileType) -> Result<()> {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+    let is_flac = extension.eq_ignore_ascii_case("flac");
+    let is_mp3 = extension.eq_ignore_ascii_case("mp3");
+    match file_type {
+        FileType::Flac if is_flac => Ok(()),
+        FileType::Mpeg if is_mp3 => Ok(()),
+        FileType::Flac => Err(anyhow!("FLAC file does not use a .flac extension")),
+        FileType::Mpeg => Err(anyhow!("MP3 file does not use a .mp3 extension")),
+        _ => Err(anyhow!("not a FLAC or MP3 file")),
+    }
 }
 
 pub struct TrackTags<'a> {
@@ -88,10 +110,11 @@ pub fn write_tags(path: &Path, tags: &TrackTags<'_>) -> Result<()> {
     save(tagged, path)
 }
 
-/// Copy embedded pictures from one FLAC to another.
+/// Copy embedded pictures from one audio file to another.
 ///
-/// Normalization re-encodes audio into a fresh file, so this keeps the source
-/// cover until canonical tags (and a better cover, when available) are written.
+/// Normalization or conversion re-encodes audio into a fresh file, so this
+/// keeps the source cover until canonical tags (and a better cover, when
+/// available) are written.
 pub fn copy_pictures(from: &Path, to: &Path) -> Result<()> {
     let source = tagged_file(from)?;
     let Some(source_tag) = source.primary_tag() else {
@@ -194,6 +217,24 @@ mod tests {
         ))
     }
 
+    fn mp3_test_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "soulsucker-audio-{}-{name}.mp3",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn mp3_duration_and_bitrate_are_read() {
+        let path = mp3_test_path("inspect");
+        fs::write(&path, include_bytes!("../tests/fixtures/silence.mp3")).unwrap();
+        let duration = duration_secs(&path).unwrap();
+        assert!((duration - 1.0).abs() < 0.1, "{duration}");
+        let bitrate = bitrate_kbps(&path).unwrap().unwrap();
+        assert!(bitrate >= 300, "{bitrate}");
+        let _ = fs::remove_file(path);
+    }
+
     #[test]
     fn musicbrainz_tags_replace_source_metadata_and_cover() {
         let path = test_path("tags");
@@ -277,6 +318,54 @@ mod tests {
         let tag = tagged.primary_tag().unwrap();
         assert_eq!(tag.pictures().len(), 1);
         assert_eq!(tag.pictures()[0].data(), b"\xff\xd8\xff\xe0new-cover");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn mp3_tags_replace_source_metadata_and_cover() {
+        let path = mp3_test_path("tags");
+        fs::write(&path, include_bytes!("../tests/fixtures/silence.mp3")).unwrap();
+        let cover = b"\x89PNG\r\n\x1a\nfake-image-data";
+        let tags = TrackTags {
+            title: "Song",
+            artist: "Track Artist",
+            track_artists: Some("Original Track Credit"),
+            album_artist: "Album Artist",
+            album: "Album",
+            date: Some("2001-02-03"),
+            track: 3,
+            track_total: 10,
+            disc: 2,
+            disc_total: 2,
+            release_mbid: "release-id",
+            release_group_mbid: "group-id",
+            recording_mbid: "recording-id",
+            track_mbid: "track-id",
+            cover: Some(cover),
+        };
+        write_tags(&path, &tags).unwrap();
+
+        let tagged = lofty::read_from_path(&path).unwrap();
+        let tag = tagged.primary_tag().unwrap();
+        assert_eq!(tag.title().as_deref(), Some("Song"));
+        assert_eq!(tag.artist().as_deref(), Some("Track Artist"));
+        assert_eq!(tag.album().as_deref(), Some("Album"));
+        assert_eq!(tag.track(), Some(3));
+        assert_eq!(tag.track_total(), Some(10));
+        assert_eq!(tag.disk(), Some(2));
+        assert_eq!(tag.disk_total(), Some(2));
+        assert_eq!(tag.get_string(ItemKey::AlbumArtist), Some("Album Artist"));
+        assert_eq!(
+            tag.get_string(ItemKey::TrackArtists),
+            Some("Original Track Credit")
+        );
+        assert_eq!(
+            tag.get_string(ItemKey::MusicBrainzRecordingId),
+            Some("recording-id")
+        );
+        assert_eq!(tag.pictures().len(), 1);
+        assert_eq!(tag.pictures()[0].data(), cover);
+        assert!(duration_secs(&path).unwrap() > 0.5);
         let _ = fs::remove_file(path);
     }
 }

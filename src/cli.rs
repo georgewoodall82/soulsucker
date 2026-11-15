@@ -10,7 +10,7 @@ use crate::config::Config;
 #[command(
     name = "soulsucker",
     version,
-    about = "Find an album on MusicBrainz and download it as FLAC from Soulseek",
+    about = "Find an album on MusicBrainz and download it from Soulseek",
     long_about = "A polished terminal album downloader. Run without arguments for the TUI; \
                   artist and album prefill the search. Credentials are asked for once and saved.",
     after_help = "Credential flags are saved to the config file. Other options override the stored \
