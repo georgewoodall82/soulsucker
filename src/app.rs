@@ -535,6 +535,7 @@ pub enum SettingKey {
     ListenPort,
     MbLimit,
     DiscPrefixTracks,
+    AlbumArtistTracks,
     CheckUpdates,
 }
 
@@ -714,6 +715,18 @@ impl SettingsForm {
                 SettingKind::Bool,
             ),
             field(
+                SettingKey::AlbumArtistTracks,
+                "Album artist on tracks",
+                "car-stereo grouping",
+                if config.album_artist_for_tracks {
+                    "on"
+                } else {
+                    "off"
+                }
+                .to_string(),
+                SettingKind::Bool,
+            ),
+            field(
                 SettingKey::CheckUpdates,
                 "Check for updates",
                 "GitHub latest release",
@@ -837,6 +850,9 @@ impl SettingsForm {
                 SettingKey::MbLimit => config.mb_limit = parse_usize(&value, index, field)?,
                 SettingKey::DiscPrefixTracks => {
                     config.disc_prefix_track_numbers = value == "on";
+                }
+                SettingKey::AlbumArtistTracks => {
+                    config.album_artist_for_tracks = value == "on";
                 }
                 SettingKey::CheckUpdates => {}
             }
@@ -1674,6 +1690,7 @@ impl App {
             last_resort_stall: Duration::from_secs(self.cfg.last_resort_stall_timeout_secs),
             candidates_per_track: self.cfg.candidates_per_track,
             disc_prefix_track_numbers: self.cfg.disc_prefix_track_numbers,
+            album_artist_for_tracks: self.cfg.album_artist_for_tracks,
         };
         let request = DownloadRequest {
             job_id,
@@ -2555,12 +2572,18 @@ mod tests {
             .find(|field| field.key == SettingKey::DiscPrefixTracks)
             .unwrap()
             .value = "on".into();
+        form.fields
+            .iter_mut()
+            .find(|field| field.key == SettingKey::AlbumArtistTracks)
+            .unwrap()
+            .value = "on".into();
 
         let config = form.to_config(&base).unwrap();
         assert_eq!(config.max_concurrent, 8);
         assert_eq!(config.music_dir, "/tmp/music");
         assert!(!config.fingerprint);
         assert!(config.disc_prefix_track_numbers);
+        assert!(config.album_artist_for_tracks);
         assert_eq!(config.username, "user");
     }
 

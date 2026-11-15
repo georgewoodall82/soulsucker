@@ -241,8 +241,8 @@ Settings covers credentials, the AcoustID key, fingerprint on/off, music
 folder, parallel downloads, search/queue/stall timeouts, length tolerance,
 AcoustID score, last-resort passes and patience, sources per track, listener
 port (0 = automatic), MusicBrainz result count, disc-prefixed track numbers
-for players that ignore disc tags (Tesla and similar car stereos), and checking
-for updates.
+and album-artist track tags for players that ignore disc tags or group by
+track artist (Tesla and similar car stereos), and checking for updates.
 
 **Check for updates** compares the running version with the latest public
 GitHub release. If a newer release exists, it downloads the matching raw
@@ -274,6 +274,7 @@ candidates_per_track = 12
 listen_port = 0
 mb_limit = 25
 disc_prefix_track_numbers = false
+album_artist_for_tracks = false
 ```
 
 `listen_port = 0` asks the OS for a free port, which is friendlier than a
@@ -285,6 +286,14 @@ to `true` for players that ignore the disc tag (notably Tesla's USB player):
 multi-disc tracks are then tagged `101…113`, `201…213`, and so on. Album names
 and filenames stay unchanged. The setting applies when tags are written, so
 enable it and rerun with `--force` to retag an existing download.
+
+`album_artist_for_tracks = false` keeps each MusicBrainz track credit in
+`ARTIST`. Set it to `true` for players that group by track artist (notably
+Tesla's USB player): every track gets the album artist in `ARTIST`, while the
+original credit is preserved in `ARTISTS`. Guest and live tracks then stay
+inside the album instead of creating a second artist entry. This also applies
+when tags are written, so enable it and rerun with `--force` to retag an
+existing download.
 
 ## CLI options
 
@@ -338,6 +347,11 @@ contain peer-supplied text, so treat them as untrusted.
   the disc tag and sorts only by track number. Enable Settings →
   **Disc-prefixed tracks** (or `disc_prefix_track_numbers = true`) and rerun
   with `--force` to retag; tracks then appear as `101…`, `201…`.
+- **The same album appears under a second artist (Tesla).** A guest or live
+  track carries a different MusicBrainz `ARTIST` credit. Enable Settings →
+  **Album artist on tracks** (or `album_artist_for_tracks = true`) and rerun
+  with `--force`; every track is then grouped under the album artist, with the
+  original credit kept in `ARTISTS`.
 - **Update failed with a permission error.** soulsucker cannot replace a binary
   in a read-only or system-owned directory. Move it somewhere writable, install
   it under your home directory, or download the release asset manually.

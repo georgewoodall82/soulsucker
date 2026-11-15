@@ -169,6 +169,7 @@ Turns Soulseek search hits into ranked per-track candidates.
 - `write_cover` is used for late-arriving covers and leaves the other tags untouched.
 - Tagging is best-effort: a tag/cover failure must not fail the download.
 - `disc_prefix_track_numbers` (opt-in) writes disc-prefixed tags (`101…113`, `201…213`) for multi-disc releases so players that ignore the disc tag, notably Tesla's USB player, keep the discs in order. Filenames still use the `1-01` form.
+- `album_artist_for_tracks` (opt-in) writes the release artist into every track's `ARTIST` and preserves a differing per-track credit in `ARTISTS`, so players that group by track artist (Tesla) keep guest tracks inside the album. Canonical per-track credits remain the default.
 
 ### `update.rs`
 

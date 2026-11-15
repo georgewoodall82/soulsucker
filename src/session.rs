@@ -110,6 +110,7 @@ pub struct DownloadOptions {
     pub last_resort_stall: Duration,
     pub candidates_per_track: usize,
     pub disc_prefix_track_numbers: bool,
+    pub album_artist_for_tracks: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +154,7 @@ impl std::fmt::Debug for DownloadOptions {
             .field("last_resort_stall", &self.last_resort_stall)
             .field("candidates_per_track", &self.candidates_per_track)
             .field("disc_prefix_track_numbers", &self.disc_prefix_track_numbers)
+            .field("album_artist_for_tracks", &self.album_artist_for_tracks)
             .finish()
     }
 }
@@ -1422,9 +1424,15 @@ impl Session {
         );
         let track_total =
             tagged_track_number(track.meta.disc, disc_track_total, disc_total, prefix_tracks);
+        let (tag_artist, track_artists) = tagged_artist(
+            &track.meta.artist,
+            &album.job.artist,
+            album.job.options.album_artist_for_tracks,
+        );
         let tags = TrackTags {
             title: &track.meta.title,
-            artist: &track.meta.artist,
+            artist: tag_artist,
+            track_artists,
             album_artist: &album.job.artist,
             album: &album.job.album,
             date,
@@ -2103,6 +2111,21 @@ fn promote_file(source: &Path, target: &Path) -> std::io::Result<()> {
 /// Some players (notably Tesla's USB player) ignore the disc tag and sort only
 /// by track number. Opt-in disc-prefixed numbers keep both discs in order:
 /// disc 1 becomes 101..113 and disc 2 becomes 201..213.
+/// Choose the ARTIST tag and keep a differing per-track credit in ARTISTS.
+fn tagged_artist<'a>(
+    track_artist: &'a str,
+    album_artist: &'a str,
+    album_artist_for_tracks: bool,
+) -> (&'a str, Option<&'a str>) {
+    if album_artist_for_tracks {
+        let track_artists =
+            (!track_artist.eq_ignore_ascii_case(album_artist)).then_some(track_artist);
+        (album_artist, track_artists)
+    } else {
+        (track_artist, None)
+    }
+}
+
 fn tagged_track_number(disc: u32, position: u32, disc_count: u32, prefix: bool) -> u32 {
     if prefix && disc_count > 1 {
         disc.max(1) * 100 + position
@@ -2140,6 +2163,16 @@ mod tests {
         assert_eq!(tagged_track_number(2, 13, 2, true), 213);
         assert_eq!(tagged_track_number(1, 1, 1, true), 1);
         assert_eq!(tagged_track_number(2, 8, 2, false), 8);
+    }
+
+    #[test]
+    fn album_artist_can_replace_track_artist_for_car_stereos() {
+        assert_eq!(tagged_artist("Staind", "Staind", false), ("Staind", None));
+        assert_eq!(
+            tagged_artist("Aaron Lewis and Fred Durst", "Staind", true),
+            ("Staind", Some("Aaron Lewis and Fred Durst"))
+        );
+        assert_eq!(tagged_artist("Staind", "Staind", true), ("Staind", None));
     }
 
     #[test]
@@ -2217,6 +2250,7 @@ mod tests {
                     last_resort_stall: Duration::from_secs(10),
                     candidates_per_track: 12,
                     disc_prefix_track_numbers: false,
+                    album_artist_for_tracks: false,
                 },
                 force: false,
             },

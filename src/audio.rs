@@ -25,6 +25,9 @@ pub fn duration_secs(path: &Path) -> Result<f64> {
 pub struct TrackTags<'a> {
     pub title: &'a str,
     pub artist: &'a str,
+    /// Original per-track credit, kept when `artist` is forced to the album
+    /// artist for car-stereo grouping.
+    pub track_artists: Option<&'a str>,
     pub album_artist: &'a str,
     pub album: &'a str,
     pub date: Option<&'a str>,
@@ -57,6 +60,11 @@ pub fn write_tags(path: &Path, tags: &TrackTags<'_>) -> Result<()> {
     tag.set_disk_total(tags.disc_total.max(tags.disc));
     tag.set_title(tags.title.to_string());
     tag.set_artist(artist.to_string());
+    if let Some(track_artists) = tags.track_artists.and_then(non_empty) {
+        tag.insert_text(ItemKey::TrackArtists, track_artists.to_string());
+    } else {
+        tag.remove_key(ItemKey::TrackArtists);
+    }
     tag.set_album(tags.album.to_string());
     if let Some(album_artist) = non_empty(album_artist) {
         tag.insert_text(ItemKey::AlbumArtist, album_artist.to_string());
@@ -172,6 +180,7 @@ mod tests {
         let stale = TrackTags {
             title: "Wrong Title",
             artist: "Wrong Artist",
+            track_artists: Some("Wrong Track Artists"),
             album_artist: "Wrong Album Artist",
             album: "Wrong Album (Remastered)",
             date: Some("1999"),
@@ -191,6 +200,7 @@ mod tests {
         let tags = TrackTags {
             title: "Song",
             artist: "Track Artist",
+            track_artists: Some("Original Track Credit"),
             album_artist: "Album Artist",
             album: "Album",
             date: Some("2001-02-03"),
@@ -216,6 +226,10 @@ mod tests {
         assert_eq!(tag.disk(), Some(2));
         assert_eq!(tag.disk_total(), Some(2));
         assert_eq!(tag.get_string(ItemKey::AlbumArtist), Some("Album Artist"));
+        assert_eq!(
+            tag.get_string(ItemKey::TrackArtists),
+            Some("Original Track Credit")
+        );
         assert_eq!(tag.get_string(ItemKey::RecordingDate), Some("2001-02-03"));
         assert_eq!(
             tag.get_string(ItemKey::MusicBrainzReleaseId),

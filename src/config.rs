@@ -52,6 +52,10 @@ pub struct Config {
     /// Write disc-prefixed track numbers (101, 201, ...) for players that
     /// ignore the disc tag, such as Tesla's USB player.
     pub disc_prefix_track_numbers: bool,
+    /// Write the album artist into every track's ARTIST tag so players that
+    /// group by track artist (Tesla and similar car stereos) keep the album
+    /// together. The original track credit is kept in ARTISTS.
+    pub album_artist_for_tracks: bool,
 
     /// Runtime-only: enable verbose logging from the Soulseek library.
     #[serde(skip)]
@@ -78,6 +82,7 @@ impl Default for Config {
             listen_port: 0,
             mb_limit: 25,
             disc_prefix_track_numbers: false,
+            album_artist_for_tracks: false,
             verbose_lib: false,
         }
     }
