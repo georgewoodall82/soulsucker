@@ -73,10 +73,6 @@ jobs:
       - name: Build (Windows)
         if: runner.os == 'Windows'
         shell: msys2 {0}
-        env:
-          # ffmpeg-sys-next otherwise passes GCC-style -march/-mtune to MSVC.
-          FFMPEG_MARCH: ""
-          FFMPEG_MTUNE: ""
         run: |
           # MSYS2 ships a coreutils `link` that shadows MSVC's linker.
           rm -f /usr/bin/link.exe

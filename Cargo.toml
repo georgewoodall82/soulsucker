@@ -7,6 +7,11 @@ description = "A polished TUI album downloader: MusicBrainz + Soulseek FLAC"
 license = "MIT"
 default-run = "soulsucker"
 
+[patch.crates-io]
+# ffmpeg-sys-next 8.1 passes GCC -march/-mtune flags to MSVC and fails.
+# The vendor copy adds an MSVC guard; drop this once upstream supports 8.1.
+ffmpeg-sys-next = { path = "vendor/ffmpeg-sys-next" }
+
 [features]
 # Build and statically link FFmpeg for self-contained release binaries.
 ffmpeg-static = ["ffmpeg-next/build"]
