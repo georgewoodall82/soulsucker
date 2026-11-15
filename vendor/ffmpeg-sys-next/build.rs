@@ -247,6 +247,7 @@ fn find_sysroot() -> Option<String> {
 }
 
 fn build(sysroot: Option<&str>) -> io::Result<()> {
+    // Keep the source tree in place so cached builds can be reconfigured.
     let source_dir = source();
     if cfg!(target_os = "windows") {
         let path = env::var("PATH").unwrap_or_default();
@@ -651,6 +652,13 @@ fn build(sysroot: Option<&str>) -> io::Result<()> {
     // time on platforms like mac which spawns thousands of nullabilty complieance warnings
     configure.arg("--extra-cflags=-w");
 
+    // Configure rewrites ffbuild/config.mak. If its contents changed since the
+    // last build, existing objects were compiled with different flags and must
+    // not be reused (for example, cached -march=native objects producing
+    // AVX-512 code on a different runner).
+    let config_mak = source_dir.join("ffbuild/config.mak");
+    let previous_config = fs::read_to_string(&config_mak).ok();
+
     // run ./configure
     let output = configure
         .output()
@@ -669,6 +677,22 @@ fn build(sysroot: Option<&str>) -> io::Result<()> {
             "configure failed {}",
             String::from_utf8_lossy(&output.stderr)
         )));
+    }
+
+    // A cached FFmpeg tree may contain objects from an older configuration.
+    let current_config = fs::read_to_string(&config_mak).ok();
+    if previous_config.is_some() && previous_config != current_config {
+        // The configure flags changed, so make would otherwise keep objects
+        // built with the previous flags.
+        println!("cargo:warning=FFmpeg configure flags changed; rebuilding from scratch");
+        if !Command::new("make")
+            .arg("clean")
+            .current_dir(&source_dir)
+            .status()?
+            .success()
+        {
+            return Err(io::Error::other("make clean failed"));
+        }
     }
 
     // run make
@@ -973,11 +997,15 @@ fn main() {
             search().join("lib").to_string_lossy()
         );
         link_to_libraries(statik);
-        if fs::metadata(search().join("lib").join("libavutil.a")).is_err() {
+        if !source().join("configure").exists() {
             fs::create_dir_all(output()).expect("failed to create build directory");
             fetch().unwrap();
-            build(sysroot.as_deref()).unwrap();
         }
+
+        // Always reconfigure. Cargo may reuse a cached target directory whose
+        // FFmpeg objects were built with different flags; build() compares
+        // config.mak and runs `make clean` when the configuration changed.
+        build(sysroot.as_deref()).unwrap();
 
         // Check additional required libraries.
         {
