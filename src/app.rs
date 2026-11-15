@@ -10,10 +10,11 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::DefaultTerminal;
 
+use crate::acoustid;
 use crate::cli::Args;
 use crate::config::{self, AudioQuality, Config};
 use crate::input::TextInput;
-use crate::musicbrainz::{self, ReleaseCandidate, ReleaseInfo};
+use crate::musicbrainz::{self, ReleaseCandidate, ReleaseGroupCandidate, ReleaseInfo};
 use crate::session::{
     self, DownloadOptions, DownloadRequest, LogLevel, SessionHandle, SlskEvent, TrackMeta,
     TrackStatus, TrackUpdate,
@@ -43,8 +44,17 @@ pub enum ConnState {
 
 #[derive(Debug)]
 pub enum UiEvent {
-    MbSearch {
+    SetupCheck {
         generation: u64,
+        result: Result<(), SetupProblem>,
+    },
+    MbGroups {
+        generation: u64,
+        result: Result<Vec<ReleaseGroupCandidate>, String>,
+    },
+    MbGroupReleases {
+        generation: u64,
+        group_mbid: String,
         result: Result<Vec<ReleaseCandidate>, String>,
     },
     MbRelease {
@@ -146,6 +156,21 @@ pub struct SetupForm {
     pub acoustid: TextInput,
     pub focus: usize,
     pub error: Option<String>,
+    pub checking: bool,
+    pending: Option<PendingSetup>,
+}
+
+struct PendingSetup {
+    username: String,
+    password: String,
+    acoustid: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetupProblem {
+    Soulseek(String),
+    AcoustId(String),
+    Unavailable(String),
 }
 
 impl SetupForm {
@@ -156,6 +181,8 @@ impl SetupForm {
             acoustid: TextInput::new(&config.acoustid_key),
             focus: if config.username.is_empty() { 0 } else { 1 },
             error: None,
+            checking: false,
+            pending: None,
         }
     }
 }
@@ -175,6 +202,7 @@ pub enum SearchFocus {
 pub enum SearchPhase {
     Idle,
     Searching { started: Instant },
+    FetchingReleases { started: Instant },
     Fetching { started: Instant },
 }
 
@@ -186,16 +214,32 @@ impl SearchPhase {
     pub fn started(self) -> Option<Instant> {
         match self {
             Self::Idle => None,
-            Self::Searching { started } | Self::Fetching { started } => Some(started),
+            Self::Searching { started }
+            | Self::FetchingReleases { started }
+            | Self::Fetching { started } => Some(started),
         }
     }
+}
+
+/// Where the user is in the album → release → tracklist flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchStage {
+    Groups,
+    Chosen,
+    Releases,
 }
 
 pub struct SearchView {
     pub artist: TextInput,
     pub album: TextInput,
     pub focus: SearchFocus,
-    pub results: Vec<ReleaseCandidate>,
+    pub groups: Vec<ReleaseGroupCandidate>,
+    pub releases: Vec<ReleaseCandidate>,
+    pub stage: SearchStage,
+    pub group: Option<ReleaseGroupCandidate>,
+    pub chosen: Option<ReleaseCandidate>,
+    /// 0 = continue with the chosen release, 1 = choose another release.
+    pub choice: usize,
     pub list_state: ratatui::widgets::ListState,
     pub phase: SearchPhase,
     pub error: Option<String>,
@@ -213,7 +257,12 @@ impl SearchView {
             artist: TextInput::new(artist),
             album: TextInput::new(album),
             focus,
-            results: Vec::new(),
+            groups: Vec::new(),
+            releases: Vec::new(),
+            stage: SearchStage::Groups,
+            group: None,
+            chosen: None,
+            choice: 0,
             list_state: ratatui::widgets::ListState::default(),
             phase: SearchPhase::Idle,
             error: None,
@@ -225,12 +274,28 @@ impl SearchView {
         self.list_state.selected()
     }
 
+    pub fn has_results(&self) -> bool {
+        match self.stage {
+            SearchStage::Groups => !self.groups.is_empty(),
+            SearchStage::Chosen => self.chosen.is_some(),
+            SearchStage::Releases => !self.releases.is_empty(),
+        }
+    }
+
+    fn list_len(&self) -> usize {
+        match self.stage {
+            SearchStage::Groups => self.groups.len(),
+            SearchStage::Releases => self.releases.len(),
+            SearchStage::Chosen => 0,
+        }
+    }
+
     fn set_selected(&mut self, index: usize) {
-        if self.results.is_empty() {
+        let len = self.list_len();
+        if len == 0 {
             self.list_state.select(None);
         } else {
-            let index = index.min(self.results.len() - 1);
-            self.list_state.select(Some(index));
+            self.list_state.select(Some(index.min(len - 1)));
         }
     }
 }
@@ -775,7 +840,7 @@ impl SettingsForm {
             field(
                 SettingKey::MbLimit,
                 "MusicBrainz results",
-                "release candidates",
+                "album/EP matches",
                 config.mb_limit.to_string(),
                 SettingKind::Int { min: 1, max: 100 },
             ),
@@ -1152,6 +1217,7 @@ fn parse_f64(value: &str, index: usize, field: &SettingField) -> Result<f64, (us
 pub enum ConfirmAction {
     Quit,
     NewSearch,
+    SetupWithoutAcoustId,
 }
 
 pub struct ConfirmDialog {
@@ -1171,6 +1237,7 @@ pub struct App {
     pub screen: Screen,
     pub previous_screen: Screen,
     pub setup: SetupForm,
+    pub setup_generation: u64,
     pub search: SearchView,
     pub tracks: Option<TracksView>,
     pub download: Option<DownloadView>,
@@ -1225,6 +1292,7 @@ impl App {
             },
             previous_screen: Screen::Search,
             setup,
+            setup_generation: 0,
             search,
             tracks: None,
             download: None,
@@ -1333,15 +1401,56 @@ impl App {
 
     fn handle_ui_event(&mut self, event: UiEvent) {
         match event {
-            UiEvent::MbSearch { generation, result } => {
+            UiEvent::SetupCheck { generation, result } => {
+                if generation != self.setup_generation {
+                    return;
+                }
+                self.setup.checking = false;
+                match result {
+                    Ok(()) => self.finish_setup(),
+                    Err(problem) => {
+                        self.setup.pending = None;
+                        let (message, focus) = match &problem {
+                            SetupProblem::Soulseek(_) => {
+                                ("Incorrect Soulseek username or password.", Some(1))
+                            }
+                            SetupProblem::AcoustId(_) => ("Incorrect AcoustID API key.", Some(2)),
+                            SetupProblem::Unavailable(_) => {
+                                ("Could not verify credentials; try again.", None)
+                            }
+                        };
+                        let detail = match problem {
+                            SetupProblem::Soulseek(message) => {
+                                format!("Soulseek login was rejected: {message}")
+                            }
+                            SetupProblem::AcoustId(message) => {
+                                format!("AcoustID key was rejected: {message}")
+                            }
+                            SetupProblem::Unavailable(message) => message,
+                        };
+                        self.setup.error = Some(message.to_string());
+                        if let Some(focus) = focus {
+                            self.setup.focus = focus;
+                        }
+                        self.push_log(LogLevel::Error, detail);
+                        self.toast(LogLevel::Error, "Credential check failed");
+                    }
+                }
+            }
+            UiEvent::MbGroups { generation, result } => {
                 if generation != self.generation {
                     return;
                 }
                 self.search.phase = SearchPhase::Idle;
                 match result {
-                    Ok(results) => {
-                        let count = results.len();
-                        self.search.results = results;
+                    Ok(groups) => {
+                        let count = groups.len();
+                        self.search.groups = groups;
+                        self.search.releases.clear();
+                        self.search.group = None;
+                        self.search.chosen = None;
+                        self.search.stage = SearchStage::Groups;
+                        self.search.choice = 0;
                         self.search.error = None;
                         if count == 0 {
                             self.search.list_state.select(None);
@@ -1349,26 +1458,91 @@ impl App {
                             self.auto_yes = false;
                             self.push_log(
                                 LogLevel::Warn,
-                                "No MusicBrainz releases found for that artist and album.",
+                                "No MusicBrainz albums, EPs or singles found for that artist and title.",
                             );
-                            self.toast(LogLevel::Warn, "No releases found");
+                            self.toast(LogLevel::Warn, "No matching albums found");
                         } else {
-                            self.search.set_selected(0);
+                            self.search.list_state.select(Some(0));
                             self.search.focus = SearchFocus::Results;
                             self.push_log(
                                 LogLevel::Info,
-                                format!("MusicBrainz returned {count} release(s)."),
+                                format!("MusicBrainz returned {count} album/EP/single match(es)."),
                             );
                             if self.auto_yes {
-                                self.choose_release();
+                                self.choose_group();
                             }
                         }
                     }
                     Err(err) => {
                         self.search.error = Some(err.clone());
                         self.search.focus = SearchFocus::Album;
+                        self.auto_yes = false;
                         self.push_log(LogLevel::Error, format!("MusicBrainz search failed: {err}"));
                         self.toast(LogLevel::Error, "MusicBrainz search failed");
+                    }
+                }
+            }
+            UiEvent::MbGroupReleases {
+                generation,
+                group_mbid,
+                result,
+            } => {
+                if generation != self.generation {
+                    return;
+                }
+                if self
+                    .search
+                    .group
+                    .as_ref()
+                    .is_none_or(|group| group.mbid != group_mbid)
+                {
+                    return;
+                }
+                self.search.phase = SearchPhase::Idle;
+                match result {
+                    Ok(releases) => {
+                        let count = releases.len();
+                        if count == 0 {
+                            self.search.error =
+                                Some("MusicBrainz returned no releases for this album/EP.".into());
+                            self.search.stage = SearchStage::Groups;
+                            self.search.focus = SearchFocus::Results;
+                            self.auto_yes = false;
+                            self.push_log(
+                                LogLevel::Warn,
+                                "No releases found in that MusicBrainz release group.",
+                            );
+                            self.toast(LogLevel::Warn, "No releases found");
+                        } else {
+                            self.search.releases = releases;
+                            self.search.chosen = self.search.releases.first().cloned();
+                            self.search.stage = SearchStage::Chosen;
+                            self.search.choice = 0;
+                            self.search.error = None;
+                            self.search.focus = SearchFocus::Results;
+                            if let Some(chosen) = &self.search.chosen {
+                                self.push_log(
+                                    LogLevel::Info,
+                                    format!(
+                                        "Found {count} release(s); chose “{} — {}” ({}).",
+                                        chosen.artist,
+                                        chosen.title,
+                                        chosen.format_summary()
+                                    ),
+                                );
+                            }
+                            if self.auto_yes {
+                                self.open_chosen_release();
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        self.search.error = Some(err.clone());
+                        self.search.stage = SearchStage::Groups;
+                        self.search.focus = SearchFocus::Results;
+                        self.auto_yes = false;
+                        self.push_log(LogLevel::Error, format!("Could not load releases: {err}"));
+                        self.toast(LogLevel::Error, "Could not load releases");
                     }
                 }
             }
@@ -1777,12 +1951,17 @@ impl App {
             started: Instant::now(),
         };
         self.search.error = None;
-        self.search.results.clear();
+        self.search.groups.clear();
+        self.search.releases.clear();
+        self.search.group = None;
+        self.search.chosen = None;
+        self.search.stage = SearchStage::Groups;
+        self.search.choice = 0;
         self.search.list_state.select(None);
         self.search.query_label = format!("{artist} — {album}");
         self.push_log(
             LogLevel::Info,
-            format!("Searching MusicBrainz for “{artist} — {album}”…"),
+            format!("Searching MusicBrainz for “{artist} — {album}” (albums, EPs and singles)…"),
         );
         self.toast(LogLevel::Info, "Searching MusicBrainz…");
         let tx = self.events_tx.clone();
@@ -1790,9 +1969,9 @@ impl App {
         let spawned = thread::Builder::new()
             .name("musicbrainz-search".to_string())
             .spawn(move || {
-                let result = musicbrainz::search_releases(&artist, &album, limit)
+                let result = musicbrainz::search_release_groups(&artist, &album, limit)
                     .map_err(|err| err.to_string());
-                let _ = tx.send(UiEvent::MbSearch { generation, result });
+                let _ = tx.send(UiEvent::MbGroups { generation, result });
             });
         if spawned.is_err() {
             self.search.phase = SearchPhase::Idle;
@@ -1801,14 +1980,102 @@ impl App {
         }
     }
 
-    fn choose_release(&mut self) {
-        if self.search.phase.is_loading() {
+    fn choose_group(&mut self) {
+        if self.search.phase.is_loading() || self.search.stage != SearchStage::Groups {
             return;
         }
         let Some(index) = self.search.selected() else {
             return;
         };
-        let Some(candidate) = self.search.results.get(index).cloned() else {
+        let Some(group) = self.search.groups.get(index).cloned() else {
+            return;
+        };
+        self.generation += 1;
+        let generation = self.generation;
+        self.search.phase = SearchPhase::FetchingReleases {
+            started: Instant::now(),
+        };
+        self.search.error = None;
+        self.search.releases.clear();
+        self.search.chosen = None;
+        self.search.choice = 0;
+        self.search.group = Some(group.clone());
+        self.push_log(
+            LogLevel::Info,
+            format!(
+                "Looking up releases for “{} — {}”…",
+                group.artist, group.title
+            ),
+        );
+        self.toast(LogLevel::Info, "Looking up releases…");
+        let tx = self.events_tx.clone();
+        // Browse the full page so later remastered pressings are not missed
+        // just because the group has many earlier releases.
+        let limit = 100;
+        let group_mbid = group.mbid.clone();
+        let spawned = thread::Builder::new()
+            .name("musicbrainz-group-releases".to_string())
+            .spawn(move || {
+                let result =
+                    musicbrainz::get_group_releases(&group, limit).map_err(|err| err.to_string());
+                let _ = tx.send(UiEvent::MbGroupReleases {
+                    generation,
+                    group_mbid,
+                    result,
+                });
+            });
+        if spawned.is_err() {
+            self.search.phase = SearchPhase::Idle;
+            self.search.error = Some("Could not start the release lookup worker".into());
+            self.toast(LogLevel::Error, "Could not start the release lookup");
+        }
+    }
+
+    fn show_release_list(&mut self) {
+        if self.search.stage != SearchStage::Chosen || self.search.releases.is_empty() {
+            return;
+        }
+        let chosen_index = self
+            .search
+            .chosen
+            .as_ref()
+            .and_then(|chosen| {
+                self.search
+                    .releases
+                    .iter()
+                    .position(|release| release.mbid == chosen.mbid)
+            })
+            .unwrap_or(0);
+        self.search.stage = SearchStage::Releases;
+        self.search.choice = 0;
+        self.search.error = None;
+        self.search.focus = SearchFocus::Results;
+        self.search.set_selected(chosen_index);
+        self.toast(
+            LogLevel::Info,
+            format!("{} release(s) available", self.search.releases.len()),
+        );
+    }
+
+    fn open_selected_release(&mut self) {
+        if self.search.phase.is_loading() || self.search.stage != SearchStage::Releases {
+            return;
+        }
+        let Some(index) = self.search.selected() else {
+            return;
+        };
+        let Some(release) = self.search.releases.get(index).cloned() else {
+            return;
+        };
+        self.search.chosen = Some(release);
+        self.open_chosen_release();
+    }
+
+    fn open_chosen_release(&mut self) {
+        if self.search.phase.is_loading() {
+            return;
+        }
+        let Some(candidate) = self.search.chosen.clone() else {
             return;
         };
         self.generation += 1;
@@ -1955,7 +2222,12 @@ impl App {
         }
         self.download = None;
         self.pending_start = None;
-        self.search.results.clear();
+        self.search.groups.clear();
+        self.search.releases.clear();
+        self.search.group = None;
+        self.search.chosen = None;
+        self.search.stage = SearchStage::Groups;
+        self.search.choice = 0;
         self.search.list_state.select(None);
         self.search.phase = SearchPhase::Idle;
         self.search.error = None;
@@ -2063,6 +2335,9 @@ impl App {
     }
 
     fn save_setup(&mut self) {
+        if self.setup.checking {
+            return;
+        }
         let username = self.setup.username.value().trim().to_string();
         let password = self.setup.password.value();
         if username.is_empty() {
@@ -2076,21 +2351,117 @@ impl App {
             return;
         }
         let acoustid = self.setup.acoustid.value().trim().to_string();
-        self.persisted_cfg.username = username.clone();
-        self.persisted_cfg.password = password.clone();
-        self.persisted_cfg.acoustid_key = acoustid.clone();
+        if acoustid.is_empty() {
+            self.setup.focus = 2;
+            self.setup.error = None;
+            self.confirm = Some(ConfirmDialog {
+                title: "Continue without AcoustID?".to_string(),
+                lines: vec![
+                    "AcoustID is free and highly recommended.".to_string(),
+                    "Without it, tracks could be wrong.".to_string(),
+                    "Continue without an AcoustID key?".to_string(),
+                ],
+                action: ConfirmAction::SetupWithoutAcoustId,
+            });
+            return;
+        }
+        self.begin_setup_validation();
+    }
+
+    fn begin_setup_validation(&mut self) {
+        if self.setup.checking {
+            return;
+        }
+        let username = self.setup.username.value().trim().to_string();
+        let password = self.setup.password.value();
+        let acoustid = self.setup.acoustid.value().trim().to_string();
+        if username.is_empty() || password.is_empty() {
+            self.setup.error = Some("Soulseek username and password are required".to_string());
+            self.setup.focus = if username.is_empty() { 0 } else { 1 };
+            return;
+        }
+
+        self.setup_generation += 1;
+        let generation = self.setup_generation;
+        self.setup.checking = true;
+        self.setup.error = None;
+        self.setup.pending = Some(PendingSetup {
+            username: username.clone(),
+            password: password.clone(),
+            acoustid: acoustid.clone(),
+        });
+
+        let mut config = self.cfg.clone();
+        config.username = username;
+        config.password = password;
+        let api_key = acoustid;
+        let tx = self.events_tx.clone();
+        let spawned = thread::Builder::new()
+            .name("credential-check".to_string())
+            .spawn(move || {
+                let result = session::verify_login(&config)
+                    .map_err(|err| match err {
+                        session::LoginCheckError::Rejected(message) => {
+                            SetupProblem::Soulseek(message)
+                        }
+                        session::LoginCheckError::Unavailable(message) => {
+                            SetupProblem::Unavailable(format!(
+                                "Could not verify Soulseek login: {message}"
+                            ))
+                        }
+                    })
+                    .and_then(|()| {
+                        if api_key.is_empty() {
+                            Ok(())
+                        } else {
+                            acoustid::validate_api_key(&api_key).map_err(|err| match err {
+                                acoustid::ApiKeyError::Invalid => {
+                                    SetupProblem::AcoustId("invalid API key".to_string())
+                                }
+                                acoustid::ApiKeyError::Unavailable(message) => {
+                                    SetupProblem::Unavailable(format!(
+                                        "Could not verify AcoustID key: {message}"
+                                    ))
+                                }
+                            })
+                        }
+                    });
+                let _ = tx.send(UiEvent::SetupCheck { generation, result });
+            });
+        if spawned.is_err() {
+            self.setup.checking = false;
+            self.setup.pending = None;
+            self.setup.error = Some("Could not start the credential check".to_string());
+        }
+    }
+
+    fn finish_setup(&mut self) {
+        self.setup.checking = false;
+        let Some(pending) = self.setup.pending.take() else {
+            self.setup.error = Some("Credential check finished unexpectedly".to_string());
+            return;
+        };
+
+        self.persisted_cfg.username = pending.username.clone();
+        self.persisted_cfg.password = pending.password.clone();
+        self.persisted_cfg.acoustid_key = pending.acoustid.clone();
         if let Err(err) = config::save(&self.persisted_cfg, &self.cfg_path) {
             self.setup.error = Some(format!("Could not save credentials: {err}"));
             return;
         }
-        // Keep any runtime-only CLI overrides, but use the new credentials.
-        self.cfg.username = username;
-        self.cfg.password = password;
-        self.cfg.acoustid_key = acoustid;
+
+        self.setup_generation += 1;
+        // Keep any runtime-only CLI overrides, but use the verified credentials.
+        self.cfg.username = pending.username;
+        self.cfg.password = pending.password;
+        self.cfg.acoustid_key = pending.acoustid;
         self.setup.error = None;
         self.push_log(
             LogLevel::Success,
-            format!("Credentials saved to {}", self.cfg_path.display()),
+            format!(
+                "Credentials verified and saved to {}",
+                self.cfg_path.display()
+            ),
         );
         self.screen = Screen::Search;
         self.spawn_session();
@@ -2103,7 +2474,7 @@ impl App {
                 SearchFocus::Album
             };
         }
-        self.toast(LogLevel::Success, "Credentials saved");
+        self.toast(LogLevel::Success, "Credentials verified and saved");
     }
 
     fn cancel_selected_track(&mut self) {
@@ -2262,6 +2633,7 @@ impl App {
                     match confirm.action {
                         ConfirmAction::Quit => self.quit = true,
                         ConfirmAction::NewSearch => self.do_new_search(),
+                        ConfirmAction::SetupWithoutAcoustId => self.begin_setup_validation(),
                     }
                 }
             }
@@ -2273,6 +2645,16 @@ impl App {
     }
 
     fn handle_setup_key(&mut self, key: KeyEvent) {
+        if self.setup.checking {
+            if key.code == KeyCode::Esc {
+                self.setup_generation += 1;
+                self.setup.checking = false;
+                self.setup.pending = None;
+                self.setup.error = None;
+                self.toast(LogLevel::Info, "Credential check cancelled");
+            }
+            return;
+        }
         match key.code {
             KeyCode::Tab | KeyCode::Down => {
                 self.setup.focus = (self.setup.focus + 1) % 3;
@@ -2322,13 +2704,36 @@ impl App {
                     self.auto_yes = false;
                     self.toast(LogLevel::Info, "Search cancelled");
                 } else if self.search.focus != SearchFocus::Results {
-                    if !self.search.results.is_empty() {
+                    if self.search.has_results() {
                         self.search.focus = SearchFocus::Results;
                     } else {
                         self.search.focus = SearchFocus::Artist;
                     }
                 } else {
-                    self.search.focus = SearchFocus::Album;
+                    match self.search.stage {
+                        SearchStage::Groups => self.search.focus = SearchFocus::Album,
+                        SearchStage::Chosen => {
+                            let index = self
+                                .search
+                                .group
+                                .as_ref()
+                                .and_then(|chosen_group| {
+                                    self.search
+                                        .groups
+                                        .iter()
+                                        .position(|group| group.mbid == chosen_group.mbid)
+                                })
+                                .unwrap_or(0);
+                            self.search.stage = SearchStage::Groups;
+                            self.search.set_selected(index);
+                            self.search.focus = SearchFocus::Results;
+                        }
+                        SearchStage::Releases => {
+                            self.search.stage = SearchStage::Chosen;
+                            self.search.choice = 0;
+                            self.search.focus = SearchFocus::Results;
+                        }
+                    }
                 }
             }
             KeyCode::Enter => match self.search.focus {
@@ -2340,7 +2745,17 @@ impl App {
                 }
                 SearchFocus::Results => {
                     if !loading {
-                        self.choose_release();
+                        match self.search.stage {
+                            SearchStage::Groups => self.choose_group(),
+                            SearchStage::Chosen => {
+                                if self.search.choice == 0 {
+                                    self.open_chosen_release();
+                                } else {
+                                    self.show_release_list();
+                                }
+                            }
+                            SearchStage::Releases => self.open_selected_release(),
+                        }
                     }
                 }
             },
@@ -2352,7 +2767,15 @@ impl App {
             | KeyCode::End
                 if self.search.focus == SearchFocus::Results =>
             {
-                self.move_search_selection(key.code);
+                if self.search.stage == SearchStage::Chosen {
+                    self.search.choice = match key.code {
+                        KeyCode::Up | KeyCode::Home | KeyCode::PageUp => 0,
+                        KeyCode::Down | KeyCode::End | KeyCode::PageDown => 1,
+                        _ => self.search.choice,
+                    };
+                } else {
+                    self.move_search_selection(key.code);
+                }
             }
             _ => {
                 if loading {
@@ -2381,7 +2804,7 @@ impl App {
     }
 
     fn cycle_search_focus(&mut self, forward: bool) {
-        let has_results = !self.search.results.is_empty();
+        let has_results = self.search.has_results();
         self.search.focus = match (self.search.focus, forward, has_results) {
             (SearchFocus::Artist, true, _) => SearchFocus::Album,
             (SearchFocus::Artist, false, true) => SearchFocus::Results,
@@ -2395,7 +2818,7 @@ impl App {
     }
 
     fn move_search_selection(&mut self, code: KeyCode) {
-        let len = self.search.results.len();
+        let len = self.search.list_len();
         if len == 0 {
             return;
         }
@@ -2444,7 +2867,7 @@ impl App {
             }
             KeyCode::Char('b') | KeyCode::Esc => {
                 self.screen = Screen::Search;
-                self.search.focus = if self.search.results.is_empty() {
+                self.search.focus = if !self.search.has_results() {
                     SearchFocus::Album
                 } else {
                     SearchFocus::Results
@@ -2529,7 +2952,7 @@ impl App {
                     match phase {
                         Some(DownloadPhase::Complete) => {
                             self.screen = Screen::Search;
-                            self.search.focus = if self.search.results.is_empty() {
+                            self.search.focus = if !self.search.has_results() {
                                 SearchFocus::Album
                             } else {
                                 SearchFocus::Results
@@ -2539,7 +2962,7 @@ impl App {
                             self.pending_start = None;
                             self.download = None;
                             self.screen = Screen::Search;
-                            self.search.focus = if self.search.results.is_empty() {
+                            self.search.focus = if !self.search.has_results() {
                                 SearchFocus::Album
                             } else {
                                 SearchFocus::Results
@@ -2632,6 +3055,7 @@ fn move_list_selection(state: &mut ratatui::widgets::ListState, len: usize, code
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     fn configured() -> Config {
         Config {
@@ -2640,6 +3064,176 @@ mod tests {
             acoustid_key: "key".into(),
             ..Config::default()
         }
+    }
+
+    fn app_for_test() -> App {
+        let args = Args::parse_from(["soulsucker"]);
+        App::new(
+            Config::default(),
+            Config::default(),
+            "/tmp/soulsucker-test.toml".into(),
+            &args,
+            None,
+        )
+    }
+
+    fn search_group_for_test() -> ReleaseGroupCandidate {
+        ReleaseGroupCandidate {
+            mbid: "group-id".into(),
+            title: "Album".into(),
+            artist: "Artist".into(),
+            first_release_date: "1984".into(),
+            primary_type: "Album".into(),
+            secondary_types: Vec::new(),
+            disambiguation: String::new(),
+            release_count: 2,
+            search_score: 100,
+            score: 0,
+        }
+    }
+
+    fn search_release_for_test(mbid: &str, disambiguation: &str) -> ReleaseCandidate {
+        ReleaseCandidate {
+            mbid: mbid.into(),
+            title: "Album".into(),
+            artist: "Artist".into(),
+            date: "1984".into(),
+            country: "US".into(),
+            status: "Official".into(),
+            disambiguation: disambiguation.into(),
+            track_count: 8,
+            primary_type: "Album".into(),
+            secondary_types: Vec::new(),
+            formats: vec!["CD".into()],
+            score: 0,
+        }
+    }
+
+    #[test]
+    fn group_and_release_events_advance_the_search_stages() {
+        let mut app = app_for_test();
+        app.screen = Screen::Search;
+        app.search.phase = SearchPhase::Searching {
+            started: Instant::now(),
+        };
+        let generation = app.generation;
+        let group = search_group_for_test();
+
+        app.handle_ui_event(UiEvent::MbGroups {
+            generation,
+            result: Ok(vec![group.clone()]),
+        });
+        assert_eq!(app.search.stage, SearchStage::Groups);
+        assert_eq!(app.search.groups.len(), 1);
+        assert_eq!(app.search.focus, SearchFocus::Results);
+        assert_eq!(app.search.selected(), Some(0));
+
+        app.generation += 1;
+        let generation = app.generation;
+        app.search.group = Some(group.clone());
+        app.handle_ui_event(UiEvent::MbGroupReleases {
+            generation,
+            group_mbid: "another-group".into(),
+            result: Ok(vec![search_release_for_test("wrong", "")]),
+        });
+        assert_eq!(app.search.stage, SearchStage::Groups);
+
+        app.handle_ui_event(UiEvent::MbGroupReleases {
+            generation,
+            group_mbid: group.mbid.clone(),
+            result: Ok(vec![
+                search_release_for_test("remaster", "2015 remaster"),
+                search_release_for_test("original", ""),
+            ]),
+        });
+        assert_eq!(app.search.stage, SearchStage::Chosen);
+        assert_eq!(
+            app.search
+                .chosen
+                .as_ref()
+                .map(|release| release.mbid.as_str()),
+            Some("remaster")
+        );
+        assert_eq!(app.search.choice, 0);
+
+        app.handle_search_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.search.choice, 1);
+        app.handle_search_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.search.choice, 0);
+
+        app.show_release_list();
+        assert_eq!(app.search.stage, SearchStage::Releases);
+        assert_eq!(app.search.selected(), Some(0));
+
+        app.handle_search_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.search.stage, SearchStage::Chosen);
+        assert_eq!(app.search.choice, 0);
+    }
+
+    #[test]
+    fn missing_acoustid_requires_confirmation() {
+        let mut app = app_for_test();
+        app.screen = Screen::Setup;
+        app.setup.username = TextInput::new("user");
+        app.setup.password = TextInput::new("pass");
+        app.setup.acoustid = TextInput::new("");
+
+        app.save_setup();
+
+        let confirm = app.confirm.as_ref().expect("confirmation dialog");
+        assert_eq!(confirm.action, ConfirmAction::SetupWithoutAcoustId);
+        assert!(
+            confirm
+                .lines
+                .iter()
+                .any(|line| line.contains("highly recommended"))
+        );
+        assert!(
+            confirm
+                .lines
+                .iter()
+                .any(|line| line.contains("tracks could be wrong"))
+        );
+        assert_eq!(app.setup.focus, 2);
+        assert!(!app.setup.checking);
+    }
+
+    #[test]
+    fn failed_credential_checks_stay_on_setup() {
+        let mut app = app_for_test();
+        app.screen = Screen::Setup;
+
+        app.setup_generation = 7;
+        app.setup.checking = true;
+        app.handle_ui_event(UiEvent::SetupCheck {
+            generation: 7,
+            result: Err(SetupProblem::Soulseek("rejected".into())),
+        });
+        assert_eq!(app.screen, Screen::Setup);
+        assert!(!app.setup.checking);
+        assert_eq!(app.setup.focus, 1);
+        assert!(
+            app.setup
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Incorrect Soulseek"))
+        );
+
+        app.setup_generation = 8;
+        app.setup.checking = true;
+        app.handle_ui_event(UiEvent::SetupCheck {
+            generation: 8,
+            result: Err(SetupProblem::AcoustId("invalid API key".into())),
+        });
+        assert_eq!(app.screen, Screen::Setup);
+        assert!(!app.setup.checking);
+        assert_eq!(app.setup.focus, 2);
+        assert!(
+            app.setup
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Incorrect AcoustID"))
+        );
     }
 
     fn release_for_test(primary_type: &str) -> crate::musicbrainz::ReleaseInfo {

@@ -47,7 +47,7 @@ pub struct Args {
     /// Force re-download of files that already exist
     #[arg(long)]
     pub force: bool,
-    /// Auto-pick the recommended release and start downloading
+    /// Auto-pick the recommended album, release and start downloading
     #[arg(long)]
     pub yes: bool,
 
@@ -84,7 +84,7 @@ pub struct Args {
     /// Soulseek listener port (0 = automatic)
     #[arg(long, value_name = "PORT")]
     pub port: Option<u16>,
-    /// Number of MusicBrainz releases to show
+    /// Number of MusicBrainz album/EP matches to show
     #[arg(long, value_name = "N")]
     pub limit: Option<usize>,
 

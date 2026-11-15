@@ -1,29 +1,15 @@
 # soulsucker ♫
 
-A terminal album downloader that is actually pleasant to use. Pick a release
-from **MusicBrainz**, and soulsucker finds matching **FLAC** or **320 kbps MP3**
-files on **Soulseek**, downloads them in parallel, verifies what it got, and
-files cleanly numbered tracks into an artist/album library.
+A terminal album downloader that is actually pleasant to use. Pick an album, EP
+or single from **MusicBrainz**, and soulsucker finds matching **FLAC** or **320
+kbps MP3** files on **Soulseek**, downloads them in parallel, verifies what it
+got, and files cleanly numbered tracks into an artist/album library.
 
 Built in Rust with [`ratatui`](https://ratatui.rs/) for the TUI,
 [`clap`](https://clap.rs/) for the command line, and
 [`soulseek-rs-lib`](https://crates.io/crates/soulseek-rs-lib) for Soulseek.
 
-```text
- ♫ soulsucker  MusicBrainz → Soulseek                    ● youruser · port 51234
-╭ Search MusicBrainz ────────────────────────────────────────────────────────╮
-│ ▸ Artist:           Radiohead                                              │
-│   Album:            In Rainbows                                            │
-│ Enter searches · Tab moves between fields                                   │
-╰────────────────────────────────────────────────────────────────────────────╯
-╭ Releases · 25 ─────────────────────────────────────────────────────────────╮
-│ ▌  1. ★ In Rainbows  ·  Radiohead  recommended                             │
-│      2007 · GB · Official · CD · 10 tracks                                 │
-│    2.   In Rainbows  ·  Radiohead                                          │
-│      2007 · JP · Official · CD · 10 tracks                                 │
-│    …                                                                       │
-╰────────────────────────────────────────────────────────────────────────────╯
-```
+![soulsucker downloading Alice in Chains — Jar of Flies](docs/screenshot.png)
 
 ## Share your music
 
@@ -61,13 +47,16 @@ duration/fingerprint verification, and automatic retries:
 - **Actual verification.** Finished files are checked against the
   MusicBrainz duration, and optionally against a built-in Chromaprint
   fingerprint via AcoustID.
-- **Clean output.** Metadata is overwritten from the chosen MusicBrainz
-  release — canonical album/artist/title/date, track/disc numbers, MusicBrainz
-  IDs, and cover art from the iTunes Search API (with the Cover Art Archive as
-  a fallback) — and files are named `01 - Title.flac` (or `1-01 - Title.flac`
-  for multi-disc releases; `.mp3` in MP3 mode). An optional **disc-prefixed
-  track numbers** setting writes tags like `101…113` and `201…213` for players
-  that ignore the disc tag (Tesla's USB player, for example).
+- **Automatic, consistent tags.** Every downloaded file is tagged
+  automatically from the chosen MusicBrainz release — canonical
+  album/artist/title/date, track/disc numbers, MusicBrainz IDs, and cover art
+  from the iTunes Search API (with the Cover Art Archive as a fallback).
+  Existing tags from the peer are replaced, so every album in your library has
+  consistent metadata. An optional **disc-prefixed track numbers** setting
+  writes tags like `101…113` and `201…213` for players that ignore the disc tag
+  (Tesla's USB player, for example).
+- **Clean output.** Files are named `01 - Title.flac` (or `1-01 - Title.flac`
+  for multi-disc releases; `.mp3` in MP3 mode).
 - **FLAC or MP3 320.** Choose lossless FLAC or 320 kbps MP3 in Settings. MP3
   mode prefers a verified 320 kbps MP3 source; when none is available it takes
   a FLAC source and converts it after verification. The conversion and loudness
@@ -90,9 +79,9 @@ duration/fingerprint verification, and automatic retries:
   binaries link FFmpeg and the bundled LAME MP3 encoder statically and need no
   runtime libraries.
 - A terminal at least **60×20** cells (the TUI asks for this if it is too small).
-- Optional: a free AcoustID API key from <https://acoustid.org/api> for
+- Recommended: a free AcoustID API key from <https://acoustid.org/api> for
   fingerprint verification. Fingerprinting is built in; without a key,
-  duration checks still run.
+  duration checks still run, but the wrong recording could pass.
 
 On Fedora:
 
@@ -139,7 +128,13 @@ If no credentials are configured, a setup screen asks for:
 
 1. Soulseek username
 2. Soulseek password
-3. AcoustID API key (optional; leave blank to skip)
+3. AcoustID API key (free and highly recommended)
+
+> [!IMPORTANT]
+> **Please use a free AcoustID key.** Your Soulseek login and AcoustID key are
+> checked before setup completes. Without a key, tracks are only checked by
+> duration and the wrong recording could be kept. Get a free key at
+> <https://acoustid.org/api>.
 
 > [!TIP]
 > **Please share your music.** Many Soulseek users block people who only
@@ -147,7 +142,8 @@ If no credentials are configured, a setup screen asks for:
 > [Share your music](#share-your-music) for the desktop and Android clients to
 > use with your account.
 
-They are saved to the config file shown on screen, normally:
+They are verified before being saved to the config file shown on screen,
+normally:
 
 | Platform | Path |
 | --- | --- |
@@ -195,11 +191,12 @@ soulsucker --no-fingerprint
 
 ### What happens when you press Download
 
-1. MusicBrainz returns releases sorted **standard edition first**, preferring
-   the **original release and country** inferred from the earliest official
-   release. Later reissues get a small tie-break penalty. Deluxe, anniversary,
-   live, expanded, bonus-heavy and bootleg releases are penalised.
-2. You pick a release; soulsucker fetches its full audio tracklist, including
+1. MusicBrainz returns matching **albums, EPs, live albums, live EPs, singles**
+   and other release groups, ranked with exact matches and studio albums first.
+2. You pick one. soulsucker looks up its pressings and shows the recommended
+   release — remastered pressings first, then official standard editions — with
+   **Continue** selected by default, or **Choose another release** to browse
+   every pressing. Continue loads the full audio tracklist, including
    multi-disc releases and skipping DVD/Blu-ray mediums.
 3. The destination is created at `<music folder>/<Artist>/<Album>/`.
    Releases MusicBrainz marks as **Single** skip the album folder and are saved
@@ -253,8 +250,9 @@ is in flight; `Esc` cancels the request so you can open it.
 | Key | Action |
 | --- | --- |
 | `Tab` / `Shift+Tab` | Move between artist, album and results |
-| `Enter` | Search (from album) / open release (from results) |
-| `↑` `↓` `PgUp` `PgDn` `Home` `End` | Choose a release |
+| `Enter` | Search (from album) / choose an album, EP or release |
+| `↑` `↓` `PgUp` `PgDn` `Home` `End` | Choose an album, EP or release |
+| `Esc` | Back to the previous search step |
 | `/` or `e` | Edit the album field |
 | `r` | Run the search again |
 | `s` | Settings |
@@ -385,7 +383,7 @@ Run `soulsucker --help` for the full list. Useful ones:
 | --- | --- |
 | `-a`, `-A` | Artist / album |
 | `-o`, `--output` | Root music folder for this run |
-| `--yes` | Auto-pick the recommended release and download |
+| `--yes` | Auto-pick the recommended album, release and download |
 | `--force` | Re-download existing files |
 | `--no-fingerprint` | Duration checks only for this run |
 | `--search-timeout` | Seconds to collect Soulseek results |
@@ -398,7 +396,7 @@ Run `soulsucker --help` for the full list. Useful ones:
 | `--last-resort-stall-timeout` | Patience during those passes |
 | `--candidates` | Sources tried per track |
 | `--port` | Soulseek listener port |
-| `--limit` | MusicBrainz releases to fetch |
+| `--limit` | MusicBrainz album/EP matches to fetch |
 | `--config` | Alternate config file |
 | `--setup` | Force the credential screen |
 
@@ -413,8 +411,8 @@ contain peer-supplied text, so treat them as untrusted.
 - **Login rejected.** Open Settings (`F2`) and check the username/password.
   If another client is logged in with the same account, the server will
   displace one of them.
-- **MusicBrainz is busy.** The app retries `429/502/503` responses with a
-  backoff. If it still fails, wait a moment and press `r`.
+- **MusicBrainz is busy.** The app retries `429/502/503/504` responses three
+  times with a backoff. If it still fails, wait a moment and press `r`.
 - **No matching sources.** Soulseek is peer-to-peer: availability changes by
   the minute. Try a longer search timeout, another pressing/edition, set
   **Audio quality** to FLAC, or search again later.

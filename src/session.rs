@@ -287,6 +287,31 @@ enum ConnResult {
     Failed { message: String, auth: bool },
 }
 
+#[derive(Debug)]
+pub enum LoginCheckError {
+    Rejected(String),
+    Unavailable(String),
+}
+
+/// Validate a username/password without leaving a session or listener behind.
+pub fn verify_login(config: &Config) -> Result<(), LoginCheckError> {
+    match connect_client_with(config, false) {
+        ConnResult::Connected(client) => {
+            if let Some(mut client) = Arc::into_inner(client) {
+                client.disconnect();
+            }
+            Ok(())
+        }
+        ConnResult::Failed { message, auth } => {
+            if auth {
+                Err(LoginCheckError::Rejected(message))
+            } else {
+                Err(LoginCheckError::Unavailable(message))
+            }
+        }
+    }
+}
+
 fn run_session(
     config: Config,
     events: Sender<SlskEvent>,
@@ -1831,9 +1856,13 @@ impl Session {
 // -------------------------------------------------------------------------
 
 fn connect_client(config: &Config) -> ConnResult {
+    connect_client_with(config, true)
+}
+
+fn connect_client_with(config: &Config, enable_listen: bool) -> ConnResult {
     let mut settings = ClientSettings::new(config.username.clone(), config.password.clone());
     settings.server_address = PeerAddress::new("server.slsknet.org".to_string(), 2416);
-    settings.enable_listen = true;
+    settings.enable_listen = enable_listen;
     settings.listen_port = config.listen_port;
     settings.shared_directories = Vec::new();
     settings.accept_children = false;

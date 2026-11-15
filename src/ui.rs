@@ -6,8 +6,8 @@ use ratatui::widgets::{
 };
 
 use crate::app::{
-    App, ConnState, DownloadFocus, DownloadPhase, SearchFocus, SearchPhase, SettingKind,
-    SettingsTab,
+    App, ConnState, DownloadFocus, DownloadPhase, SearchFocus, SearchPhase, SearchStage,
+    SettingKind, SettingsTab,
 };
 use crate::input::TextInput;
 use crate::session::{LogLevel, TrackStatus};
@@ -220,7 +220,7 @@ fn footer_hints(app: &App) -> Vec<(&'static str, &'static str)> {
         crate::app::Screen::Setup => vec![
             ("Tab", "next field"),
             ("Enter", "continue"),
-            ("Ctrl+S", "save"),
+            ("Ctrl+S", "verify"),
             ("F1", "help"),
             ("Esc", "quit"),
         ],
@@ -228,14 +228,32 @@ fn footer_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             if app.search.phase.is_loading() {
                 vec![("Esc", "cancel"), ("F2", "settings"), ("Ctrl+Q", "quit")]
             } else if app.search.focus == SearchFocus::Results {
-                vec![
-                    ("↑↓", "select"),
-                    ("Enter", "open release"),
-                    ("/", "edit"),
-                    ("r", "search again"),
-                    ("s", "settings"),
-                    ("q", "quit"),
-                ]
+                match app.search.stage {
+                    SearchStage::Groups => vec![
+                        ("↑↓", "select"),
+                        ("Enter", "choose album/EP"),
+                        ("/", "edit"),
+                        ("r", "search again"),
+                        ("s", "settings"),
+                        ("q", "quit"),
+                    ],
+                    SearchStage::Chosen => vec![
+                        ("↑↓", "options"),
+                        ("Enter", "confirm"),
+                        ("Esc", "back"),
+                        ("r", "search again"),
+                        ("s", "settings"),
+                        ("q", "quit"),
+                    ],
+                    SearchStage::Releases => vec![
+                        ("↑↓", "select"),
+                        ("Enter", "use release"),
+                        ("Esc", "back"),
+                        ("r", "search again"),
+                        ("s", "settings"),
+                        ("q", "quit"),
+                    ],
+                }
             } else {
                 vec![
                     ("Tab", "next field"),
@@ -332,7 +350,7 @@ fn render_setup(app: &mut App, frame: &mut Frame, area: Rect) {
     let mut y = inner.y;
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "One-time setup. Your login and optional AcoustID key are saved to:",
+            "One-time setup. Credentials are saved to:",
             Style::default().fg(MUTED),
         ))),
         Rect::new(inner.x, y, inner.width, 1),
@@ -376,7 +394,7 @@ fn render_setup(app: &mut App, frame: &mut Frame, area: Rect) {
     }
     y += 1;
 
-    let allow_cursor = !app.help_open;
+    let allow_cursor = !app.help_open && !app.setup.checking && app.confirm.is_none();
     render_input_row(
         frame,
         inner,
@@ -405,35 +423,55 @@ fn render_setup(app: &mut App, frame: &mut Frame, area: Rect) {
         frame,
         inner,
         y,
-        "AcoustID key",
+        "AcoustID API key",
         &app.setup.acoustid,
         app.setup.focus == 2,
         true,
-        "optional (fingerprint checks)",
+        "recommended (free key)",
         allow_cursor,
     );
     y += 1;
 
     let notes = [
-        ("AcoustID is free: https://acoustid.org/api", MUTED),
-        ("Without a key, files are still checked by duration.", MUTED),
-        ("Everything can be changed later in Settings (F2).", MUTED),
+        (
+            "AcoustID is free and highly recommended.",
+            Style::default().fg(WARNING).bold(),
+        ),
+        (
+            "Get a key at https://acoustid.org/api",
+            Style::default().fg(MUTED),
+        ),
+        (
+            "Without it, tracks could be wrong.",
+            Style::default().fg(WARNING),
+        ),
     ];
-    for (note, color) in notes {
+    for (note, style) in notes {
         if y >= inner.bottom() {
             break;
         }
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 util::truncate(note, inner.width as usize),
-                Style::default().fg(color),
+                style,
             ))),
             Rect::new(inner.x, y, inner.width, 1),
         );
         y += 1;
     }
 
-    if let Some(error) = &app.setup.error
+    if app.setup.checking && y < inner.bottom() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                util::truncate(
+                    &format!("{} checking credentials…", spinner(app)),
+                    inner.width as usize,
+                ),
+                Style::default().fg(ACCENT).bold(),
+            ))),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+    } else if let Some(error) = &app.setup.error
         && y < inner.bottom()
     {
         frame.render_widget(
@@ -462,6 +500,9 @@ fn render_search(app: &mut App, frame: &mut Frame, area: Rect) {
         SearchPhase::Idle => "Search MusicBrainz".to_string(),
         SearchPhase::Searching { .. } => {
             format!("Search MusicBrainz · {} searching…", spinner(app))
+        }
+        SearchPhase::FetchingReleases { .. } => {
+            format!("Search MusicBrainz · {} loading releases…", spinner(app))
         }
         SearchPhase::Fetching { .. } => {
             format!("Search MusicBrainz · {} loading tracklist…", spinner(app))
@@ -501,12 +542,22 @@ fn render_search(app: &mut App, frame: &mut Frame, area: Rect) {
     if y < form_inner.bottom() {
         let hint = if app.search.phase.is_loading() {
             format!(
-                "{} searching…  {}",
+                "{} working…  {}",
                 spinner(app),
                 elapsed_label(app.search.phase.started())
             )
         } else if app.search.focus == SearchFocus::Results {
-            "Enter opens the highlighted release · / edits the album".to_string()
+            match app.search.stage {
+                SearchStage::Groups => {
+                    "Enter shows releases · ↑↓ chooses an album, EP or single".to_string()
+                }
+                SearchStage::Chosen => {
+                    "Enter continues · ↑↓ switches between the two options".to_string()
+                }
+                SearchStage::Releases => {
+                    "Enter uses the highlighted release · Esc goes back".to_string()
+                }
+            }
         } else if app.search.focus == SearchFocus::Artist {
             "Enter moves to the album · Tab switches fields".to_string()
         } else {
@@ -521,10 +572,12 @@ fn render_search(app: &mut App, frame: &mut Frame, area: Rect) {
         );
     }
 
-    let results_title = if app.search.results.is_empty() {
-        "Releases".to_string()
-    } else {
-        format!("Releases · {}", app.search.results.len())
+    let results_title = match app.search.stage {
+        SearchStage::Groups if app.search.groups.is_empty() => "Albums, EPs & singles".to_string(),
+        SearchStage::Groups => format!("Albums, EPs & singles · {}", app.search.groups.len()),
+        SearchStage::Chosen => "Chosen release".to_string(),
+        SearchStage::Releases if app.search.releases.is_empty() => "Releases".to_string(),
+        SearchStage::Releases => format!("Releases · {}", app.search.releases.len()),
     };
     let results_block = panel(&results_title, app.search.focus == SearchFocus::Results);
     let results_inner = results_block.inner(results_area);
@@ -557,110 +610,242 @@ fn render_search(app: &mut App, frame: &mut Frame, area: Rect) {
         .alignment(Alignment::Center);
         let centered = centered_rect(results_inner, 60, 3);
         frame.render_widget(text, centered);
-    } else if app.search.results.is_empty() {
-        let text = Paragraph::new(Text::from(vec![
-            Line::from(Span::styled("♪", Style::default().fg(ACCENT_DARK))),
-            Line::from(Span::styled(
-                "Type an artist and album, then press Enter.",
-                Style::default().fg(MUTED),
-            )),
-        ]))
-        .alignment(Alignment::Center);
-        frame.render_widget(text, results_inner);
     } else {
-        let mut items = Vec::with_capacity(app.search.results.len());
-        let selected = app.search.selected();
-        let width = results_inner.width as usize;
-        for (index, release) in app.search.results.iter().enumerate() {
-            let is_selected = selected == Some(index);
-            let marker = if is_selected { "▌ " } else { "  " };
-            let star = if index == 0 { "★ " } else { "  " };
-            let mut line1 = vec![
-                Span::styled(marker, Style::default().fg(ACCENT).bold()),
-                Span::styled(format!("{:>2}. ", index + 1), Style::default().fg(MUTED)),
-                Span::styled(
-                    star,
-                    Style::default().fg(if index == 0 { WARNING } else { MUTED }),
-                ),
-                Span::styled(
-                    util::truncate(&release.title, width.saturating_sub(16)),
-                    Style::default().fg(TEXT).bold(),
-                ),
-                Span::styled("  ·  ", Style::default().fg(BORDER)),
-                Span::styled(
-                    util::truncate(&release.artist, width.saturating_sub(30).max(8)),
-                    Style::default().fg(MUTED),
-                ),
-            ];
-            if index == 0 {
-                line1.push(Span::styled("  recommended", Style::default().fg(WARNING)));
-            }
-
-            let mut details = String::new();
-            if !release.year().is_empty() {
-                details.push_str(release.year());
-                details.push_str(" · ");
-            }
-            if !release.country.is_empty() {
-                details.push_str(&release.country);
-                details.push_str(" · ");
-            }
-            if !release.status.is_empty() {
-                details.push_str(&release.status);
-                details.push_str(" · ");
-            }
-            details.push_str(&release.format_summary());
-            details.push_str(&format!(" · {} tracks", release.track_count));
-            if !release.disambiguation.is_empty() {
-                details.push_str(" · ");
-                details.push_str(&release.disambiguation);
-            }
-
-            let mut line2 = vec![
-                Span::styled("     ", Style::default()),
-                Span::styled(
-                    util::truncate(&details, width.saturating_sub(8)),
-                    Style::default().fg(MUTED),
-                ),
-            ];
-            let tags = release.edition_tags();
-            if !tags.is_empty() {
-                line2.push(Span::styled("  ", Style::default()));
-                line2.push(Span::styled(
-                    util::truncate(&tags.join(" · "), width.saturating_sub(20).max(8)),
-                    Style::default().fg(WARNING),
-                ));
-            }
-            items.push(ListItem::new(Text::from(vec![
-                Line::from(line1),
-                Line::from(line2),
-            ])));
+        match app.search.stage {
+            SearchStage::Groups => render_group_results(app, frame, results_inner),
+            SearchStage::Chosen => render_chosen_release(app, frame, results_inner),
+            SearchStage::Releases => render_release_results(app, frame, results_inner),
         }
-        let list = List::new(items)
-            .block(Block::default().style(Style::default().bg(PANEL)))
-            .highlight_style(Style::default().bg(PANEL_ALT));
-        frame.render_stateful_widget(list, results_inner, &mut app.search.list_state);
 
-        if matches!(app.search.phase, SearchPhase::Fetching { .. }) {
-            let text = Paragraph::new(Line::from(vec![
-                Span::styled(spinner(app), Style::default().fg(ACCENT)),
-                Span::styled("  fetching tracklist…", Style::default().fg(ACCENT).bold()),
-            ]))
-            .style(Style::default().bg(PANEL_ALT));
-            if results_inner.height > 0 {
-                frame.render_widget(
-                    text,
-                    Rect::new(results_inner.x, results_inner.y, results_inner.width, 1),
-                );
-            }
+        let loading = match app.search.phase {
+            SearchPhase::FetchingReleases { .. } => Some("loading releases…"),
+            SearchPhase::Fetching { .. } => Some("loading tracklist…"),
+            _ => None,
+        };
+        if let Some(label) = loading {
+            render_loading_overlay(app, frame, results_inner, label);
         }
     }
 
-    let details_block = panel("Selection", false);
-    let details_inner = details_block.inner(details_area);
-    frame.render_widget(details_block, details_area);
-    if let Some(index) = app.search.selected() {
-        if let Some(release) = app.search.results.get(index) {
+    render_search_details(app, frame, details_area);
+}
+
+fn render_group_results(app: &mut App, frame: &mut Frame, area: Rect) {
+    if app.search.groups.is_empty() {
+        render_empty_search(frame, area);
+        return;
+    }
+    let selected = app.search.selected();
+    let width = area.width as usize;
+    let mut items = Vec::with_capacity(app.search.groups.len());
+    for (index, group) in app.search.groups.iter().enumerate() {
+        let is_selected = selected == Some(index);
+        let marker = if is_selected { "▌ " } else { "  " };
+        let star = if index == 0 { "★ " } else { "  " };
+        let mut line1 = vec![
+            Span::styled(marker, Style::default().fg(ACCENT).bold()),
+            Span::styled(format!("{:>2}. ", index + 1), Style::default().fg(MUTED)),
+            Span::styled(
+                star,
+                Style::default().fg(if index == 0 { WARNING } else { MUTED }),
+            ),
+            Span::styled(
+                util::truncate(&group.title, width.saturating_sub(16)),
+                Style::default().fg(TEXT).bold(),
+            ),
+            Span::styled("  ·  ", Style::default().fg(BORDER)),
+            Span::styled(
+                util::truncate(&group.artist, width.saturating_sub(30).max(8)),
+                Style::default().fg(MUTED),
+            ),
+        ];
+        if index == 0 {
+            line1.push(Span::styled("  recommended", Style::default().fg(WARNING)));
+        }
+
+        let mut details = group_meta(group);
+        if !group.disambiguation.is_empty() {
+            if !details.is_empty() {
+                details.push_str(" · ");
+            }
+            details.push_str(&group.disambiguation);
+        }
+        let line2 = vec![
+            Span::styled("     ", Style::default()),
+            Span::styled(
+                util::truncate(&details, width.saturating_sub(8)),
+                Style::default().fg(MUTED),
+            ),
+        ];
+        items.push(ListItem::new(Text::from(vec![
+            Line::from(line1),
+            Line::from(line2),
+        ])));
+    }
+    let list = List::new(items)
+        .block(Block::default().style(Style::default().bg(PANEL)))
+        .highlight_style(Style::default().bg(PANEL_ALT));
+    frame.render_stateful_widget(list, area, &mut app.search.list_state);
+}
+
+fn render_release_results(app: &mut App, frame: &mut Frame, area: Rect) {
+    if app.search.releases.is_empty() {
+        render_empty_search(frame, area);
+        return;
+    }
+    let selected = app.search.selected();
+    let width = area.width as usize;
+    let mut items = Vec::with_capacity(app.search.releases.len());
+    for (index, release) in app.search.releases.iter().enumerate() {
+        let is_selected = selected == Some(index);
+        let marker = if is_selected { "▌ " } else { "  " };
+        let star = if index == 0 { "★ " } else { "  " };
+        let mut line1 = vec![
+            Span::styled(marker, Style::default().fg(ACCENT).bold()),
+            Span::styled(format!("{:>2}. ", index + 1), Style::default().fg(MUTED)),
+            Span::styled(
+                star,
+                Style::default().fg(if index == 0 { WARNING } else { MUTED }),
+            ),
+            Span::styled(
+                util::truncate(&release.title, width.saturating_sub(16)),
+                Style::default().fg(TEXT).bold(),
+            ),
+            Span::styled("  ·  ", Style::default().fg(BORDER)),
+            Span::styled(
+                util::truncate(&release.artist, width.saturating_sub(30).max(8)),
+                Style::default().fg(MUTED),
+            ),
+        ];
+        if index == 0 {
+            line1.push(Span::styled("  recommended", Style::default().fg(WARNING)));
+        }
+
+        let mut line2 = vec![
+            Span::styled("     ", Style::default()),
+            Span::styled(
+                util::truncate(&release_meta(release), width.saturating_sub(8)),
+                Style::default().fg(MUTED),
+            ),
+        ];
+        let tags = release.edition_tags();
+        if !tags.is_empty() {
+            line2.push(Span::styled("  ", Style::default()));
+            line2.push(Span::styled(
+                util::truncate(&tags.join(" · "), width.saturating_sub(20).max(8)),
+                Style::default().fg(WARNING),
+            ));
+        }
+        items.push(ListItem::new(Text::from(vec![
+            Line::from(line1),
+            Line::from(line2),
+        ])));
+    }
+    let list = List::new(items)
+        .block(Block::default().style(Style::default().bg(PANEL)))
+        .highlight_style(Style::default().bg(PANEL_ALT));
+    frame.render_stateful_widget(list, area, &mut app.search.list_state);
+}
+
+fn render_chosen_release(app: &App, frame: &mut Frame, area: Rect) {
+    let Some(release) = &app.search.chosen else {
+        render_empty_search(frame, area);
+        return;
+    };
+    let width = area.width as usize;
+    let mut meta = String::new();
+    let tags = release.edition_tags();
+    if !tags.is_empty() {
+        meta.push_str(&tags.join(" · "));
+        meta.push_str(" · ");
+    }
+    meta.push_str(&release_meta(release));
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("★ ", Style::default().fg(WARNING)),
+            Span::styled(
+                util::truncate(
+                    &format!("{} — {}", release.artist, release.title),
+                    width.saturating_sub(2),
+                ),
+                Style::default().fg(TEXT).bold(),
+            ),
+        ]),
+        Line::from(Span::styled(
+            util::truncate(&meta, width),
+            Style::default().fg(MUTED),
+        )),
+        Line::from(""),
+        option_line(
+            app.search.choice == 0,
+            "Continue with this release (default)",
+        ),
+        option_line(
+            app.search.choice == 1,
+            &format!(
+                "Choose another release ({} available)",
+                app.search.releases.len()
+            ),
+        ),
+    ];
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+fn option_line(selected: bool, text: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            if selected { "▌ " } else { "  " },
+            Style::default().fg(ACCENT).bold(),
+        ),
+        Span::styled(
+            text.to_string(),
+            if selected {
+                Style::default().fg(TEXT).bold()
+            } else {
+                Style::default().fg(MUTED)
+            },
+        ),
+    ])
+}
+
+fn render_empty_search(frame: &mut Frame, area: Rect) {
+    let text = Paragraph::new(Text::from(vec![
+        Line::from(Span::styled("♪", Style::default().fg(ACCENT_DARK))),
+        Line::from(Span::styled(
+            "Type an artist and album, then press Enter.",
+            Style::default().fg(MUTED),
+        )),
+    ]))
+    .alignment(Alignment::Center);
+    frame.render_widget(text, area);
+}
+
+fn render_loading_overlay(app: &App, frame: &mut Frame, area: Rect, label: &str) {
+    if area.height == 0 {
+        return;
+    }
+    let text = Paragraph::new(Line::from(vec![
+        Span::styled(spinner(app), Style::default().fg(ACCENT)),
+        Span::styled(format!("  {label}"), Style::default().fg(ACCENT).bold()),
+    ]))
+    .style(Style::default().bg(PANEL_ALT));
+    frame.render_widget(text, Rect::new(area.x, area.y, area.width, 1));
+}
+
+fn render_search_details(app: &App, frame: &mut Frame, area: Rect) {
+    let block = panel("Selection", false);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    match app.search.stage {
+        SearchStage::Groups => {
+            let Some(index) = app.search.selected() else {
+                return render_pick_release(frame, inner);
+            };
+            let Some(group) = app.search.groups.get(index) else {
+                return render_pick_release(frame, inner);
+            };
             let mut line1 = vec![
                 Span::styled(
                     if index == 0 { "★ " } else { "  " },
@@ -668,8 +853,52 @@ fn render_search(app: &mut App, frame: &mut Frame, area: Rect) {
                 ),
                 Span::styled(
                     util::truncate(
+                        &format!("{} — {}", group.artist, group.title),
+                        inner.width as usize,
+                    ),
+                    Style::default().fg(TEXT).bold(),
+                ),
+            ];
+            let tags = group.type_tags();
+            if !tags.is_empty() {
+                line1.push(Span::styled("  ", Style::default()));
+                line1.push(Span::styled(
+                    format!("[{}]", tags.join(" · ")),
+                    Style::default().fg(WARNING),
+                ));
+            }
+            let mut line2 = group_meta(group);
+            if !group.disambiguation.is_empty() {
+                if !line2.is_empty() {
+                    line2.push_str(" · ");
+                }
+                line2.push_str(&group.disambiguation);
+            }
+            if !line2.is_empty() {
+                line2.push_str("  ·  ");
+            }
+            line2.push_str("Enter shows the available releases");
+            frame.render_widget(
+                Paragraph::new(Text::from(vec![
+                    Line::from(line1),
+                    Line::from(Span::styled(
+                        util::truncate(&line2, inner.width as usize),
+                        Style::default().fg(MUTED),
+                    )),
+                ])),
+                inner,
+            );
+        }
+        SearchStage::Chosen => {
+            let Some(release) = &app.search.chosen else {
+                return render_pick_release(frame, inner);
+            };
+            let mut line1 = vec![
+                Span::styled("★ ", Style::default().fg(WARNING)),
+                Span::styled(
+                    util::truncate(
                         &format!("{} — {}", release.artist, release.title),
-                        details_inner.width as usize,
+                        inner.width as usize,
                     ),
                     Style::default().fg(TEXT).bold(),
                 ),
@@ -682,50 +911,116 @@ fn render_search(app: &mut App, frame: &mut Frame, area: Rect) {
                     Style::default().fg(WARNING),
                 ));
             }
-            let mut line2 = String::new();
-            if !release.year().is_empty() {
-                line2.push_str(release.year());
-                line2.push_str(" · ");
+            let line2 = format!(
+                "{}  ·  {} release(s) available",
+                release_meta(release),
+                app.search.releases.len()
+            );
+            frame.render_widget(
+                Paragraph::new(Text::from(vec![
+                    Line::from(line1),
+                    Line::from(Span::styled(
+                        util::truncate(&line2, inner.width as usize),
+                        Style::default().fg(MUTED),
+                    )),
+                ])),
+                inner,
+            );
+        }
+        SearchStage::Releases => {
+            let Some(index) = app.search.selected() else {
+                return render_pick_release(frame, inner);
+            };
+            let Some(release) = app.search.releases.get(index) else {
+                return render_pick_release(frame, inner);
+            };
+            let mut line1 = vec![
+                Span::styled(
+                    if index == 0 { "★ " } else { "  " },
+                    Style::default().fg(WARNING),
+                ),
+                Span::styled(
+                    util::truncate(
+                        &format!("{} — {}", release.artist, release.title),
+                        inner.width as usize,
+                    ),
+                    Style::default().fg(TEXT).bold(),
+                ),
+            ];
+            let tags = release.edition_tags();
+            if !tags.is_empty() {
+                line1.push(Span::styled("  ", Style::default()));
+                line1.push(Span::styled(
+                    format!("[{}]", tags.join(" · ")),
+                    Style::default().fg(WARNING),
+                ));
             }
-            if !release.country.is_empty() {
-                line2.push_str(&release.country);
-                line2.push_str(" · ");
-            }
-            line2.push_str(if release.status.is_empty() {
-                "status unknown"
-            } else {
-                &release.status
-            });
-            line2.push_str(&format!(
-                " · {} · {} tracks",
-                release.format_summary(),
-                release.track_count
-            ));
+            let mut line2 = release_meta(release);
             if release
                 .edition_tags()
                 .iter()
                 .any(|tag| matches!(tag.as_str(), "Deluxe" | "Live" | "Anniversary" | "Expanded"))
             {
-                line2.push_str("  ·  special editions rank below the standard album");
+                line2.push_str("  ·  remasters and standard editions rank first");
             }
-            let text = Text::from(vec![
-                Line::from(line1),
-                Line::from(Span::styled(
-                    util::truncate(&line2, details_inner.width as usize),
-                    Style::default().fg(MUTED),
-                )),
-            ]);
-            frame.render_widget(Paragraph::new(text), details_inner);
+            frame.render_widget(
+                Paragraph::new(Text::from(vec![
+                    Line::from(line1),
+                    Line::from(Span::styled(
+                        util::truncate(&line2, inner.width as usize),
+                        Style::default().fg(MUTED),
+                    )),
+                ])),
+                inner,
+            );
         }
-    } else {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "Pick a release to see its details.",
-                Style::default().fg(MUTED),
-            ))),
-            details_inner,
-        );
     }
+}
+
+fn render_pick_release(frame: &mut Frame, area: Rect) {
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "Pick an album, EP or release to see its details.",
+            Style::default().fg(MUTED),
+        ))),
+        area,
+    );
+}
+
+fn group_meta(group: &crate::musicbrainz::ReleaseGroupCandidate) -> String {
+    let mut parts = Vec::new();
+    let tags = group.type_tags();
+    if !tags.is_empty() {
+        parts.push(tags.join(" · "));
+    }
+    if !group.year().is_empty() {
+        parts.push(group.year().to_string());
+    }
+    if group.release_count == 1 {
+        parts.push("1 release".to_string());
+    } else if group.release_count > 1 {
+        parts.push(format!("{} releases", group.release_count));
+    }
+    parts.join(" · ")
+}
+
+fn release_meta(release: &crate::musicbrainz::ReleaseCandidate) -> String {
+    let mut parts = Vec::new();
+    if !release.year().is_empty() {
+        parts.push(release.year().to_string());
+    }
+    if !release.country.is_empty() {
+        parts.push(release.country.clone());
+    }
+    if !release.status.is_empty() {
+        parts.push(release.status.clone());
+    }
+    parts.push(release.format_summary());
+    parts.push(format!("{} tracks", release.track_count));
+    if !release.disambiguation.is_empty() {
+        parts.push(release.disambiguation.clone());
+    }
+    parts.join(" · ")
 }
 
 fn elapsed_label(started: Option<std::time::Instant>) -> String {
@@ -1110,7 +1405,9 @@ fn render_download(app: &mut App, frame: &mut Frame, area: Rect) {
             String::new()
         };
         let note = if show_note {
-            let text = if !row.note.is_empty() && !matches!(row.status, TrackStatus::Downloading) {
+            let text = if row.status == TrackStatus::Done {
+                "Success".to_string()
+            } else if !row.note.is_empty() && !matches!(row.status, TrackStatus::Downloading) {
                 row.note.clone()
             } else if !row.source.is_empty() {
                 if row.attempts_total > 1 {
@@ -1129,7 +1426,7 @@ fn render_download(app: &mut App, frame: &mut Frame, area: Rect) {
             TrackStatus::Failed => ERROR,
             TrackStatus::Retrying => WARNING,
             TrackStatus::Verifying => INFO,
-            TrackStatus::Done => MUTED,
+            TrackStatus::Done => SUCCESS,
             _ => MUTED,
         };
 
@@ -1417,7 +1714,7 @@ fn render_edit_popup(app: &mut App, frame: &mut Frame, area: Rect) {
 // -------------------------------------------------------------------------
 
 fn render_confirm(confirm: &crate::app::ConfirmDialog, frame: &mut Frame, area: Rect) {
-    let width = area.width.saturating_sub(8).clamp(40, 68);
+    let width = area.width.saturating_sub(4).clamp(40, 68);
     let height = (confirm.lines.len() as u16 + 5).min(area.height);
     let popup = Rect::new(
         area.x + (area.width.saturating_sub(width)) / 2,
@@ -1462,19 +1759,19 @@ fn render_help(app: &App, frame: &mut Frame, area: Rect) {
         crate::app::Screen::Setup => {
             lines.push(help_section("Setup"));
             lines.push(help_line("Tab", "next field"));
-            lines.push(help_line("Enter", "continue / save"));
-            lines.push(help_line("Ctrl+S", "save credentials"));
+            lines.push(help_line("Enter", "continue / verify"));
+            lines.push(help_line("Ctrl+S", "verify and save credentials"));
             lines.push(help_line("Esc", "quit"));
         }
         crate::app::Screen::Search => {
             lines.push(help_section("Search"));
             lines.push(help_line("Tab", "switch between fields"));
-            lines.push(help_line("Enter", "search / open release"));
-            lines.push(help_line("↑ ↓", "choose a release"));
+            lines.push(help_line("Enter", "search / choose"));
+            lines.push(help_line("↑ ↓", "choose an album, EP or release"));
+            lines.push(help_line("Esc", "back / cancel"));
             lines.push(help_line("/", "edit the album"));
             lines.push(help_line("r", "search again"));
             lines.push(help_line("s", "settings"));
-            lines.push(help_line("Esc", "cancel / leave input"));
         }
         crate::app::Screen::Tracks => {
             lines.push(help_section("Tracklist"));
@@ -1621,7 +1918,7 @@ mod tests {
     use crate::app::{App, Screen, SearchFocus, TracksView};
     use crate::cli::Args;
     use crate::config::Config;
-    use crate::musicbrainz::{ReleaseCandidate, ReleaseInfo, TrackInfo};
+    use crate::musicbrainz::{ReleaseCandidate, ReleaseGroupCandidate, ReleaseInfo, TrackInfo};
     use crate::session::TrackStatus;
     use clap::Parser;
     use ratatui::Terminal;
@@ -1689,6 +1986,38 @@ mod tests {
         }
     }
 
+    fn release_candidate() -> ReleaseCandidate {
+        ReleaseCandidate {
+            mbid: "release-id".into(),
+            title: "Test Album".into(),
+            artist: "Test Artist".into(),
+            date: "2015-01-01".into(),
+            country: "GB".into(),
+            status: "Official".into(),
+            disambiguation: "2015 remaster".into(),
+            track_count: 2,
+            primary_type: "Album".into(),
+            secondary_types: Vec::new(),
+            formats: vec!["CD".into()],
+            score: 0,
+        }
+    }
+
+    fn group_candidate() -> ReleaseGroupCandidate {
+        ReleaseGroupCandidate {
+            mbid: "group-id".into(),
+            title: "Test Album".into(),
+            artist: "Test Artist".into(),
+            first_release_date: "2020-01-02".into(),
+            primary_type: "Album".into(),
+            secondary_types: Vec::new(),
+            disambiguation: String::new(),
+            release_count: 1,
+            search_score: 100,
+            score: 0,
+        }
+    }
+
     #[test]
     fn setup_and_search_screens_render() {
         let mut app = app();
@@ -1696,32 +2025,63 @@ mod tests {
         assert!(setup.contains("Welcome to soulsucker"));
         assert!(setup.contains("block non-sharers"));
         assert!(setup.contains("Nicotine+"));
+        assert!(setup.contains("highly recommended"));
+        assert!(setup.contains("tracks could be wrong"));
 
         let setup_narrow = render_text(&mut app, 48, 20);
         assert!(setup_narrow.contains("block non-sharers."));
         assert!(setup_narrow.contains("one session at a time."));
+        assert!(setup_narrow.contains("highly recommended"));
 
         app.screen = Screen::Search;
         app.search.focus = SearchFocus::Results;
-        app.search.results = vec![ReleaseCandidate {
-            mbid: "release-id".into(),
-            title: "Test Album".into(),
-            artist: "Test Artist".into(),
-            date: "2020-01-02".into(),
-            country: "GB".into(),
-            status: "Official".into(),
-            disambiguation: String::new(),
-            track_count: 2,
-            primary_type: "Album".into(),
-            secondary_types: Vec::new(),
-            formats: vec!["CD".into()],
-            score: 0,
-        }];
+        app.search.stage = SearchStage::Groups;
+        app.search.groups = vec![group_candidate()];
         app.search.list_state.select(Some(0));
-        let search = render_text(&mut app, 110, 34);
-        assert!(search.contains("Search MusicBrainz"));
-        assert!(search.contains("Test Album"));
-        assert!(search.contains("recommended"));
+        let groups = render_text(&mut app, 110, 34);
+        assert!(groups.contains("Search MusicBrainz"));
+        assert!(groups.contains("Albums, EPs & singles"));
+        assert!(groups.contains("Test Album"));
+        assert!(groups.contains("recommended"));
+
+        app.search.releases = vec![release_candidate()];
+        app.search.chosen = Some(release_candidate());
+        app.search.stage = SearchStage::Chosen;
+        app.search.choice = 0;
+        let chosen = render_text(&mut app, 110, 34);
+        assert!(chosen.contains("Chosen release"));
+        assert!(chosen.contains("Continue with this release"));
+        assert!(chosen.contains("Choose another release"));
+        assert!(chosen.contains("Remaster"));
+
+        app.search.stage = SearchStage::Releases;
+        app.search.choice = 1;
+        app.search.list_state.select(Some(0));
+        let releases = render_text(&mut app, 110, 34);
+        assert!(releases.contains("Releases · 1"));
+        assert!(releases.contains("Test Album"));
+        assert!(releases.contains("Remaster"));
+    }
+
+    #[test]
+    fn setup_without_acoustid_confirmation_renders_at_minimum_width() {
+        let mut app = app();
+        app.screen = Screen::Setup;
+        app.confirm = Some(crate::app::ConfirmDialog {
+            title: "Continue without AcoustID?".into(),
+            lines: vec![
+                "AcoustID is free and highly recommended.".into(),
+                "Without it, tracks could be wrong.".into(),
+                "Continue without an AcoustID key?".into(),
+            ],
+            action: crate::app::ConfirmAction::SetupWithoutAcoustId,
+        });
+
+        let text = render_text(&mut app, 48, 20);
+        assert!(text.contains("Continue without AcoustID?"));
+        assert!(text.contains("highly recommended"));
+        assert!(text.contains("tracks could be wrong"));
+        assert!(text.contains("[y]"));
     }
 
     #[test]
@@ -1753,6 +2113,8 @@ mod tests {
         let download_text = render_text(&mut app, 110, 34);
         assert!(download_text.contains("Download"));
         assert!(download_text.contains("First Song"));
+        assert!(download_text.contains("Success"));
+        assert!(!download_text.contains("duration 4:00"));
         assert!(download_text.contains("Activity"));
 
         app.screen = Screen::Settings;

@@ -22,6 +22,7 @@ const USER_AGENT: &str = concat!(
     " (https://github.com/example/soulsucker)"
 );
 const REQUEST_SPACING: Duration = Duration::from_millis(1100);
+const MAX_RETRIES: u32 = 3;
 
 static HTTP: OnceLock<ureq::Agent> = OnceLock::new();
 static LAST_REQUEST: Mutex<Option<Instant>> = Mutex::new(None);
@@ -47,9 +48,17 @@ fn throttle() {
     *guard = Some(Instant::now());
 }
 
+fn should_retry(retryable: bool, attempt: u32) -> bool {
+    retryable && attempt < MAX_RETRIES
+}
+
+fn retry_delay(attempt: u32) -> Duration {
+    Duration::from_secs(2 + attempt as u64 * 2)
+}
+
 fn get_json<T: DeserializeOwned>(url: &str, query: &[(&str, String)]) -> Result<T> {
     let mut last_error = None;
-    for attempt in 0..3 {
+    for attempt in 0..=MAX_RETRIES {
         throttle();
         let request = http()
             .get(url)
@@ -70,10 +79,10 @@ fn get_json<T: DeserializeOwned>(url: &str, query: &[(&str, String)]) -> Result<
                 );
                 let message = friendly_http_error(&err);
                 last_error = Some(anyhow!(message));
-                if !retryable || attempt == 2 {
+                if !should_retry(retryable, attempt) {
                     break;
                 }
-                std::thread::sleep(Duration::from_secs(2 + attempt as u64 * 2));
+                std::thread::sleep(retry_delay(attempt));
             }
         }
     }
@@ -189,6 +198,50 @@ impl ReleaseCandidate {
         tags.dedup();
         tags
     }
+
+    /// A remastered pressing, based on the release title or disambiguation
+    /// comment (MusicBrainz stores remaster information there).
+    pub fn is_remastered(&self) -> bool {
+        let blob = format!("{} {}", self.title, self.disambiguation).to_ascii_lowercase();
+        blob.contains("remaster")
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReleaseGroupCandidate {
+    pub mbid: String,
+    pub title: String,
+    pub artist: String,
+    pub first_release_date: String,
+    pub primary_type: String,
+    pub secondary_types: Vec<String>,
+    pub disambiguation: String,
+    pub release_count: u32,
+    pub search_score: i32,
+    /// Lower is more desirable, like [`ReleaseCandidate::score`].
+    pub score: i32,
+}
+
+impl ReleaseGroupCandidate {
+    pub fn year(&self) -> &str {
+        self.first_release_date.get(..4).unwrap_or("")
+    }
+
+    /// Short type labels such as `Album`, `EP`, or `Live · EP`.
+    pub fn type_tags(&self) -> Vec<String> {
+        let mut tags = Vec::new();
+        if !self.primary_type.trim().is_empty() {
+            tags.push(self.primary_type.trim().to_string());
+        }
+        for secondary in &self.secondary_types {
+            let secondary = secondary.trim();
+            if !secondary.is_empty() && !tags.iter().any(|tag| tag.eq_ignore_ascii_case(secondary))
+            {
+                tags.push(secondary.to_string());
+            }
+        }
+        tags
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -269,31 +322,29 @@ pub struct CoverArt {
 // -------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
-struct SearchResponse {
-    #[serde(default)]
-    releases: Vec<SearchRelease>,
+struct GroupSearchResponse {
+    #[serde(rename = "release-groups", default)]
+    release_groups: Vec<SearchReleaseGroup>,
 }
 
 #[derive(Debug, Deserialize)]
-struct SearchRelease {
+struct SearchReleaseGroup {
     id: String,
     title: String,
     #[serde(default)]
-    date: Option<String>,
-    #[serde(default)]
-    country: Option<String>,
-    #[serde(default)]
-    status: Option<String>,
+    score: i32,
+    #[serde(rename = "primary-type", default)]
+    primary_type: Option<String>,
+    #[serde(rename = "secondary-types", default)]
+    secondary_types: Vec<String>,
+    #[serde(rename = "first-release-date", default)]
+    first_release_date: Option<String>,
     #[serde(default)]
     disambiguation: Option<String>,
-    #[serde(rename = "track-count", default)]
-    track_count: u32,
+    #[serde(default)]
+    count: u32,
     #[serde(rename = "artist-credit", default)]
     artist_credit: Vec<ArtistCredit>,
-    #[serde(rename = "release-group", default)]
-    release_group: Option<ReleaseGroup>,
-    #[serde(default)]
-    media: Vec<SearchMedium>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -310,12 +361,36 @@ struct ReleaseGroup {
     id: Option<String>,
     #[serde(rename = "primary-type", default)]
     primary_type: Option<String>,
-    #[serde(rename = "secondary-types", default)]
-    secondary_types: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct SearchMedium {
+struct BrowseReleasesResponse {
+    #[serde(default)]
+    releases: Vec<BrowseRelease>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowseRelease {
+    id: String,
+    title: String,
+    #[serde(default)]
+    date: Option<String>,
+    #[serde(default)]
+    country: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    disambiguation: Option<String>,
+    #[serde(rename = "artist-credit", default)]
+    artist_credit: Vec<ArtistCredit>,
+    #[serde(default)]
+    media: Vec<BrowseMedium>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowseMedium {
+    #[serde(rename = "track-count", default)]
+    track_count: u32,
     #[serde(default)]
     format: Option<String>,
 }
@@ -404,10 +479,14 @@ struct ItunesAlbum {
 // Public API
 // -------------------------------------------------------------------------
 
-pub fn search_releases(artist: &str, album: &str, limit: usize) -> Result<Vec<ReleaseCandidate>> {
-    let query = build_query(artist, album);
-    let url = format!("{MB_BASE}/release/");
-    let response: SearchResponse = get_json(
+pub fn search_release_groups(
+    artist: &str,
+    album: &str,
+    limit: usize,
+) -> Result<Vec<ReleaseGroupCandidate>> {
+    let query = build_group_query(artist, album);
+    let url = format!("{MB_BASE}/release-group/");
+    let response: GroupSearchResponse = get_json(
         &url,
         &[
             ("query", query),
@@ -416,28 +495,66 @@ pub fn search_releases(artist: &str, album: &str, limit: usize) -> Result<Vec<Re
         ],
     )?;
 
-    Ok(candidates_from_search(response, artist, album))
+    Ok(groups_from_search(response, artist, album))
 }
 
-fn candidates_from_search(
-    response: SearchResponse,
+fn groups_from_search(
+    response: GroupSearchResponse,
     artist: &str,
     album: &str,
+) -> Vec<ReleaseGroupCandidate> {
+    let groups = response
+        .release_groups
+        .into_iter()
+        .map(|group| ReleaseGroupCandidate {
+            mbid: group.id,
+            title: group.title,
+            artist: join_artist_credit(&group.artist_credit),
+            first_release_date: group.first_release_date.unwrap_or_default(),
+            primary_type: group.primary_type.unwrap_or_default(),
+            secondary_types: group.secondary_types,
+            disambiguation: group.disambiguation.unwrap_or_default(),
+            release_count: group.count,
+            search_score: group.score,
+            score: 0,
+        })
+        .collect();
+    rank_groups(groups, artist, album)
+}
+
+/// Fetch every available release (pressing/edition) in a release group.
+pub fn get_group_releases(
+    group: &ReleaseGroupCandidate,
+    limit: usize,
+) -> Result<Vec<ReleaseCandidate>> {
+    let url = format!("{MB_BASE}/release/");
+    let response: BrowseReleasesResponse = get_json(
+        &url,
+        &[
+            ("release-group", group.mbid.clone()),
+            ("inc", "artist-credits+media".to_string()),
+            ("fmt", "json".to_string()),
+            ("limit", limit.clamp(1, 100).to_string()),
+        ],
+    )?;
+
+    Ok(candidates_from_group(response, group))
+}
+
+fn candidates_from_group(
+    response: BrowseReleasesResponse,
+    group: &ReleaseGroupCandidate,
 ) -> Vec<ReleaseCandidate> {
-    let out: Vec<ReleaseCandidate> = response
+    let releases = response
         .releases
         .into_iter()
         .map(|release| {
+            let track_count: u32 = release.media.iter().map(|m| m.track_count).sum();
             let formats = release
                 .media
                 .iter()
-                .filter_map(|m| m.format.clone())
-                .collect::<Vec<_>>();
-            let release_group = release.release_group.unwrap_or(ReleaseGroup {
-                id: None,
-                primary_type: None,
-                secondary_types: Vec::new(),
-            });
+                .filter_map(|medium| medium.format.clone())
+                .collect();
             ReleaseCandidate {
                 mbid: release.id,
                 title: release.title,
@@ -446,54 +563,145 @@ fn candidates_from_search(
                 country: release.country.unwrap_or_default(),
                 status: release.status.unwrap_or_default(),
                 disambiguation: release.disambiguation.unwrap_or_default(),
-                track_count: release.track_count,
-                primary_type: release_group.primary_type.unwrap_or_default(),
-                secondary_types: release_group.secondary_types,
+                track_count,
+                primary_type: group.primary_type.clone(),
+                secondary_types: group.secondary_types.clone(),
                 formats,
                 score: 0,
             }
         })
         .collect();
-
-    rank_candidates(out, artist, album)
+    rank_group_releases(releases, group)
 }
 
-fn rank_candidates(
-    mut candidates: Vec<ReleaseCandidate>,
+fn rank_groups(
+    mut groups: Vec<ReleaseGroupCandidate>,
     artist: &str,
     album: &str,
-) -> Vec<ReleaseCandidate> {
-    let original = original_release(&candidates);
-    for candidate in &mut candidates {
-        candidate.score = score_release(candidate, artist, album);
-        if !candidate.country.trim().is_empty()
-            && !original.countries.is_empty()
-            && !original
-                .countries
-                .iter()
-                .any(|country| country.eq_ignore_ascii_case(candidate.country.trim()))
-        {
-            candidate.score += FOREIGN_COUNTRY_PENALTY;
-        }
-        if let (Some(original_date), Some(date)) =
-            (original.date, parse_partial_date(&candidate.date))
-            && date > original_date
-        {
-            let years_late = (date.year - original_date.year).max(0) as f64;
-            candidate.score += (years_late * LATER_RELEASE_PENALTY_PER_YEAR)
-                .min(MAX_LATER_RELEASE_PENALTY)
-                .round() as i32;
+) -> Vec<ReleaseGroupCandidate> {
+    for group in &mut groups {
+        group.score = score_group(group, artist, album);
+    }
+    groups.sort_by(|a, b| {
+        a.score
+            .cmp(&b.score)
+            .then_with(|| b.search_score.cmp(&a.search_score))
+            .then_with(|| type_order(&a.primary_type).cmp(&type_order(&b.primary_type)))
+            .then_with(|| a.first_release_date.cmp(&b.first_release_date))
+            .then_with(|| a.title.cmp(&b.title))
+    });
+    groups
+}
+
+fn type_order(primary_type: &str) -> u8 {
+    match primary_type.to_ascii_lowercase().as_str() {
+        "album" => 0,
+        "ep" => 1,
+        "single" => 2,
+        "broadcast" => 3,
+        "" => 4,
+        _ => 5,
+    }
+}
+
+/// Lower score is more desirable. Release groups are the album/EP/single
+/// entries shown before the individual pressings.
+fn score_group(group: &ReleaseGroupCandidate, query_artist: &str, query_album: &str) -> i32 {
+    let mut score = 0.0f64;
+    let album_query = normalize_text(query_album);
+    let artist_query = normalize_text(query_artist);
+    let title = normalize_text(&group.title);
+    let artist = normalize_text(&group.artist);
+
+    if !album_query.is_empty() && !title.is_empty() {
+        if title == album_query {
+            score -= 60.0;
+        } else if title.contains(&album_query) || album_query.contains(&title) {
+            score -= 25.0;
+        } else {
+            let ratio = normalized_levenshtein(&album_query, &title);
+            score += (1.0 - ratio) * 200.0;
+            if ratio < 0.5 {
+                score += 40.0;
+            }
         }
     }
 
-    candidates.sort_by(|a, b| {
-        a.score
-            .cmp(&b.score)
+    if !artist_query.is_empty() && !artist.is_empty() {
+        if artist == artist_query {
+            score -= 15.0;
+        } else if artist.contains(&artist_query) || artist_query.contains(&artist) {
+            score -= 8.0;
+        } else {
+            let ratio = normalized_levenshtein(&artist_query, &artist);
+            score += (1.0 - ratio) * 100.0;
+            if ratio < 0.5 {
+                score += 30.0;
+            }
+        }
+    }
+
+    // Keep studio albums first, then EPs and singles. Exact title/artist
+    // matches still dominate these small type preferences.
+    score += match group.primary_type.to_ascii_lowercase().as_str() {
+        "album" => 0.0,
+        "ep" => 8.0,
+        "single" => 16.0,
+        "broadcast" => 20.0,
+        "" => 6.0,
+        _ => 25.0,
+    };
+
+    let asked_live = contains_word(&album_query, "live");
+    let asked_compilation = album_query.contains("compilation")
+        || album_query.contains("greatest")
+        || album_query.contains("best of");
+    for secondary in &group.secondary_types {
+        let lower = secondary.to_ascii_lowercase();
+        if lower.contains("live") && !asked_live {
+            score += 10.0;
+        } else if lower.contains("compilation") && !asked_compilation {
+            score += 6.0;
+        } else if lower.contains("soundtrack") {
+            score += 4.0;
+        } else if lower.contains("remix") {
+            score += 8.0;
+        }
+    }
+
+    if group.first_release_date.is_empty() {
+        score += 2.0;
+    }
+
+    score.round() as i32
+}
+
+/// Rank the pressings inside one release group. Remastered releases come
+/// first; within that group the existing edition/format heuristics apply.
+fn rank_group_releases(
+    mut releases: Vec<ReleaseCandidate>,
+    group: &ReleaseGroupCandidate,
+) -> Vec<ReleaseCandidate> {
+    for release in &mut releases {
+        release.score = score_release(release, &group.artist, &group.title);
+    }
+    releases.sort_by(|a, b| {
+        preferred_remaster(b)
+            .cmp(&preferred_remaster(a))
+            .then_with(|| a.score.cmp(&b.score))
             .then_with(|| a.track_count.cmp(&b.track_count))
-            .then_with(|| a.date.is_empty().cmp(&b.date.is_empty()))
             .then_with(|| a.date.cmp(&b.date))
+            .then_with(|| a.mbid.cmp(&b.mbid))
     });
-    candidates
+    releases
+}
+
+fn preferred_remaster(release: &ReleaseCandidate) -> bool {
+    release.is_remastered()
+        && !matches!(
+            release.status.to_ascii_lowercase().as_str(),
+            "bootleg" | "promotion" | "pseudo-release" | "withdrawn" | "cancelled"
+        )
 }
 
 pub fn get_release(mbid: &str) -> Result<ReleaseInfo> {
@@ -858,12 +1066,12 @@ fn release_info_from_detail(detail: DetailRelease) -> Result<ReleaseInfo> {
     })
 }
 
-pub fn build_query(artist: &str, album: &str) -> String {
+pub fn build_group_query(artist: &str, album: &str) -> String {
     let artist = escape_lucene(artist);
     let album = escape_lucene(album);
     match (artist.trim().is_empty(), album.trim().is_empty()) {
-        (false, false) => format!("release:\"{album}\" AND artist:\"{artist}\""),
-        (true, false) => format!("release:\"{album}\""),
+        (false, false) => format!("releasegroup:\"{album}\" AND artist:\"{artist}\""),
+        (true, false) => format!("releasegroup:\"{album}\""),
         (false, true) => format!("artist:\"{artist}\""),
         (true, true) => String::new(),
     }
@@ -908,95 +1116,6 @@ fn is_video_medium(medium: &DetailMedium) -> bool {
         return true;
     }
     medium.title.as_deref().is_some_and(is_video_format)
-}
-
-/// Preferred-country releases get no penalty; other pressings get this one.
-const FOREIGN_COUNTRY_PENALTY: i32 = 12;
-/// Later pressings get a small tie-break penalty so the original release wins
-/// when everything else is equal. The cap keeps it below edition penalties.
-const LATER_RELEASE_PENALTY_PER_YEAR: f64 = 0.5;
-const MAX_LATER_RELEASE_PENALTY: f64 = 6.0;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct PartialDate {
-    year: i32,
-    month: u8,
-    day: u8,
-}
-
-fn parse_partial_date(value: &str) -> Option<PartialDate> {
-    let mut parts = value.trim().split('-');
-    let year = parts.next()?.parse::<i32>().ok()?;
-    // Missing components mean "unknown within this period". Treat them as the
-    // end of the period so a bare `1979` does not look earlier than
-    // `1979-11-30` and hijack the original-country inference.
-    let month = match parts.next() {
-        None => 12,
-        Some(part) => part
-            .parse::<u8>()
-            .ok()
-            .filter(|month| (1..=12).contains(month))?,
-    };
-    let day = match parts.next() {
-        None => 31,
-        Some(part) => part
-            .parse::<u8>()
-            .ok()
-            .filter(|day| (1..=31).contains(day))?,
-    };
-    (year > 0).then_some(PartialDate { year, month, day })
-}
-
-#[derive(Debug, Default)]
-struct OriginalRelease {
-    date: Option<PartialDate>,
-    countries: Vec<String>,
-}
-
-/// The earliest official release in the search results, plus its country (or
-/// countries tied for that date). This is a good proxy for the album's first
-/// issue and where it came from.
-fn original_release(candidates: &[ReleaseCandidate]) -> OriginalRelease {
-    let mut original = OriginalRelease::default();
-
-    for candidate in candidates {
-        if !candidate.status.is_empty() && !candidate.status.eq_ignore_ascii_case("official") {
-            continue;
-        }
-        let Some(date) = parse_partial_date(&candidate.date) else {
-            continue;
-        };
-        let country = candidate.country.trim();
-
-        match original.date {
-            None => {
-                original.date = Some(date);
-                if !country.is_empty() {
-                    original.countries.push(country.to_ascii_uppercase());
-                }
-            }
-            Some(current) if date < current => {
-                original.date = Some(date);
-                original.countries.clear();
-                if !country.is_empty() {
-                    original.countries.push(country.to_ascii_uppercase());
-                }
-            }
-            Some(current)
-                if date == current
-                    && !country.is_empty()
-                    && !original
-                        .countries
-                        .iter()
-                        .any(|known| known.eq_ignore_ascii_case(country)) =>
-            {
-                original.countries.push(country.to_ascii_uppercase());
-            }
-            _ => {}
-        }
-    }
-
-    original
 }
 
 /// Lower score is more desirable.
@@ -1173,6 +1292,33 @@ mod tests {
         }
     }
 
+    fn group_candidate(title: &str, primary_type: &str, date: &str) -> ReleaseGroupCandidate {
+        ReleaseGroupCandidate {
+            mbid: format!("{title}-{primary_type}"),
+            title: title.into(),
+            artist: "Metallica".into(),
+            first_release_date: date.into(),
+            primary_type: primary_type.into(),
+            secondary_types: Vec::new(),
+            disambiguation: String::new(),
+            release_count: 1,
+            search_score: 100,
+            score: 0,
+        }
+    }
+
+    #[test]
+    fn transient_errors_are_retried_three_times() {
+        assert!(should_retry(true, 0));
+        assert!(should_retry(true, 1));
+        assert!(should_retry(true, 2));
+        assert!(!should_retry(true, MAX_RETRIES));
+        assert!(!should_retry(false, 0));
+        assert_eq!(retry_delay(0), Duration::from_secs(2));
+        assert_eq!(retry_delay(1), Duration::from_secs(4));
+        assert_eq!(retry_delay(2), Duration::from_secs(6));
+    }
+
     #[test]
     fn a_standard_album_outscores_a_deluxe_edition() {
         let mut standard = candidate("Ride the Lightning", 8);
@@ -1181,72 +1327,6 @@ mod tests {
         standard.score = score_release(&standard, "Metallica", "Ride the Lightning");
         deluxe.score = score_release(&deluxe, "Metallica", "Ride the Lightning");
         assert!(standard.score < deluxe.score);
-    }
-
-    #[test]
-    fn original_country_comes_from_the_earliest_official_release() {
-        let mut uk = candidate("Ride the Lightning", 8);
-        uk.country = "GB".into();
-        uk.date = "1984-07-27".into();
-        let mut us = candidate("Ride the Lightning", 8);
-        us.country = "US".into();
-        us.date = "1984-10-01".into();
-        let mut bootleg = candidate("Ride the Lightning", 8);
-        bootleg.country = "DE".into();
-        bootleg.date = "1984-01-01".into();
-        bootleg.status = "Bootleg".into();
-
-        assert_eq!(
-            original_release(&[us, uk, bootleg]).countries,
-            vec!["GB".to_string()]
-        );
-    }
-
-    #[test]
-    fn a_year_only_date_does_not_beat_a_specific_date_in_the_same_year() {
-        let mut specific = candidate("The Wall", 26);
-        specific.country = "GB".into();
-        specific.date = "1979-11-30".into();
-        let mut vague = candidate("The Wall", 26);
-        vague.country = "SE".into();
-        vague.date = "1979".into();
-
-        assert_eq!(
-            original_release(&[vague, specific]).countries,
-            vec!["GB".to_string()]
-        );
-    }
-
-    #[test]
-    fn the_original_release_outranks_a_later_reissue() {
-        let mut original = candidate("The Wall", 26);
-        original.artist = "Pink Floyd".into();
-        original.date = "1979-11-30".into();
-        original.country = "US".into();
-        original.formats = vec!["12\" Vinyl".into(), "12\" Vinyl".into()];
-        let mut reissue = candidate("The Wall", 26);
-        reissue.artist = "Pink Floyd".into();
-        reissue.date = "1985".into();
-        reissue.country = "US".into();
-        reissue.formats = vec!["CD".into(), "CD".into()];
-
-        let ranked = rank_candidates(vec![reissue, original], "Pink Floyd", "The Wall");
-        assert_eq!(ranked[0].date, "1979-11-30");
-    }
-
-    #[test]
-    fn releases_from_the_original_country_are_preferred() {
-        let mut original = candidate("Ride the Lightning", 8);
-        original.country = "US".into();
-        original.date = "1984-07-27".into();
-        original.formats = vec!["Vinyl".into()];
-        let mut foreign = candidate("Ride the Lightning", 8);
-        foreign.country = "JP".into();
-        foreign.date = "1984-09-21".into();
-        foreign.formats = vec!["CD".into()];
-
-        let ranked = rank_candidates(vec![foreign, original], "Metallica", "Ride the Lightning");
-        assert_eq!(ranked[0].country, "US");
     }
 
     #[test]
@@ -1270,11 +1350,95 @@ mod tests {
     }
 
     #[test]
-    fn build_query_escapes_quotes() {
+    fn build_group_query_uses_releasegroup_field() {
         assert_eq!(
-            build_query("AC\"DC", "Back\\Black"),
-            "release:\"Back\\\\Black\" AND artist:\"AC\\\"DC\""
+            build_group_query("AC\"DC", "Back\\Black"),
+            "releasegroup:\"Back\\\\Black\" AND artist:\"AC\\\"DC\""
         );
+    }
+
+    #[test]
+    fn release_group_search_json_fields_are_parsed() {
+        let json = r#"{
+          "release-groups": [{
+            "id": "group-1",
+            "title": "Jar of Flies",
+            "score": 100,
+            "primary-type": "EP",
+            "secondary-types": [],
+            "first-release-date": "1994-01-18",
+            "count": 9,
+            "artist-credit": [{"name": "Alice in Chains", "joinphrase": ""}]
+          }]
+        }"#;
+        let response: GroupSearchResponse = serde_json::from_str(json).unwrap();
+        let groups = groups_from_search(response, "Alice in Chains", "Jar of Flies");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].mbid, "group-1");
+        assert_eq!(groups[0].artist, "Alice in Chains");
+        assert_eq!(groups[0].release_count, 9);
+        assert_eq!(groups[0].year(), "1994");
+        assert_eq!(groups[0].type_tags(), vec!["EP".to_string()]);
+        assert!(groups[0].score < 0);
+    }
+
+    #[test]
+    fn albums_rank_before_eps_and_singles_for_the_same_title() {
+        let album = group_candidate("Ride the Lightning", "Album", "1984");
+        let ep = group_candidate("Ride the Lightning", "EP", "1984");
+        let single = group_candidate("Ride the Lightning", "Single", "1984");
+        let ranked = rank_groups(vec![single, ep, album], "Metallica", "Ride the Lightning");
+        assert_eq!(ranked[0].primary_type, "Album");
+        assert_eq!(ranked[1].primary_type, "EP");
+        assert_eq!(ranked[2].primary_type, "Single");
+    }
+
+    #[test]
+    fn bootleg_remasters_do_not_outrank_official_originals() {
+        let group = group_candidate("Ride the Lightning", "Album", "1984");
+        let mut original = candidate("Ride the Lightning", 8);
+        original.mbid = "original".into();
+        let mut bootleg = candidate("Ride the Lightning", 8);
+        bootleg.mbid = "bootleg".into();
+        bootleg.status = "Bootleg".into();
+        bootleg.disambiguation = "remastered".into();
+
+        let ranked = rank_group_releases(vec![bootleg, original], &group);
+        assert_eq!(ranked[0].mbid, "original");
+    }
+
+    #[test]
+    fn group_browse_json_prefers_remastered_pressings() {
+        let json = r#"{
+          "releases": [
+            {
+              "id": "original",
+              "title": "Ride the Lightning",
+              "date": "1984-07-27",
+              "country": "US",
+              "status": "Official",
+              "artist-credit": [{"name": "Metallica", "joinphrase": ""}],
+              "media": [{"format": "CD", "track-count": 8}]
+            },
+            {
+              "id": "remaster",
+              "title": "Ride the Lightning",
+              "date": "2016-01-01",
+              "country": "US",
+              "status": "Official",
+              "disambiguation": "2016 remaster",
+              "artist-credit": [{"name": "Metallica", "joinphrase": ""}],
+              "media": [{"format": "CD", "track-count": 8}]
+            }
+          ]
+        }"#;
+        let response: BrowseReleasesResponse = serde_json::from_str(json).unwrap();
+        let group = group_candidate("Ride the Lightning", "Album", "1984");
+        let releases = candidates_from_group(response, &group);
+        assert_eq!(releases.len(), 2);
+        assert_eq!(releases[0].mbid, "remaster");
+        assert!(releases[0].is_remastered());
+        assert_eq!(releases[0].track_count, 8);
     }
 
     #[test]
@@ -1325,35 +1489,6 @@ mod tests {
         assert_eq!(release.tracks[1].artist, "Album Artist");
         assert_eq!(release.tracks[1].track_mbid, "track-2");
         assert_eq!(release.tracks[1].index, 1);
-    }
-
-    #[test]
-    fn search_json_fields_are_parsed() {
-        let json = r#"{
-          "releases": [{
-            "id": "rel-1",
-            "title": "Ride the Lightning",
-            "date": "1984-07-27",
-            "country": "US",
-            "status": "Official",
-            "track-count": 8,
-            "artist-credit": [
-              {"name": "Metallica", "joinphrase": ""}
-            ],
-            "release-group": {"primary-type": "Album", "secondary-types": []},
-            "media": [{"format": "CD"}, {"format": "DVD"}]
-          }]
-        }"#;
-        let response: SearchResponse = serde_json::from_str(json).unwrap();
-        let candidates = candidates_from_search(response, "Metallica", "Ride the Lightning");
-        assert_eq!(candidates.len(), 1);
-        let candidate = &candidates[0];
-        assert_eq!(candidate.mbid, "rel-1");
-        assert_eq!(candidate.artist, "Metallica");
-        assert_eq!(candidate.track_count, 8);
-        assert_eq!(candidate.primary_type, "Album");
-        assert_eq!(candidate.format_summary(), "CD");
-        assert!(candidate.score < 0);
     }
 
     fn itunes_album(artist: &str, album: &str, artwork: &str) -> ItunesAlbum {

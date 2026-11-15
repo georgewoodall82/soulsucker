@@ -129,7 +129,66 @@ struct TrackListResponse {
 #[derive(Debug, Deserialize)]
 struct ApiError {
     #[serde(default)]
+    code: i32,
+    #[serde(default)]
     message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApiKeyError {
+    Invalid,
+    Unavailable(String),
+}
+
+/// Confirm that AcoustID accepts the client key.
+///
+/// The request deliberately uses an invalid fingerprint. AcoustID validates
+/// the client key first, so a good key returns error code 3 ("invalid
+/// fingerprint") while a bad key returns code 4 ("invalid API key"). This
+/// avoids generating and fingerprinting audio just to check the key.
+pub fn validate_api_key(api_key: &str) -> std::result::Result<(), ApiKeyError> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return Err(ApiKeyError::Invalid);
+    }
+    let body = format!(
+        "format=json&client={}&meta=recordings&duration=3&fingerprint=AQAAAAAA",
+        form_encode(api_key)
+    );
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(15)))
+        .http_status_as_error(false)
+        .user_agent(USER_AGENT)
+        .build();
+    let agent = ureq::Agent::new_with_config(config);
+    throttle_requests();
+    let mut response = agent
+        .post(LOOKUP_URL)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .send(body)
+        .map_err(|err| ApiKeyError::Unavailable(err.to_string()))?;
+    let data: LookupResponse = response.body_mut().read_json().map_err(|err| {
+        ApiKeyError::Unavailable(format!("could not parse AcoustID response: {err}"))
+    })?;
+    classify_api_key_response(&data)
+}
+
+fn classify_api_key_response(data: &LookupResponse) -> std::result::Result<(), ApiKeyError> {
+    if data.status == "ok" {
+        return Ok(());
+    }
+    match data.error.as_ref().map(|err| err.code).unwrap_or_default() {
+        // The key was accepted; only our deliberately fake fingerprint was
+        // rejected.
+        3 => Ok(()),
+        4 => Err(ApiKeyError::Invalid),
+        _ => Err(ApiKeyError::Unavailable(
+            data.error
+                .as_ref()
+                .and_then(|err| err.message.clone())
+                .unwrap_or_else(|| "unknown AcoustID error".to_string()),
+        )),
+    }
 }
 
 static LAST_REQUEST: Mutex<Option<Instant>> = Mutex::new(None);
@@ -668,6 +727,41 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    fn api_error(code: i32, message: &str) -> LookupResponse {
+        LookupResponse {
+            status: "error".to_string(),
+            error: Some(ApiError {
+                code,
+                message: Some(message.to_string()),
+            }),
+            results: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn api_key_validation_classifies_acoustid_errors() {
+        assert_eq!(
+            classify_api_key_response(&api_error(3, "invalid fingerprint")),
+            Ok(())
+        );
+        assert_eq!(
+            classify_api_key_response(&api_error(4, "invalid API key")),
+            Err(ApiKeyError::Invalid)
+        );
+        assert!(matches!(
+            classify_api_key_response(&api_error(5, "temporarily unavailable")),
+            Err(ApiKeyError::Unavailable(_))
+        ));
+        assert_eq!(
+            classify_api_key_response(&LookupResponse {
+                status: "ok".to_string(),
+                error: None,
+                results: Vec::new(),
+            }),
+            Ok(())
+        );
     }
 
     #[test]

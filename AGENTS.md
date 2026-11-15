@@ -69,7 +69,8 @@ The app uses **threads + `std::sync::mpsc`**, not async/Tokio.
 ```text
 main
  └─ App (UI thread: crossterm + ratatui)
-     ├─ MusicBrainz worker threads ──> UiEvent::MbSearch / UiEvent::MbRelease
+     ├─ MusicBrainz worker threads ──> UiEvent::MbGroups /
+     │                                  UiEvent::MbGroupReleases / UiEvent::MbRelease
      ├─ update worker ───────────────> UiEvent::UpdateStarted / UiEvent::UpdateDone
      └─ SessionHandle ──> session thread (owns soulseek-rs Client)
            ├─ search worker ─────────> SessionCommand::SearchDone
@@ -98,6 +99,8 @@ Important patterns:
 - `UiEvent` includes a `generation`; ignore stale results when the generation no longer matches.
 - `App::run` drains events, renders, polls keys, then ticks. Don't do blocking work here.
 - MusicBrainz search/release requests are spawned as named threads.
+- Search uses `SearchStage`: **Groups** (albums/EPs/singles), **Chosen** (recommended release with Continue / Choose another), then **Releases** (every pressing in the chosen group). Keep both async stages guarded by `generation` and the selected group MBID.
+- First-run credentials are not saved until `session::verify_login` and `acoustid::validate_api_key` succeed. The check runs in a `credential-check` worker and reports through `UiEvent::SetupCheck`; use `setup_generation` for stale results. An empty AcoustID key requires the `SetupWithoutAcoustId` confirmation.
 - `pending_start` holds a download request while waiting for Soulseek login.
 - `cfg` is the runtime config (includes CLI overrides); `persisted_cfg` is what Settings edits and saves. Do not accidentally persist runtime-only CLI overrides.
 - Settings are edited through `SettingsForm`; saving validates and calls `config::save`, then may respawn the session if credentials/listener settings changed. Settings are grouped into **Account**, **Library**, **Downloading**, and **Advanced** tabs; `SettingKey::tab` decides placement.
@@ -117,6 +120,8 @@ All Ratatui rendering lives here. `ui::render` dispatches by `app.screen`.
 
 The background album engine. This is the most state-heavy file.
 
+`verify_login` checks a username/password by connecting without a listener, then disconnecting; keep it off the UI thread. The normal session still owns its listener and client lifecycle.
+
 Main flow:
 
 1. `start_album` checks existing files, starts cover lookup, and runs one pooled Soulseek search for the whole album.
@@ -134,9 +139,8 @@ Album phases: `Searching`, `Downloading`, `Complete`.
 
 ### `musicbrainz.rs`
 
-- `search_releases` builds a Lucene query, fetches candidates, and ranks them.
-- **`ReleaseCandidate.score` is a penalty: lower is better.** The list sorts ascending. Tests assert a standard album scores lower than a deluxe edition.
-- `rank_candidates` infers the original release date/country from the earliest official release with a country, then adds `FOREIGN_COUNTRY_PENALTY` to other pressings and a capped `LATER_RELEASE_PENALTY_PER_YEAR` to later reissues. Both are deliberately smaller than the edition/status penalties, so they break pressing ties without promoting deluxe or bootleg releases. Dates with missing month/day are compared as end-of-period, so a bare `1979` does not beat `1979-11-30`.
+- `search_release_groups` builds a `releasegroup:` Lucene query and returns albums, EPs, live albums, live EPs, singles and other release groups. `ReleaseGroupCandidate.score` is a penalty: lower is better, with exact title/artist matches first and studio albums ahead of EPs/singles.
+- `get_group_releases` browses `/release?release-group=<mbid>` and converts the pressings into `ReleaseCandidate`s. `rank_group_releases` puts official remastered pressings first, then applies the normal edition/format/status scoring. Bootleg remasters are not preferred.
 - `get_release` requests `recordings+artist-credits+release-groups`, skips video media, numbers audio discs, and captures track/recording MBIDs and per-track artist credits.
 - `ReleaseInfo.primary_type` comes from the release group. `is_single()` makes `TracksView::build` save singles as loose files in the artist folder instead of creating an album folder.
 - `fetch_cover` order:
@@ -146,7 +150,7 @@ Album phases: `Searching`, `Downloading`, `Complete`.
 - iTunes matching uses `matcher::normalize_text` and `matcher::strip_release_noise`. Changes to those functions affect cover matching too.
 - iTunes artwork URLs are upgraded from `100x100bb` to `600x600bb`.
 - iTunes collection names append storefront types such as `Ep II - EP`; `strip_itunes_suffix` removes ` - EP`, ` - Single`, and ` - Album` before matching. Keep explicit edition markers like `(Live)`, which are meaningful.
-- MusicBrainz requests are throttled to roughly one per 1.1 s with a proper User-Agent and retries. Keep it that way.
+- MusicBrainz requests are throttled to roughly one per 1.1 s with a proper User-Agent. Transient failures get three retries (four attempts total) before surfacing an error. Keep it that way.
 
 ### `matcher.rs`
 
@@ -166,6 +170,7 @@ Turns Soulseek search hits into ranked per-track candidates.
 
 - Duration checking always runs, even without an AcoustID key.
 - Fingerprint verification is best-effort: missing key, timeout, or AcoustID outage falls back to accepting on duration.
+- `validate_api_key` checks a key with a deliberately invalid fingerprint. AcoustID validates the client first, so code 3 means the key is good and code 4 means it is invalid; do not replace this with audio generation just to check a key.
 - A top-cluster recording from the selected release group is accepted even when its recording MBID differs; reissues and early CD pressings often use alternate edits of the same track.
 - A clear top-cluster mismatch rejects the file.
 - MP3 320 mode also rejects a lossy source whose actual bitrate is below 300 kbps.
@@ -217,7 +222,7 @@ Turns Soulseek search hits into ranked per-track candidates.
 - All other flags are runtime-only overrides; they do not change stored settings.
 - `--setup` forces the first-run credential screen.
 - `--force` redownloads existing tracks, which is also required to retag already-valid files.
-- `--yes` auto-picks the recommended release and starts downloading; it requires artist and album.
+- `--yes` auto-picks the recommended album, release and starts downloading; it requires artist and album.
 
 ## Critical Soulseek/library invariants
 
