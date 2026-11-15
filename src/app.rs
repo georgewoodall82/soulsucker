@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::DefaultTerminal;
 
-use crate::acoustid;
 use crate::cli::Args;
 use crate::config::{self, AudioQuality, Config};
 use crate::input::TextInput;
@@ -1193,7 +1192,6 @@ pub struct App {
     pub generation: u64,
     pub job_counter: u64,
     pub started: Instant,
-    pub fpcalc_available: bool,
     pub config_path_label: String,
     pub session_generation: u64,
     pub update_state: UpdateState,
@@ -1248,7 +1246,6 @@ impl App {
             generation: 0,
             job_counter: 0,
             started: Instant::now(),
-            fpcalc_available: acoustid::fpcalc_path().is_some(),
             config_path_label,
             session_generation: 0,
             update_state: UpdateState::Idle,
@@ -1265,16 +1262,18 @@ impl App {
             LogLevel::Info,
             format!("Config: {}", app.cfg_path.display()),
         );
-        if app.fpcalc_available {
-            app.push_log(
-                LogLevel::Info,
-                "fpcalc found — fingerprint verification available.",
-            );
-        } else {
-            app.push_log(
-                LogLevel::Warn,
-                "fpcalc not found — tracks will be checked by duration only (install chromaprint-tools for AcoustID).",
-            );
+        if app.effective_fingerprint() {
+            if app.cfg.acoustid_key.trim().is_empty() {
+                app.push_log(
+                    LogLevel::Warn,
+                    "AcoustID key not set — tracks will be checked by duration only.",
+                );
+            } else {
+                app.push_log(
+                    LogLevel::Info,
+                    "Chromaprint fingerprint verification ready.",
+                );
+            }
         }
 
         if !setup_needed {
@@ -1628,8 +1627,6 @@ impl App {
             ("off", true)
         } else if self.cfg.acoustid_key.trim().is_empty() {
             ("on, but no AcoustID key — duration only", false)
-        } else if !self.fpcalc_available {
-            ("on, but fpcalc missing — duration only", false)
         } else {
             ("on — Chromaprint + AcoustID", true)
         }

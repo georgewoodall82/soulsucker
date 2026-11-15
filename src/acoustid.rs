@@ -1,24 +1,44 @@
 //! Chromaprint + AcoustID verification.
 //!
-//! A duration check is always possible. Fingerprint verification is optional:
-//! it needs `fpcalc` (chromaprint-tools) and a free AcoustID API key.
+//! Fingerprinting is built in: FFmpeg decodes the finished track and the
+//! bundled Chromaprint port produces the fingerprint. The duration check is
+//! always possible; AcoustID matching additionally needs a free API key.
 
 use std::collections::HashMap;
-use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::path::Path;
+use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use chromaprint::{Algorithm, Fingerprinter};
+use ffmpeg::format::Sample;
+use ffmpeg::{codec, format, frame, media, software};
+use ffmpeg_next as ffmpeg;
 use serde::Deserialize;
 
 use crate::audio;
 use crate::util::form_encode;
 
+/// `fpcalc` fingerprints the first two minutes by default; AcoustID expects
+/// fingerprints of that length.
+const FINGERPRINT_SECS: u64 = 120;
+/// Abandon a pathological decode instead of blocking verification forever.
+const FINGERPRINT_TIMEOUT: Duration = Duration::from_secs(60);
+
 const LOOKUP_URL: &str = "https://api.acoustid.org/v2/lookup";
 const TRACK_LIST_URL: &str = "https://api.acoustid.org/v2/track/list_by_mbid";
 const USER_AGENT: &str = concat!("soulsucker/", env!("CARGO_PKG_VERSION"));
+
+static FFMPEG_START: std::sync::Once = std::sync::Once::new();
+
+fn init() {
+    FFMPEG_START.call_once(|| {
+        let _ = ffmpeg::init();
+        // The TUI owns the terminal; FFmpeg must not write diagnostics to it.
+        ffmpeg::util::log::set_level(ffmpeg::util::log::Level::Quiet);
+    });
+}
 
 #[derive(Clone)]
 pub struct VerifySpec {
@@ -134,127 +154,197 @@ fn http() -> ureq::Agent {
     ureq::Agent::new_with_config(config)
 }
 
-/// Locate `fpcalc` on PATH.
-pub fn fpcalc_path() -> Option<PathBuf> {
-    let exe = if cfg!(windows) {
-        "fpcalc.exe"
-    } else {
-        "fpcalc"
-    };
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(exe))
-        .find(|candidate| candidate.is_file())
-}
-
+#[derive(Debug)]
 enum FingerprintFailure {
     Timeout,
     Other(String),
 }
 
-fn compute_fingerprint(path: &Path) -> std::result::Result<(f64, String), FingerprintFailure> {
-    let Some(binary) = fpcalc_path() else {
-        return Err(FingerprintFailure::Other(
-            "fpcalc was not found on PATH".to_string(),
-        ));
-    };
-    run_fpcalc(&binary, path)
+/// Fingerprint the first two minutes on a worker thread so a decode that
+/// wedges cannot block verification forever. A timed-out worker is abandoned
+/// and the file is accepted on duration alone.
+fn compute_fingerprint(path: &Path) -> std::result::Result<String, FingerprintFailure> {
+    let path = path.to_path_buf();
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("chromaprint".to_string())
+        .spawn(move || {
+            let _ = tx.send(fingerprint_file(&path));
+        })
+        .map_err(|err| FingerprintFailure::Other(format!("could not start Chromaprint: {err}")))?;
+    match rx.recv_timeout(FINGERPRINT_TIMEOUT) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(FingerprintFailure::Timeout),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(FingerprintFailure::Other(
+            "the Chromaprint worker stopped unexpectedly".to_string(),
+        )),
+    }
 }
 
-fn run_fpcalc(
-    binary: &Path,
-    path: &Path,
-) -> std::result::Result<(f64, String), FingerprintFailure> {
-    let mut child = Command::new(binary)
-        .arg("-json")
-        .arg(path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+fn fingerprint_file(path: &Path) -> std::result::Result<String, FingerprintFailure> {
+    init();
+    let mut ictx = format::input(path).map_err(|err| {
+        FingerprintFailure::Other(format!("could not open {}: {err}", path.display()))
+    })?;
+    let stream = ictx.streams().best(media::Type::Audio).ok_or_else(|| {
+        FingerprintFailure::Other(format!("{} has no audio stream", path.display()))
+    })?;
+    let stream_index = stream.index();
+    let mut decoder = codec::context::Context::from_parameters(stream.parameters())
+        .and_then(|context| context.decoder().audio())
         .map_err(|err| {
-            FingerprintFailure::Other(format!("could not run fpcalc on {}: {err}", path.display()))
+            FingerprintFailure::Other(format!("could not open the audio decoder: {err}"))
         })?;
-    let mut stdout_pipe = match child.stdout.take() {
-        Some(pipe) => pipe,
-        None => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(FingerprintFailure::Other(
-                "fpcalc produced no output stream".to_string(),
-            ));
-        }
-    };
-    let mut stderr_pipe = match child.stderr.take() {
-        Some(pipe) => pipe,
-        None => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(FingerprintFailure::Other(
-                "fpcalc produced no error stream".to_string(),
-            ));
-        }
-    };
-    // Drain the pipes on their own threads so a large fingerprint cannot
-    // block the child while we wait for it to exit.
-    let stdout_reader = std::thread::spawn(move || {
-        let mut buffer = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut buffer);
-        buffer
-    });
-    let stderr_reader = std::thread::spawn(move || {
-        let mut buffer = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buffer);
-        buffer
-    });
+    decoder.set_parameters(stream.parameters()).map_err(|err| {
+        FingerprintFailure::Other(format!("could not configure the audio decoder: {err}"))
+    })?;
 
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(FingerprintFailure::Timeout);
+    let mut sink: Option<FingerprintSink> = None;
+    let mut decoded = frame::Audio::empty();
+    'audio: for (stream, packet) in ictx.packets() {
+        if stream.index() != stream_index {
+            continue;
+        }
+        decoder.send_packet(&packet).map_err(|err| {
+            FingerprintFailure::Other(format!("could not decode the audio: {err}"))
+        })?;
+        while decoder.receive_frame(&mut decoded).is_ok() {
+            // PCM streams often report an unspecified layout. Give the frame
+            // the default layout for its channel count so the converter sees
+            // the same layout it was configured with.
+            if decoded.channel_layout().is_empty() {
+                let channels = decoded.channels();
+                if channels > 0 {
+                    decoded.set_channel_layout(ffmpeg::ChannelLayout::default(i32::from(channels)));
+                }
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(err) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(FingerprintFailure::Other(format!(
-                    "could not wait for fpcalc: {err}"
-                )));
+            let sink = match sink.as_mut() {
+                Some(sink) => sink,
+                None => sink.insert(FingerprintSink::new(
+                    decoded.rate(),
+                    decoded.channel_layout(),
+                    decoded.format(),
+                )?),
+            };
+            if sink.push(&decoded)? {
+                break 'audio;
             }
         }
-    };
-    let stdout = stdout_reader.join().unwrap_or_default();
-    let stderr = stderr_reader.join().unwrap_or_default();
-    if !status.success() {
-        let stderr = String::from_utf8_lossy(&stderr);
-        return Err(FingerprintFailure::Other(format!(
-            "fpcalc failed: {}",
-            stderr.trim().chars().take(200).collect::<String>()
-        )));
     }
-    let data: serde_json::Value = serde_json::from_slice(&stdout)
-        .map_err(|err| FingerprintFailure::Other(format!("fpcalc returned invalid JSON: {err}")))?;
-    let duration = data
-        .get("duration")
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or(0.0);
-    let fingerprint = data
-        .get("fingerprint")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| FingerprintFailure::Other("fpcalc returned no fingerprint".to_string()))?;
-    if fingerprint.is_empty() {
-        return Err(FingerprintFailure::Other(
-            "fpcalc returned an empty fingerprint".to_string(),
-        ));
+    let sink = sink.ok_or_else(|| {
+        FingerprintFailure::Other("the audio stream decoded no samples".to_string())
+    })?;
+    sink.finish()
+}
+
+/// Streams decoded PCM into Chromaprint, stopping once the fingerprint has
+/// all the audio it needs.
+struct FingerprintSink {
+    converter: software::resampling::Context,
+    fingerprinter: Fingerprinter,
+    converted: frame::Audio,
+    channels: usize,
+    limit: u64,
+    fed: u64,
+}
+
+impl FingerprintSink {
+    fn new(
+        rate: u32,
+        layout: ffmpeg::ChannelLayout,
+        format: Sample,
+    ) -> std::result::Result<Self, FingerprintFailure> {
+        if rate == 0 || layout.channels() == 0 || format == Sample::None {
+            return Err(FingerprintFailure::Other(
+                "the audio stream has no usable sample format".to_string(),
+            ));
+        }
+        let converter = software::resampling::Context::get(
+            format,
+            layout,
+            rate,
+            Sample::I16(ffmpeg::format::sample::Type::Packed),
+            layout,
+            rate,
+        )
+        .map_err(|err| {
+            FingerprintFailure::Other(format!("could not open the audio converter: {err}"))
+        })?;
+        let mut fingerprinter = Fingerprinter::new(Algorithm::default());
+        fingerprinter
+            .start(rate, layout.channels() as u16)
+            .map_err(|err| {
+                FingerprintFailure::Other(format!("could not start Chromaprint: {err}"))
+            })?;
+        Ok(Self {
+            converter,
+            fingerprinter,
+            converted: frame::Audio::empty(),
+            channels: layout.channels() as usize,
+            limit: FINGERPRINT_SECS * u64::from(rate),
+            fed: 0,
+        })
     }
-    Ok((duration, fingerprint.to_string()))
+
+    fn is_full(&self) -> bool {
+        self.fed >= self.limit
+    }
+
+    fn push(&mut self, input: &frame::Audio) -> std::result::Result<bool, FingerprintFailure> {
+        if self.is_full() {
+            return Ok(true);
+        }
+        // Each decoder frame can have a different size (MP3 trims its first
+        // frame), so let the converter allocate an output frame that fits it.
+        self.converted = frame::Audio::empty();
+        self.converter
+            .run(input, &mut self.converted)
+            .map_err(|err| {
+                FingerprintFailure::Other(format!("could not convert the audio: {err}"))
+            })?;
+        self.feed()
+    }
+
+    fn feed(&mut self) -> std::result::Result<bool, FingerprintFailure> {
+        let samples = self.converted.samples();
+        if samples == 0 {
+            return Ok(self.is_full());
+        }
+        let remaining = self.limit.saturating_sub(self.fed);
+        let data = self.converted.data(0);
+        let values = (samples as u64 * self.channels as u64)
+            .min(data.len() as u64 / 2)
+            .min(remaining * self.channels as u64) as usize;
+        let values = values - values % self.channels;
+        if values > 0 {
+            // The converter writes packed i16 samples into plane 0.
+            let pcm = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<i16>(), values) };
+            self.fingerprinter.feed(pcm).map_err(|err| {
+                FingerprintFailure::Other(format!("Chromaprint rejected the audio: {err}"))
+            })?;
+            self.fed += (values / self.channels) as u64;
+        }
+        Ok(self.is_full())
+    }
+
+    fn finish(mut self) -> std::result::Result<String, FingerprintFailure> {
+        // Same-rate conversion has no resampling delay, but flush any buffered
+        // tail so the last samples still reach the fingerprint.
+        self.converter.flush(&mut self.converted).map_err(|err| {
+            FingerprintFailure::Other(format!("could not flush the audio converter: {err}"))
+        })?;
+        self.feed()?;
+        self.fingerprinter.finish().map_err(|err| {
+            FingerprintFailure::Other(format!("could not finish Chromaprint: {err}"))
+        })?;
+        let raw = self.fingerprinter.fingerprint();
+        if raw.is_empty() {
+            return Err(FingerprintFailure::Other(
+                "Chromaprint produced an empty fingerprint".to_string(),
+            ));
+        }
+        Ok(self.fingerprinter.encode())
+    }
 }
 
 fn acoustid_lookup(
@@ -487,13 +577,10 @@ pub fn verify_file(path: &Path, spec: &VerifySpec, on_phase: &dyn Fn(&str)) -> V
     if spec.api_key.trim().is_empty() {
         return VerifyResult::accept(format!("duration {duration_note} · fingerprint off"));
     }
-    if fpcalc_path().is_none() {
-        return VerifyResult::accept(format!("duration {duration_note} · fpcalc not installed"));
-    }
 
     on_phase("computing Chromaprint fingerprint…");
-    let (fp_duration, fingerprint) = match compute_fingerprint(path) {
-        Ok(result) => result,
+    let fingerprint = match compute_fingerprint(path) {
+        Ok(fingerprint) => fingerprint,
         Err(FingerprintFailure::Timeout) => {
             return VerifyResult::accept(format!(
                 "duration {duration_note} · fingerprint timed out — kept on duration"
@@ -506,21 +593,8 @@ pub fn verify_file(path: &Path, spec: &VerifySpec, on_phase: &dyn Fn(&str)) -> V
         }
     };
 
-    if let Some(expected) = spec.expected_secs
-        && fp_duration > 0.0
-        && spec.tolerance_secs > 0.0
-        && (fp_duration - expected).abs() > spec.tolerance_secs + 1.0
-    {
-        return VerifyResult::reject(format!(
-            "decoded length {} vs expected {} (±{:.0}s)",
-            crate::util::fmt_duration(fp_duration),
-            crate::util::fmt_duration(expected),
-            spec.tolerance_secs
-        ));
-    }
-
     on_phase("querying AcoustID…");
-    let clusters = match acoustid_lookup(&fingerprint, fp_duration, &spec.api_key) {
+    let clusters = match acoustid_lookup(&fingerprint, duration, &spec.api_key) {
         Ok(clusters) => clusters,
         Err(err) => {
             return VerifyResult::accept(format!(
@@ -693,5 +767,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(data.results[0].recordings[0].releasegroups[0].id, "group");
+    }
+
+    fn write_test_wav(path: &Path, seconds: u32) {
+        let rate = 44_100u32;
+        let channels = 2u16;
+        let frames = rate * seconds;
+        let data_len = frames * u32::from(channels) * 2;
+        let mut bytes = Vec::with_capacity(44 + data_len as usize);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&channels.to_le_bytes());
+        bytes.extend_from_slice(&rate.to_le_bytes());
+        bytes.extend_from_slice(&(rate * u32::from(channels) * 2).to_le_bytes());
+        bytes.extend_from_slice(&(channels * 2).to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        for frame in 0..frames {
+            let t = frame as f32 / rate as f32;
+            let sample =
+                ((t * 440.0 * std::f32::consts::TAU).sin() * 0.25 * i16::MAX as f32) as i16;
+            for _ in 0..channels {
+                bytes.extend_from_slice(&sample.to_le_bytes());
+            }
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn a_tone_is_fingerprinted_in_process() {
+        let dir =
+            std::env::temp_dir().join(format!("soulsucker-chromaprint-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tone.wav");
+        write_test_wav(&path, 3);
+
+        let fingerprint = compute_fingerprint(&path).unwrap();
+        assert!(!fingerprint.is_empty());
+        // Decoding and fingerprinting the same PCM must be deterministic.
+        assert_eq!(compute_fingerprint(&path).unwrap(), fingerprint);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

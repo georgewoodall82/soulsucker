@@ -44,7 +44,8 @@ duration/fingerprint verification, and automatic retries:
 - **Resilient transfers.** Per-attempt staging folders, queue/stall
   watchdogs, next-source fallback, and last-resort passes with more patience.
 - **Actual verification.** Finished files are checked against the
-  MusicBrainz duration, and optionally against Chromaprint/AcoustID.
+  MusicBrainz duration, and optionally against a built-in Chromaprint
+  fingerprint via AcoustID.
 - **Clean output.** Metadata is overwritten from the chosen MusicBrainz
   release — canonical album/artist/title/date, track/disc numbers, MusicBrainz
   IDs, and cover art from the iTunes Search API (with the Cover Art Archive as
@@ -74,10 +75,9 @@ duration/fingerprint verification, and automatic retries:
   binaries link FFmpeg and the bundled LAME MP3 encoder statically and need no
   runtime libraries.
 - A terminal at least **60×20** cells (the TUI asks for this if it is too small).
-- Optional: [`fpcalc`](https://acoustid.org/chromaprint) from
-  `chromaprint-tools` for audio fingerprinting.
 - Optional: a free AcoustID API key from <https://acoustid.org/api> for
-  fingerprint verification. Without it, duration checks still run.
+  fingerprint verification. Fingerprinting is built in; without a key,
+  duration checks still run.
 
 On Fedora:
 
@@ -89,7 +89,7 @@ On Debian/Ubuntu:
 
 ```bash
 sudo apt install ffmpeg libavcodec-dev libavformat-dev libavfilter-dev \
-  libavutil-dev libswresample-dev chromaprint-tools
+  libavutil-dev libswresample-dev
 ```
 
 ## Build / install
@@ -192,8 +192,8 @@ soulsucker --no-fingerprint
 6. Tracks download in parallel. Each attempt gets its own hidden staging
    folder inside the destination folder, so partial files can never be mistaken
    for finished ones.
-7. When a transfer completes, its duration is checked. With an AcoustID key
-   and `fpcalc`, the Chromaprint fingerprint is also checked: the expected
+7. When a transfer completes, its duration is checked. With an AcoustID key,
+   the built-in Chromaprint fingerprint is also checked: the expected
    MusicBrainz recording must appear in AcoustID's **top-scoring cluster**.
    MP3 sources are also checked for a genuine 320 kbps bitrate.
 8. A wrong version, a stall, a queue timeout or a rejected transfer moves on
@@ -399,8 +399,9 @@ contain peer-supplied text, so treat them as untrusted.
   **Audio quality** to FLAC, or search again later.
 - **A track keeps failing.** Open the activity log (`Tab`) to see whether it
   was a queue timeout, a stall, a duration mismatch or an AcoustID mismatch.
-- **Fingerprinting does not run.** Install `fpcalc` and/or add an AcoustID
-  key. Without them, duration checks still reject wrong-length versions.
+- **Fingerprinting does not run.** Add an AcoustID key in Settings.
+  Chromaprint is built into the binary; without a key, duration checks still
+  reject wrong-length versions.
 - **Stale partial files.** They live in the destination folder's hidden
   `.soulsucker-staging` directory and are cleaned up at the start of the next
   download for that release. Quitting also tries to remove them.

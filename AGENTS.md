@@ -24,7 +24,7 @@ cargo build --release --features ffmpeg-static
 
 - Rust **1.91+**, edition **2024**.
 - FFmpeg **8.x** development libraries are required (`ffmpeg-devel` on Fedora, `libavcodec-dev libavformat-dev libavfilter-dev libavutil-dev libswresample-dev` on Debian/Ubuntu). `ffmpeg-next` links the system libraries.
-- The test suite is fast and offline. Keep it that way; do not add tests that hit MusicBrainz, iTunes, AcoustID, or Soulseek. Do not add tests that require FFmpeg to process a real file; cover parsing and pure helpers instead.
+- The test suite is fast and offline. Keep it that way; do not add tests that hit MusicBrainz, iTunes, AcoustID, or Soulseek. Keep any real-file FFmpeg work to tiny generated inputs (the Chromaprint test writes a 3 s WAV); cover parsing and pure helpers for everything else.
 - The release binary is `target/release/soulsucker`.
 - `cargo run --release` starts the TUI and needs a real terminal. Do not run the interactive TUI in a non-interactive shell; use `--help`, unit tests, and clippy for validation.
 - For manual testing without touching the user's real config/credentials, pass `--config /tmp/opencode/soulsucker-test.toml` (or set `SOULSUCKER_CONFIG`).
@@ -43,7 +43,7 @@ cargo build --release --features ffmpeg-static
 │   ├── session.rs       Soulseek session thread, album download engine, retries
 │   ├── musicbrainz.rs   release search/ranking, release details, cover lookup
 │   ├── matcher.rs       local fuzzy matching and source selection
-│   ├── acoustid.rs      fpcalc + AcoustID verification
+│   ├── acoustid.rs      built-in Chromaprint + AcoustID verification
 │   ├── normalize.rs     two-pass EBU R128 normalization + FLAC/MP3 output
 │   ├── audio.rs         FLAC/MP3 inspection, metadata tagging, cover embedding
 │   ├── config.rs        TOML config, normalization, secure atomic saves
@@ -164,12 +164,12 @@ Turns Soulseek search hits into ranked per-track candidates.
 
 ### `acoustid.rs`
 
-- Duration checking always runs, even without an AcoustID key or `fpcalc`.
-- Fingerprint verification is best-effort: missing key, missing `fpcalc`, timeout, or AcoustID outage falls back to accepting on duration.
+- Duration checking always runs, even without an AcoustID key.
+- Fingerprint verification is best-effort: missing key, timeout, or AcoustID outage falls back to accepting on duration.
 - A top-cluster recording from the selected release group is accepted even when its recording MBID differs; reissues and early CD pressings often use alternate edits of the same track.
 - A clear top-cluster mismatch rejects the file.
 - MP3 320 mode also rejects a lossy source whose actual bitrate is below 300 kbps.
-- `fpcalc` is run with a timeout and killed if it hangs.
+- Fingerprinting is in-process: FFmpeg decodes the first 120 s to interleaved i16 PCM and the bundled `chromaprint-next` port produces the fingerprint. It runs on a worker with a 60 s timeout; a hung decode is abandoned and verification falls back to duration.
 - AcoustID requests are throttled and cached where appropriate.
 
 ### `audio.rs`
@@ -261,7 +261,7 @@ When adding or changing a setting:
 ## Testing notes
 
 - Run `cargo test`; currently all tests are unit tests and run offline.
-- Audio tests use `tests/fixtures/silence.flac` and `tests/fixtures/silence.mp3`; they write real files, rewrite tags/cover, and read them back. Keep tests offline and avoid requiring FFmpeg to process a real file.
+- Audio tests use `tests/fixtures/silence.flac` and `tests/fixtures/silence.mp3`; they write real files, rewrite tags/cover, and read them back. Keep tests offline and do not add long FFmpeg encodes; the fingerprint test uses a generated 3 s WAV.
 - Include regression tests for state-machine bugs. Existing examples cover stale search results, stale verification results, promotion rollback, token changes, and cover replacement.
 - If you need a live API check, do it manually (e.g. a temporary ignored test) and remove it before finishing. Do not leave network-dependent tests enabled.
 - Before finishing: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, and usually `cargo build --release`.
