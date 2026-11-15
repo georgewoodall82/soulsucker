@@ -73,13 +73,13 @@ jobs:
       - name: Build (Windows)
         if: runner.os == 'Windows'
         shell: msys2 {0}
+        env:
+          # ffmpeg-sys-next otherwise passes GCC-style -march/-mtune to MSVC.
+          FFMPEG_MARCH: ""
+          FFMPEG_MTUNE: ""
         run: |
           # MSYS2 ships a coreutils `link` that shadows MSVC's linker.
           rm -f /usr/bin/link.exe
-          echo "cl: $(which cl.exe || true)"
-          echo "link: $(which link.exe || true)"
-          echo "INCLUDE=$INCLUDE"
-          echo "LIB=$LIB"
           cargo build --release --locked --target ${{ matrix.target }} --features ffmpeg-static
 
       - name: Dump FFmpeg configure log (Windows)
