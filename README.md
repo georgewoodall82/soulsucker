@@ -265,18 +265,21 @@ is in flight; `Esc` cancels the request so you can open it.
 
 | Key | Action |
 | --- | --- |
-| `↑` `↓` `Home` `End` | Select a field |
+| `←` `→` / `Tab` | Switch tabs |
+| `↑` `↓` `Home` `End` | Select a field in the current tab |
 | `Enter` | Edit / toggle / cycle / run action |
 | `Ctrl+S` | Save and return |
 | `Esc` | Discard and return |
 
-Settings covers credentials, the AcoustID key, fingerprint on/off, music
-folder, audio quality (FLAC or MP3 320), parallel downloads, search/queue/stall
-timeouts, length tolerance, AcoustID score, last-resort passes and patience,
-sources per track, listener port (0 = automatic), MusicBrainz result count,
-disc-prefixed track numbers and album-artist track tags for players that ignore
-disc tags or group by track artist (Tesla and similar car stereos), two-pass
-loudness normalization, and checking for updates.
+Settings is split into four tabs:
+
+- **Account** — Soulseek credentials, AcoustID key, fingerprint checking and
+  score.
+- **Library** — music folder, FLAC/MP3 320 output, Tesla-friendly tags and
+  loudness normalization.
+- **Downloading** — parallel downloads, search/queue/stall timeouts, length
+  tolerance, retry passes and sources per track.
+- **Advanced** — listener port, MusicBrainz result count and the update check.
 
 **Check for updates** compares the running version with the latest public
 GitHub release. If a newer release exists, it downloads the matching raw

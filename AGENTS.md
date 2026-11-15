@@ -100,7 +100,7 @@ Important patterns:
 - MusicBrainz search/release requests are spawned as named threads.
 - `pending_start` holds a download request while waiting for Soulseek login.
 - `cfg` is the runtime config (includes CLI overrides); `persisted_cfg` is what Settings edits and saves. Do not accidentally persist runtime-only CLI overrides.
-- Settings are edited through `SettingsForm`; saving validates and calls `config::save`, then may respawn the session if credentials/listener settings changed.
+- Settings are edited through `SettingsForm`; saving validates and calls `config::save`, then may respawn the session if credentials/listener settings changed. Settings are grouped into **Account**, **Library**, **Downloading**, and **Advanced** tabs; `SettingKey::tab` decides placement.
 - `DownloadRequest` snapshots download options at start. Changing settings mid-download does not affect the active album.
 
 ### `ui.rs`
@@ -240,7 +240,7 @@ When adding or changing a setting:
 1. Add the field to `Config` in `src/config.rs`.
 2. Update `Config::default`.
 3. Update `Config::normalize` if it is numeric/bounded.
-4. Add it to `SettingsForm::from_config` and `SettingsForm::to_config` in `src/app.rs` with a `SettingKind`.
+4. Add it to `SettingsForm::from_config` and `SettingsForm::to_config` in `src/app.rs` with a `SettingKind` and the appropriate `SettingKey::tab` grouping.
 5. Add a CLI flag in `src/cli.rs` if it should be a runtime override.
 6. If it affects downloads, decide whether it belongs in `DownloadOptions` (snapshotted per album) or is read directly from `Config`.
 7. Update `README.md` (Settings and/or CLI sections).

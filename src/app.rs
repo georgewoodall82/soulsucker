@@ -520,6 +520,39 @@ impl DownloadView {
 // -------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsTab {
+    Account,
+    Library,
+    Downloading,
+    Advanced,
+}
+
+impl SettingsTab {
+    pub const ALL: [Self; 4] = [
+        Self::Account,
+        Self::Library,
+        Self::Downloading,
+        Self::Advanced,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Account => "Account",
+            Self::Library => "Library",
+            Self::Downloading => "Downloading",
+            Self::Advanced => "Advanced",
+        }
+    }
+
+    fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|tab| *tab == self)
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingKey {
     Username,
     Password,
@@ -542,6 +575,32 @@ pub enum SettingKey {
     AlbumArtistTracks,
     NormalizeLoudness,
     CheckUpdates,
+}
+
+impl SettingKey {
+    fn tab(self) -> SettingsTab {
+        match self {
+            Self::Username
+            | Self::Password
+            | Self::AcoustId
+            | Self::Fingerprint
+            | Self::MinScore => SettingsTab::Account,
+            Self::MusicDir
+            | Self::Quality
+            | Self::DiscPrefixTracks
+            | Self::AlbumArtistTracks
+            | Self::NormalizeLoudness => SettingsTab::Library,
+            Self::MaxConcurrent
+            | Self::SearchTimeout
+            | Self::QueueTimeout
+            | Self::StallTimeout
+            | Self::LengthTolerance
+            | Self::LastResortRounds
+            | Self::LastResortStall
+            | Self::Candidates => SettingsTab::Downloading,
+            Self::ListenPort | Self::MbLimit | Self::CheckUpdates => SettingsTab::Advanced,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -575,6 +634,7 @@ impl SettingKind {
 
 pub struct SettingField {
     pub key: SettingKey,
+    pub tab: SettingsTab,
     pub label: &'static str,
     pub hint: &'static str,
     pub value: String,
@@ -588,6 +648,7 @@ pub struct EditState {
 
 pub struct SettingsForm {
     pub fields: Vec<SettingField>,
+    pub tab: SettingsTab,
     pub selected: usize,
     pub list_state: ratatui::widgets::ListState,
     pub editing: Option<EditState>,
@@ -767,6 +828,7 @@ impl SettingsForm {
         list_state.select(Some(0));
         Self {
             fields,
+            tab: SettingsTab::Account,
             selected: 0,
             list_state,
             editing: None,
@@ -778,12 +840,85 @@ impl SettingsForm {
         self.fields.get(self.selected)
     }
 
+    fn visible_indices(&self) -> Vec<usize> {
+        self.fields
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| field.tab == self.tab)
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn selected_row(&self) -> Option<usize> {
+        self.fields
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| field.tab == self.tab)
+            .position(|(index, _)| index == self.selected)
+    }
+
+    fn sync_list_state(&mut self) {
+        let row = self.selected_row();
+        self.list_state.select(row);
+    }
+
+    fn first_on_tab(&self, tab: SettingsTab) -> Option<usize> {
+        self.fields.iter().position(|field| field.tab == tab)
+    }
+
     fn set_selected(&mut self, index: usize) {
         if self.fields.is_empty() {
             return;
         }
-        self.selected = index.min(self.fields.len() - 1);
-        self.list_state.select(Some(self.selected));
+        let index = index.min(self.fields.len() - 1);
+        self.tab = self.fields[index].tab;
+        self.selected = index;
+        self.sync_list_state();
+    }
+
+    fn select_first(&mut self) {
+        if let Some(index) = self.first_on_tab(self.tab) {
+            self.set_selected(index);
+        } else {
+            self.selected = 0;
+            self.list_state.select(None);
+        }
+    }
+
+    fn select_last(&mut self) {
+        if let Some(index) = self.fields.iter().rposition(|field| field.tab == self.tab) {
+            self.set_selected(index);
+        }
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        let indices = self.visible_indices();
+        if indices.is_empty() {
+            return;
+        }
+        let current = indices
+            .iter()
+            .position(|index| *index == self.selected)
+            .unwrap_or(0);
+        let last = indices.len().saturating_sub(1) as isize;
+        let next = (current as isize + delta).clamp(0, last) as usize;
+        self.set_selected(indices[next]);
+    }
+
+    pub fn switch_tab(&mut self, delta: isize) {
+        let current = self.tab.index() as isize;
+        let next = (current + delta).rem_euclid(SettingsTab::ALL.len() as isize) as usize;
+        self.tab = SettingsTab::ALL[next];
+        self.select_first();
+    }
+
+    fn next_on_tab(&self, index: usize) -> Option<usize> {
+        self.fields
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| field.tab == self.tab)
+            .map(|(index, _)| index)
+            .find(|candidate| *candidate > index)
     }
 
     fn begin_edit(&mut self) {
@@ -812,7 +947,8 @@ impl SettingsForm {
             Ok(normalized) => {
                 field.value = normalized;
                 self.error = None;
-                self.set_selected((edit.field + 1).min(self.fields.len().saturating_sub(1)));
+                let next = self.next_on_tab(edit.field).unwrap_or(edit.field);
+                self.set_selected(next);
             }
             Err(err) => {
                 self.error = Some(err);
@@ -928,6 +1064,7 @@ fn field(
 ) -> SettingField {
     SettingField {
         key,
+        tab: key.tab(),
         label,
         hint,
         value,
@@ -2443,20 +2580,12 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Up => {
-                let index = self.settings.selected.saturating_sub(1);
-                self.settings.set_selected(index);
-            }
-            KeyCode::Down => {
-                let index = (self.settings.selected + 1).min(self.settings.fields.len() - 1);
-                self.settings.set_selected(index);
-            }
-            KeyCode::Home => self.settings.set_selected(0),
-            KeyCode::End => {
-                if !self.settings.fields.is_empty() {
-                    self.settings.set_selected(self.settings.fields.len() - 1);
-                }
-            }
+            KeyCode::Up => self.settings.move_selection(-1),
+            KeyCode::Down => self.settings.move_selection(1),
+            KeyCode::Home => self.settings.select_first(),
+            KeyCode::End => self.settings.select_last(),
+            KeyCode::Left | KeyCode::BackTab => self.settings.switch_tab(-1),
+            KeyCode::Right | KeyCode::Tab => self.settings.switch_tab(1),
             KeyCode::Enter => {
                 let kind = self.settings.selected_field().map(|field| field.kind);
                 if kind.is_some_and(|kind| kind.is_bool() || kind.is_choice()) {
@@ -2678,6 +2807,47 @@ mod tests {
         assert!(config.normalize_loudness);
         assert_eq!(config.audio_quality, AudioQuality::Mp3);
         assert_eq!(config.username, "user");
+    }
+
+    #[test]
+    fn settings_tabs_group_fields_and_keep_selection_inside_the_tab() {
+        let mut form = SettingsForm::from_config(&configured());
+        assert_eq!(form.tab, SettingsTab::Account);
+        assert_eq!(form.selected_field().unwrap().key, SettingKey::Username);
+        assert_eq!(
+            form.fields
+                .iter()
+                .filter(|field| field.tab == SettingsTab::Account)
+                .count(),
+            5
+        );
+
+        form.switch_tab(1);
+        assert_eq!(form.tab, SettingsTab::Library);
+        assert_eq!(form.selected_field().unwrap().key, SettingKey::MusicDir);
+        form.move_selection(1);
+        assert_eq!(form.selected_field().unwrap().key, SettingKey::Quality);
+        form.select_last();
+        assert_eq!(
+            form.selected_field().unwrap().key,
+            SettingKey::NormalizeLoudness
+        );
+
+        form.switch_tab(1);
+        assert_eq!(form.tab, SettingsTab::Downloading);
+        assert_eq!(
+            form.selected_field().unwrap().key,
+            SettingKey::MaxConcurrent
+        );
+
+        form.switch_tab(-2);
+        assert_eq!(form.tab, SettingsTab::Account);
+        form.select_last();
+        assert_eq!(form.selected_field().unwrap().key, SettingKey::MinScore);
+
+        form.switch_tab(-1);
+        assert_eq!(form.tab, SettingsTab::Advanced);
+        assert_eq!(form.selected_field().unwrap().key, SettingKey::ListenPort);
     }
 
     #[test]

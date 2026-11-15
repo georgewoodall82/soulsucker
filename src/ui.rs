@@ -7,6 +7,7 @@ use ratatui::widgets::{
 
 use crate::app::{
     App, ConnState, DownloadFocus, DownloadPhase, SearchFocus, SearchPhase, SettingKind,
+    SettingsTab,
 };
 use crate::input::TextInput;
 use crate::session::{LogLevel, TrackStatus};
@@ -209,10 +210,10 @@ fn footer_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     }
     if app.screen == crate::app::Screen::Settings {
         return vec![
-            ("↑↓", "select"),
-            ("Enter", "edit/toggle/cycle"),
-            ("Ctrl+S", "save & back"),
-            ("Esc", "discard & back"),
+            ("←→", "tabs"),
+            ("Enter", "edit"),
+            ("Ctrl+S", "save"),
+            ("Esc", "back"),
         ];
     }
     match app.screen {
@@ -1195,7 +1196,8 @@ fn status_icon(status: TrackStatus, spinner: &'static str) -> (&'static str, Col
 // -------------------------------------------------------------------------
 
 fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
-    let [hint_area, list_area, error_area] = Layout::vertical([
+    let [hint_area, tabs_area, list_area, error_area] = Layout::vertical([
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(4),
         Constraint::Length(1),
@@ -1215,15 +1217,40 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
         hint_area,
     );
 
-    let block = panel("Settings", true);
+    let mut tabs = Vec::with_capacity(SettingsTab::ALL.len() * 2);
+    for (index, tab) in SettingsTab::ALL.iter().enumerate() {
+        if index > 0 {
+            tabs.push(Span::styled("  ", Style::default().fg(BORDER)));
+        }
+        let selected = app.settings.tab == *tab;
+        let style = if selected {
+            Style::default().fg(BG).bg(ACCENT).bold()
+        } else {
+            Style::default().fg(MUTED).bg(PANEL_ALT)
+        };
+        tabs.push(Span::styled(format!(" {} ", tab.label()), style));
+    }
+    frame.render_widget(Paragraph::new(Line::from(tabs)), tabs_area);
+
+    let block = panel(&format!("Settings · {}", app.settings.tab.label()), true);
     let inner = block.inner(list_area);
     frame.render_widget(block, list_area);
     let width = inner.width as usize;
+    let tab = app.settings.tab;
     let selected = app.settings.selected;
     let update_label = app.update_state.label();
     let update_level = app.update_state.level();
-    let mut items = Vec::with_capacity(app.settings.fields.len());
+    let visible_count = app
+        .settings
+        .fields
+        .iter()
+        .filter(|field| field.tab == tab)
+        .count();
+    let mut items = Vec::with_capacity(visible_count);
     for (index, field) in app.settings.fields.iter().enumerate() {
+        if field.tab != tab {
+            continue;
+        }
         let is_selected = selected == index;
         let marker = if is_selected { "▌ " } else { "  " };
         let label_width = 22;
@@ -1288,7 +1315,7 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
     } else {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "Enter edits, toggles, cycles or runs an action · Ctrl+S saves · Esc leaves",
+                "←→ tabs · ↑↓ fields · Enter edit · Ctrl+S save · Esc back",
                 Style::default().fg(BORDER),
             ))),
             error_area,
@@ -1441,7 +1468,9 @@ fn render_help(app: &App, frame: &mut Frame, area: Rect) {
         }
         crate::app::Screen::Settings => {
             lines.push(help_section("Settings"));
+            lines.push(help_line("← → / Tab", "switch tabs"));
             lines.push(help_line("↑ ↓", "select a field"));
+            lines.push(help_line("Home / End", "first / last field"));
             lines.push(help_line(
                 "Enter",
                 "edit / toggle / cycle option / check updates",
@@ -1694,8 +1723,21 @@ mod tests {
         app.screen = Screen::Settings;
         let settings_text = render_text(&mut app, 110, 34);
         assert!(settings_text.contains("Settings"));
-        assert!(settings_text.contains("Audio quality"));
-        assert!(settings_text.contains("Parallel downloads"));
+        assert!(settings_text.contains("Account"));
+        assert!(settings_text.contains("Soulseek username"));
+        assert!(settings_text.contains("Library"));
+        assert!(settings_text.contains("Downloading"));
+        assert!(settings_text.contains("Advanced"));
+
+        app.settings.switch_tab(1);
+        let library_text = render_text(&mut app, 110, 34);
+        assert!(library_text.contains("Audio quality"));
+        assert!(!library_text.contains("Parallel downloads"));
+
+        app.settings.switch_tab(1);
+        let download_settings_text = render_text(&mut app, 110, 34);
+        assert!(download_settings_text.contains("Parallel downloads"));
+        assert!(download_settings_text.contains("Search timeout"));
 
         app.help_open = true;
         let help_text = render_text(&mut app, 110, 34);
