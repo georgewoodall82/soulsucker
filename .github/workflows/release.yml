@@ -73,7 +73,10 @@ jobs:
       - name: Build (Windows)
         if: runner.os == 'Windows'
         shell: msys2 {0}
-        run: cargo build --release --locked --target ${{ matrix.target }} --features ffmpeg-static
+        run: |
+          # MSYS2 ships a coreutils `link` that shadows MSVC's linker.
+          rm -f /usr/bin/link.exe
+          cargo build --release --locked --target ${{ matrix.target }} --features ffmpeg-static
 
       - name: Build (Unix)
         if: runner.os != 'Windows'
