@@ -19,6 +19,7 @@ use crate::audio::{self, TrackTags};
 use crate::config::Config;
 use crate::matcher::{self, Candidate, CandidateOptions, RemoteFile, SearchHit, TrackQuery};
 use crate::musicbrainz;
+use crate::normalize;
 use crate::util;
 
 const STAGING_DIR: &str = ".soulsucker-staging";
@@ -111,6 +112,7 @@ pub struct DownloadOptions {
     pub candidates_per_track: usize,
     pub disc_prefix_track_numbers: bool,
     pub album_artist_for_tracks: bool,
+    pub normalize_loudness: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -155,6 +157,7 @@ impl std::fmt::Debug for DownloadOptions {
             .field("candidates_per_track", &self.candidates_per_track)
             .field("disc_prefix_track_numbers", &self.disc_prefix_track_numbers)
             .field("album_artist_for_tracks", &self.album_artist_for_tracks)
+            .field("normalize_loudness", &self.normalize_loudness)
             .finish()
     }
 }
@@ -194,6 +197,7 @@ enum SessionCommand {
         index: usize,
         attempt_no: u32,
         result: VerifyResult,
+        path: PathBuf,
     },
     CoverReady {
         job_id: u64,
@@ -505,7 +509,8 @@ impl Session {
                 index,
                 attempt_no,
                 result,
-            } => self.verified(job_id, index, attempt_no, result),
+                path,
+            } => self.verified(job_id, index, attempt_no, result, path),
             SessionCommand::CoverReady { job_id, result } => {
                 self.cover_ready(job_id, result);
             }
@@ -979,9 +984,10 @@ impl Session {
                     .iter()
                     .enumerate()
                     .filter(|(_, track)| {
-                        track.verifying.as_ref().is_some_and(|verifying| {
-                            now.duration_since(verifying.started) >= VERIFY_DEADLINE
-                        })
+                        track
+                            .verifying
+                            .as_ref()
+                            .is_some_and(|verifying| now >= verifying.deadline)
                     })
                     .map(|(index, _)| index)
                     .collect()
@@ -1259,7 +1265,7 @@ impl Session {
             return;
         };
 
-        let (update, spec, position, title, source) = {
+        let (update, spec, position, title, source, normalize_loudness) = {
             let Some(track) = album.tracks.get_mut(index) else {
                 return;
             };
@@ -1267,11 +1273,15 @@ impl Session {
             track.status = TrackStatus::Verifying;
             track.note = "checking duration…".to_string();
             track.speed = 0.0;
+            let deadline = verification_deadline(
+                Instant::now(),
+                track.meta.expected_secs,
+                album.job.options.normalize_loudness,
+            );
             track.verifying = Some(VerifyingAttempt {
                 attempt_no,
                 staging: active.staging.clone(),
-                path: staged.clone(),
-                started: Instant::now(),
+                deadline,
             });
             let update = track.update(job_id);
             let spec = VerifySpec {
@@ -1288,6 +1298,7 @@ impl Session {
                 track.meta.position,
                 track.meta.title.clone(),
                 track.source.clone(),
+                album.job.options.normalize_loudness,
             )
         };
         let _ = events.send(SlskEvent::Track(update.clone()));
@@ -1314,11 +1325,25 @@ impl Session {
                     accepted: false,
                     note: "verification worker panicked".to_string(),
                 });
+                let mut result_path = path.clone();
+                if result.accepted && normalize_loudness {
+                    on_phase("normalizing loudness (two-pass)…");
+                    match normalize::normalize_file(&path) {
+                        Ok(normalized) => result_path = normalized,
+                        Err(err) => {
+                            let _ = events.send(SlskEvent::Log(
+                                LogLevel::Warn,
+                                format!("{position:02} {title}: loudness not normalized ({err})"),
+                            ));
+                        }
+                    }
+                }
                 let _ = tx.send(SessionCommand::Verified {
                     job_id,
                     index,
                     attempt_no,
                     result,
+                    path: result_path,
                 });
             });
         if spawned.is_err() {
@@ -1331,7 +1356,14 @@ impl Session {
         }
     }
 
-    fn verified(&mut self, job_id: u64, index: usize, attempt_no: u32, result: VerifyResult) {
+    fn verified(
+        &mut self,
+        job_id: u64,
+        index: usize,
+        attempt_no: u32,
+        result: VerifyResult,
+        normalized_path: PathBuf,
+    ) {
         let events = self.events.clone();
         let Some(mut album) = self.album.take() else {
             return;
@@ -1399,7 +1431,7 @@ impl Session {
             return;
         }
 
-        if let Err(err) = promote_file(&verifying.path, &final_path) {
+        if let Err(err) = promote_file(&normalized_path, &final_path) {
             let _ = fs::remove_dir_all(&verifying.staging);
             self.album = Some(album);
             self.fail_attempt(index, &format!("could not save file: {err}"));
@@ -1841,8 +1873,7 @@ struct DownloadActive {
 struct VerifyingAttempt {
     attempt_no: u32,
     staging: PathBuf,
-    path: PathBuf,
-    started: Instant,
+    deadline: Instant,
 }
 
 struct TrackState {
@@ -2126,6 +2157,22 @@ fn tagged_artist<'a>(
     }
 }
 
+/// Verification normally has a fixed deadline. A two-pass normalize can take
+/// much longer than a fingerprint check, so scale the allowance with the
+/// expected track length and cap it at 30 minutes.
+fn verification_deadline(
+    started: Instant,
+    expected_secs: Option<f64>,
+    normalize_loudness: bool,
+) -> Instant {
+    if normalize_loudness {
+        let expected = expected_secs.unwrap_or(300.0).max(0.0);
+        started + VERIFY_DEADLINE + Duration::from_secs_f64((expected * 2.0).min(1800.0))
+    } else {
+        started + VERIFY_DEADLINE
+    }
+}
+
 fn tagged_track_number(disc: u32, position: u32, disc_count: u32, prefix: bool) -> u32 {
     if prefix && disc_count > 1 {
         disc.max(1) * 100 + position
@@ -2163,6 +2210,23 @@ mod tests {
         assert_eq!(tagged_track_number(2, 13, 2, true), 213);
         assert_eq!(tagged_track_number(1, 1, 1, true), 1);
         assert_eq!(tagged_track_number(2, 8, 2, false), 8);
+    }
+
+    #[test]
+    fn normalization_extends_the_verification_deadline() {
+        let start = Instant::now();
+        assert_eq!(
+            verification_deadline(start, Some(300.0), false),
+            start + VERIFY_DEADLINE
+        );
+        assert!(
+            verification_deadline(start, Some(300.0), true)
+                > verification_deadline(start, Some(300.0), false)
+        );
+        assert_eq!(
+            verification_deadline(start, Some(3600.0), true),
+            start + VERIFY_DEADLINE + Duration::from_secs(1800)
+        );
     }
 
     #[test]
@@ -2251,6 +2315,7 @@ mod tests {
                     candidates_per_track: 12,
                     disc_prefix_track_numbers: false,
                     album_artist_for_tracks: false,
+                    normalize_loudness: false,
                 },
                 force: false,
             },
@@ -2342,8 +2407,7 @@ mod tests {
         album.tracks[0].verifying = Some(VerifyingAttempt {
             attempt_no: 2,
             staging: PathBuf::from("/tmp/soulsucker-nonexistent-staging"),
-            path: PathBuf::from("/tmp/soulsucker-nonexistent.flac"),
-            started: Instant::now(),
+            deadline: Instant::now() + Duration::from_secs(60),
         });
         let (events_tx, _events_rx) = mpsc::channel();
         let (cmd_tx, cmd_rx) = mpsc::channel();
@@ -2369,6 +2433,7 @@ mod tests {
                 accepted: true,
                 note: "late result".into(),
             },
+            PathBuf::from("/tmp/soulsucker-late.flac"),
         );
         let verifying = session.album.as_ref().unwrap().tracks[0]
             .verifying

@@ -88,6 +88,27 @@ pub fn write_tags(path: &Path, tags: &TrackTags<'_>) -> Result<()> {
     save(tagged, path)
 }
 
+/// Copy embedded pictures from one FLAC to another.
+///
+/// Normalization re-encodes audio into a fresh file, so this keeps the source
+/// cover until canonical tags (and a better cover, when available) are written.
+pub fn copy_pictures(from: &Path, to: &Path) -> Result<()> {
+    let source = tagged_file(from)?;
+    let Some(source_tag) = source.primary_tag() else {
+        return Ok(());
+    };
+    if source_tag.pictures().is_empty() {
+        return Ok(());
+    }
+    let pictures = source_tag.pictures().to_vec();
+    let mut target = tagged_file(to)?;
+    let tag = editable_tag(&mut target)?;
+    for picture in pictures {
+        tag.push_picture(picture);
+    }
+    save(target, to)
+}
+
 /// Add or replace the front cover on an already tagged file.
 ///
 /// Used when the Cover Art Archive request finishes after a track has already

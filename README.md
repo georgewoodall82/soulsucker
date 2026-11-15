@@ -52,6 +52,9 @@ duration/fingerprint verification, and automatic retries:
   for multi-disc releases). An optional **disc-prefixed track numbers** setting
   writes tags like `101…113` and `201…213` for players that ignore the disc tag
   (Tesla's USB player, for example).
+- **Loudness normalization.** An optional two-pass EBU R128 pass brings each
+  download to -16 LUFS with a -1.5 dBTP true-peak ceiling, so quiet and loud
+  albums sit at a similar level in a car or on a portable player.
 - **Skip or force.** Valid existing tracks are skipped by default; `--force`
   downloads them again. A stray/empty file with the right name is validated and
   replaced rather than trusted.
@@ -63,16 +66,25 @@ duration/fingerprint verification, and automatic retries:
 
 - Rust **1.91+** (edition 2024).
 - A Soulseek account.
+- FFmpeg **8.x** libraries. Building needs the development headers; running
+  needs the shared libraries (usually installed with `ffmpeg`).
 - A terminal at least **60×20** cells (the TUI asks for this if it is too small).
 - Optional: [`fpcalc`](https://acoustid.org/chromaprint) from
   `chromaprint-tools` for audio fingerprinting.
 - Optional: a free AcoustID API key from <https://acoustid.org/api> for
   fingerprint verification. Without it, duration checks still run.
 
+On Fedora:
+
+```bash
+sudo dnf install ffmpeg ffmpeg-devel
+```
+
 On Debian/Ubuntu:
 
 ```bash
-sudo apt install chromaprint-tools
+sudo apt install ffmpeg libavcodec-dev libavformat-dev libavfilter-dev \
+  libavutil-dev libswresample-dev chromaprint-tools
 ```
 
 ## Build / install
@@ -83,6 +95,17 @@ cargo build --release
 # or
 cargo install --path .
 ```
+
+The normal build links the system FFmpeg shared libraries. For a
+self-contained binary that needs no FFmpeg runtime libraries, build FFmpeg
+statically:
+
+```bash
+cargo build --release --features ffmpeg-static
+```
+
+That path needs `git`, `make`, `nasm`, and a C compiler, and takes several
+minutes the first time. Release binaries are built this way.
 
 ## First run
 
@@ -242,7 +265,8 @@ folder, parallel downloads, search/queue/stall timeouts, length tolerance,
 AcoustID score, last-resort passes and patience, sources per track, listener
 port (0 = automatic), MusicBrainz result count, disc-prefixed track numbers
 and album-artist track tags for players that ignore disc tags or group by
-track artist (Tesla and similar car stereos), and checking for updates.
+track artist (Tesla and similar car stereos), two-pass loudness
+normalization, and checking for updates.
 
 **Check for updates** compares the running version with the latest public
 GitHub release. If a newer release exists, it downloads the matching raw
@@ -275,6 +299,7 @@ listen_port = 0
 mb_limit = 25
 disc_prefix_track_numbers = false
 album_artist_for_tracks = false
+normalize_loudness = false
 ```
 
 `listen_port = 0` asks the OS for a free port, which is friendlier than a
@@ -294,6 +319,15 @@ original credit is preserved in `ARTISTS`. Guest and live tracks then stay
 inside the album instead of creating a second artist entry. This also applies
 when tags are written, so enable it and rerun with `--force` to retag an
 existing download.
+
+`normalize_loudness = true` runs a two-pass EBU R128 normalization on each
+downloaded FLAC before it is tagged. The first pass measures the track with
+FFmpeg's `loudnorm` filter; the second pass applies **-16 LUFS** integrated
+loudness, a **-1.5 dBTP** true-peak ceiling, and an **11 LU** loudness range.
+The audio is re-encoded losslessly, and the normalized file replaces the
+original only after the entire encode succeeds. If normalization fails, the
+download is kept and tagged unnormalized. Existing files are skipped unless you
+rerun with `--force`.
 
 ## CLI options
 

@@ -56,6 +56,8 @@ pub struct Config {
     /// group by track artist (Tesla and similar car stereos) keep the album
     /// together. The original track credit is kept in ARTISTS.
     pub album_artist_for_tracks: bool,
+    /// Two-pass EBU R128 normalize downloaded tracks before tagging.
+    pub normalize_loudness: bool,
 
     /// Runtime-only: enable verbose logging from the Soulseek library.
     #[serde(skip)]
@@ -83,6 +85,7 @@ impl Default for Config {
             mb_limit: 25,
             disc_prefix_track_numbers: false,
             album_artist_for_tracks: false,
+            normalize_loudness: false,
             verbose_lib: false,
         }
     }

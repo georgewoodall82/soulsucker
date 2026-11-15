@@ -536,6 +536,7 @@ pub enum SettingKey {
     MbLimit,
     DiscPrefixTracks,
     AlbumArtistTracks,
+    NormalizeLoudness,
     CheckUpdates,
 }
 
@@ -727,6 +728,18 @@ impl SettingsForm {
                 SettingKind::Bool,
             ),
             field(
+                SettingKey::NormalizeLoudness,
+                "Normalize loudness",
+                "-16 LUFS · two-pass",
+                if config.normalize_loudness {
+                    "on"
+                } else {
+                    "off"
+                }
+                .to_string(),
+                SettingKind::Bool,
+            ),
+            field(
                 SettingKey::CheckUpdates,
                 "Check for updates",
                 "GitHub latest release",
@@ -853,6 +866,9 @@ impl SettingsForm {
                 }
                 SettingKey::AlbumArtistTracks => {
                     config.album_artist_for_tracks = value == "on";
+                }
+                SettingKey::NormalizeLoudness => {
+                    config.normalize_loudness = value == "on";
                 }
                 SettingKey::CheckUpdates => {}
             }
@@ -1691,6 +1707,7 @@ impl App {
             candidates_per_track: self.cfg.candidates_per_track,
             disc_prefix_track_numbers: self.cfg.disc_prefix_track_numbers,
             album_artist_for_tracks: self.cfg.album_artist_for_tracks,
+            normalize_loudness: self.cfg.normalize_loudness,
         };
         let request = DownloadRequest {
             job_id,
@@ -2577,6 +2594,11 @@ mod tests {
             .find(|field| field.key == SettingKey::AlbumArtistTracks)
             .unwrap()
             .value = "on".into();
+        form.fields
+            .iter_mut()
+            .find(|field| field.key == SettingKey::NormalizeLoudness)
+            .unwrap()
+            .value = "on".into();
 
         let config = form.to_config(&base).unwrap();
         assert_eq!(config.max_concurrent, 8);
@@ -2584,6 +2606,7 @@ mod tests {
         assert!(!config.fingerprint);
         assert!(config.disc_prefix_track_numbers);
         assert!(config.album_artist_for_tracks);
+        assert!(config.normalize_loudness);
         assert_eq!(config.username, "user");
     }
 

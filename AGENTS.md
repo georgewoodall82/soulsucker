@@ -17,10 +17,14 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 cargo build --release
+cargo build --release --features ffmpeg-static
 ```
 
+- `ffmpeg-static` compiles FFmpeg from source and statically links it. Use it for release artifacts; it needs `git`, `make`, `nasm`, and a C compiler. The normal build links the system FFmpeg development libraries.
+
 - Rust **1.91+**, edition **2024**.
-- The test suite is fast and offline. Keep it that way; do not add tests that hit MusicBrainz, iTunes, AcoustID, or Soulseek.
+- FFmpeg **8.x** development libraries are required (`ffmpeg-devel` on Fedora, `libavcodec-dev libavformat-dev libavfilter-dev libavutil-dev libswresample-dev` on Debian/Ubuntu). `ffmpeg-next` links the system libraries.
+- The test suite is fast and offline. Keep it that way; do not add tests that hit MusicBrainz, iTunes, AcoustID, or Soulseek. Do not add tests that require FFmpeg to process a real file; cover parsing and pure helpers instead.
 - The release binary is `target/release/soulsucker`.
 - `cargo run --release` starts the TUI and needs a real terminal. Do not run the interactive TUI in a non-interactive shell; use `--help`, unit tests, and clippy for validation.
 - For manual testing without touching the user's real config/credentials, pass `--config /tmp/opencode/soulsucker-test.toml` (or set `SOULSUCKER_CONFIG`).
@@ -40,6 +44,7 @@ cargo build --release
 │   ├── musicbrainz.rs   release search/ranking, release details, cover lookup
 │   ├── matcher.rs       local fuzzy matching and source selection
 │   ├── acoustid.rs      fpcalc + AcoustID verification
+│   ├── normalize.rs     two-pass EBU R128 loudness normalization via FFmpeg
 │   ├── audio.rs         FLAC inspection, metadata tagging, cover embedding
 │   ├── config.rs        TOML config, normalization, secure atomic saves
 │   ├── cli.rs           clap arguments and persistence semantics
@@ -64,9 +69,9 @@ main
      ├─ MusicBrainz worker threads ──> UiEvent::MbSearch / UiEvent::MbRelease
      ├─ update worker ───────────────> UiEvent::UpdateStarted / UiEvent::UpdateDone
      └─ SessionHandle ──> session thread (owns soulseek-rs Client)
-           ├─ search worker ────────> SessionCommand::SearchDone
-           ├─ verification workers ─> SessionCommand::Verified
-           └─ cover worker ─────────> SessionCommand::CoverReady
+           ├─ search worker ─────────> SessionCommand::SearchDone
+           ├─ verify + normalize ────> SessionCommand::Verified
+           └─ cover worker ──────────> SessionCommand::CoverReady
 ```
 
 Key rules:
@@ -116,8 +121,8 @@ Main flow:
 3. `schedule` starts tracks up to `max_concurrent`.
 4. `start_candidate` downloads into a unique per-attempt staging directory.
 5. `poll_downloads` watches queue/stall/progress, rejects bad attempts, and queues completed files for verification.
-6. `begin_verification` removes the library download record, finds the staged non-`.part` file, and verifies it in a worker.
-7. `verified` promotes the file to its final name, writes MusicBrainz tags and cover art, and marks the track done.
+6. `begin_verification` removes the library download record, finds the staged non-`.part` file, and verifies it in a worker. When `normalize_loudness` is enabled, the same worker runs the two-pass normalizer after verification and sends back the normalized staging path.
+7. `verified` promotes the (possibly normalized) file to its final name, writes MusicBrainz tags and cover art, and marks the track done.
 8. Failures go through `fail_attempt` and then `advance_after_failure`: next candidate, last-resort rounds, or `Failed`.
 9. `check_completion` fires when every track is `Done`, `Failed`, or `Cancelled`.
 
@@ -171,6 +176,17 @@ Turns Soulseek search hits into ranked per-track candidates.
 - `disc_prefix_track_numbers` (opt-in) writes disc-prefixed tags (`101…113`, `201…213`) for multi-disc releases so players that ignore the disc tag, notably Tesla's USB player, keep the discs in order. Filenames still use the `1-01` form.
 - `album_artist_for_tracks` (opt-in) writes the release artist into every track's `ARTIST` and preserves a differing per-track credit in `ARTISTS`, so players that group by track artist (Tesla) keep guest tracks inside the album. Canonical per-track credits remain the default.
 
+### `normalize.rs`
+
+- `normalize_loudness` (opt-in) runs a two-pass EBU R128 pass on downloaded FLACs before tagging.
+- Targets: **-16 LUFS** integrated, **-1.5 dBTP** true peak, **11 LU** loudness range. Keep these safe defaults unless the user asks otherwise.
+- Pass one builds an `abuffer -> loudnorm` graph, writes JSON stats through `loudnorm`'s `stats_file`, and only pulls/discards frames. Pass two reopens the source, applies `measured_*` values with `linear=true`, and encodes FLAC to a temporary file beside the source.
+- The output uses an explicit `aformat` stage and fixed encoder frame size; FLAC requires fixed-size frames. `encode_stream` counts encoded samples.
+- FFmpeg's FLAC muxer would store total samples through a zero-size side-data packet, but this FFmpeg build rejects it. `update_flac_total_samples` patches the 36-bit STREAMINFO field after muxing so duration and seeking work.
+- Normalization is best-effort: on failure, keep and tag the original file. The source is never modified in place; the temp file is returned and promoted by the session thread.
+- Never run normalization on the UI or session loop. It belongs in the verification worker.
+- Set FFmpeg's log level to quiet: the TUI owns the terminal and FFmpeg must not write diagnostics to it.
+
 ### `update.rs`
 
 - `Settings → Check for updates` calls `latest_release()` on a named worker thread, compares the GitHub tag with `env!("CARGO_PKG_VERSION")`, and installs a newer release automatically.
@@ -206,6 +222,7 @@ These are easy to break and hard to debug.
 6. **Promotion must preserve an existing file on failure.** `promote_file` uses a backup/rename fallback; keep that behavior.
 7. **Ownership of the Soulseek client matters.** `Arc<Client>` is shared with workers, but the session thread owns connect/reconnect/shutdown. Do not call blocking client operations from the UI thread.
 8. **Self-updates must stay atomic and off the UI thread.** Download to a temporary file beside the running executable, verify it, then rename it into place. The release workflow must publish raw `soulsucker-<tag>-<target>` binaries; the updater cannot extract archives.
+9. **Normalization must never destroy a download.** Encode to a temporary file, verify the result, and keep the original if anything fails. Run it in a worker, never on the UI or session loop.
 
 ## Config/CLI change checklist
 
@@ -227,6 +244,7 @@ When adding or changing a setting:
 - **Matching/scoring changes:** `matcher.rs`; update its tests. Remember cover matching depends on `normalize_text`/`strip_release_noise`.
 - **Retry/queue/stall behavior:** `session.rs` (`advance_after_failure`, `start_candidate`, `poll_downloads`, `schedule`).
 - **Verification behavior:** `acoustid.rs` and `session.rs` (`begin_verification`/`verified`).
+- **Loudness normalization:** `normalize.rs`, then the `normalize_loudness` option in `config.rs`/`app.rs`/`session.rs`.
 - **Tag fields or cover handling:** `audio.rs`, `session.rs` (`TrackTags` construction), then the audio unit test.
 - **Update behavior:** `update.rs`, the Settings action in `app.rs`/`ui.rs`, and raw asset packaging in `.github/workflows/release.yml`.
 - **UI formatting/truncation:** `util.rs` and `ui.rs`.

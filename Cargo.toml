@@ -7,11 +7,21 @@ description = "A polished TUI album downloader: MusicBrainz + Soulseek FLAC"
 license = "MIT"
 default-run = "soulsucker"
 
+[features]
+# Build and statically link FFmpeg for self-contained release binaries.
+ffmpeg-static = ["ffmpeg-next/build"]
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4.6", features = ["derive"] }
 crossterm = "0.29"
 directories = "6"
+ffmpeg-next = { version = "8.1", default-features = false, features = [
+    "codec",
+    "filter",
+    "format",
+    "software-resampling",
+] }
 lofty = "0.25"
 ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }

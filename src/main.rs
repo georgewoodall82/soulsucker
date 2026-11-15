@@ -6,6 +6,7 @@ mod config;
 mod input;
 mod matcher;
 mod musicbrainz;
+mod normalize;
 mod session;
 mod ui;
 mod update;
