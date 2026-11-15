@@ -76,7 +76,18 @@ jobs:
         run: |
           # MSYS2 ships a coreutils `link` that shadows MSVC's linker.
           rm -f /usr/bin/link.exe
+          echo "cl: $(which cl.exe || true)"
+          echo "link: $(which link.exe || true)"
+          echo "INCLUDE=$INCLUDE"
+          echo "LIB=$LIB"
           cargo build --release --locked --target ${{ matrix.target }} --features ffmpeg-static
+
+      - name: Dump FFmpeg configure log (Windows)
+        if: failure() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $log = Get-ChildItem -Path target -Recurse -Filter config.log -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($log) { Get-Content $log.FullName -Tail 250 } else { Write-Host "no config.log" }
 
       - name: Build (Unix)
         if: runner.os != 'Windows'
