@@ -37,6 +37,12 @@ jobs:
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # The cache contains FFmpeg objects built by ffmpeg-sys-next. Invalidate
+          # it when the vendored build script changes so stale native objects are
+          # never linked into a release.
+          prefix-key: v1-rust
+          key: ${{ hashFiles('vendor/ffmpeg-sys-next/**') }}
 
       - name: Install FFmpeg build tools (Linux)
         if: runner.os == 'Linux'
@@ -95,6 +101,9 @@ jobs:
           objdump -d --disassemble=av_packet_alloc "target/${{ matrix.target }}/release/soulsucker" > av_packet_alloc.asm
           if grep -Eq 'zmm|ymm' av_packet_alloc.asm; then
             echo "::error::av_packet_alloc contains AVX instructions; FFmpeg was built for the runner CPU"
+            cat av_packet_alloc.asm
+            find target -path '*ffmpeg-sys-next*/out/ffmpeg-*/ffbuild/config.mak' \
+              -exec sh -c 'echo "--- $1"; grep -E "^(CFLAGS|FFMPEG_CONFIGURATION)=" "$1"' _ {} \;
             exit 1
           fi
 
