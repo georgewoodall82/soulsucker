@@ -46,9 +46,9 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install nasm
 
-      - name: Install FFmpeg build tools (Windows)
+      - name: Install LLVM (Windows)
         if: runner.os == 'Windows'
-        run: choco install nasm make llvm -y --no-progress
+        run: choco install llvm -y --no-progress
 
       - name: Set up MSVC environment (Windows)
         if: runner.os == 'Windows'
@@ -56,12 +56,27 @@ jobs:
         with:
           arch: x64
 
+      - name: Set up MSYS2 build shell (Windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MSYS
+          update: false
+          install: make nasm diffutils
+          path-type: inherit
+
       - name: Point bindgen at libclang (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
 
-      - name: Build
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: cargo build --release --locked --target ${{ matrix.target }} --features ffmpeg-static
+
+      - name: Build (Unix)
+        if: runner.os != 'Windows'
         run: cargo build --release --locked --target ${{ matrix.target }} --features ffmpeg-static
 
       - name: Package (Unix)
