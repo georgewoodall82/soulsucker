@@ -311,7 +311,7 @@ fn render_setup(app: &mut App, frame: &mut Frame, area: Rect) {
     let form_width = area.width.saturating_sub(4).clamp(44, 82);
     let [_, middle, _] = Layout::vertical([
         Constraint::Fill(1),
-        Constraint::Length(15),
+        Constraint::Length(17),
         Constraint::Fill(1),
     ])
     .areas(area);
@@ -346,6 +346,35 @@ fn render_setup(app: &mut App, frame: &mut Frame, area: Rect) {
         Rect::new(inner.x, y, inner.width, 1),
     );
     y += 2;
+
+    let share_notes = [
+        (
+            "Many Soulseek users block non-sharers.",
+            Style::default().fg(WARNING).bold(),
+        ),
+        (
+            "Share music with Nicotine+ (desktop) or",
+            Style::default().fg(MUTED),
+        ),
+        (
+            "Seeker (Android); one session at a time.",
+            Style::default().fg(MUTED),
+        ),
+    ];
+    for (note, style) in share_notes {
+        if y >= inner.bottom() {
+            break;
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                util::truncate(note, inner.width as usize),
+                style,
+            ))),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+        y += 1;
+    }
+    y += 1;
 
     let allow_cursor = !app.help_open;
     render_input_row(
@@ -383,7 +412,7 @@ fn render_setup(app: &mut App, frame: &mut Frame, area: Rect) {
         "optional (fingerprint checks)",
         allow_cursor,
     );
-    y += 2;
+    y += 1;
 
     let notes = [
         ("AcoustID is free: https://acoustid.org/api", MUTED),
@@ -1665,6 +1694,12 @@ mod tests {
         let mut app = app();
         let setup = render_text(&mut app, 110, 34);
         assert!(setup.contains("Welcome to soulsucker"));
+        assert!(setup.contains("block non-sharers"));
+        assert!(setup.contains("Nicotine+"));
+
+        let setup_narrow = render_text(&mut app, 48, 20);
+        assert!(setup_narrow.contains("block non-sharers."));
+        assert!(setup_narrow.contains("one session at a time."));
 
         app.screen = Screen::Search;
         app.search.focus = SearchFocus::Results;

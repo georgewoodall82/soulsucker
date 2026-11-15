@@ -21,7 +21,7 @@ const MIN_MP3_BYTES: u64 = 300_000;
 const MAX_MP3_BYTES: u64 = 500_000_000;
 const MP3_320_MIN_KBPS: f64 = 300.0;
 const MAX_ESTIMATED_MP3_KBPS: f64 = 400.0;
-const MAX_FILES_PER_USER_PER_TRACK: usize = 3;
+const MAX_FILES_PER_USER_PER_TRACK: usize = 10;
 const TRACK_NUMBER_BONUS: f64 = 0.05;
 const WRONG_TRACK_PENALTY: f64 = 0.10;
 const DISC_NUMBER_BONUS: f64 = 0.03;
@@ -889,14 +889,14 @@ mod tests {
     }
 
     #[test]
-    fn one_source_is_limited_to_a_few_tries() {
+    fn one_peer_is_limited_to_ten_tries() {
         let tracks = vec![TrackQuery {
             disc: 1,
             position: 1,
             title: "Song".into(),
             expected_secs: None,
         }];
-        let files: Vec<_> = (0..10)
+        let files: Vec<_> = (0..15)
             .map(|i| file("one", &format!("Album\\{i:02} - Song.flac"), 20_000_000))
             .collect();
         let hits = vec![SearchHit {
@@ -906,7 +906,7 @@ mod tests {
             files,
         }];
         let options = CandidateOptions {
-            per_track: 12,
+            per_track: 30,
             length_tolerance: 5.0,
             quality: AudioQuality::Flac,
             artist: "Artist".into(),
@@ -914,5 +914,40 @@ mod tests {
         };
         let out = build_candidates(&tracks, &hits, &options);
         assert_eq!(out[0].len(), MAX_FILES_PER_USER_PER_TRACK);
+    }
+
+    #[test]
+    fn per_track_limit_keeps_the_thirty_best_sources() {
+        let tracks = vec![TrackQuery {
+            disc: 1,
+            position: 1,
+            title: "Song".into(),
+            expected_secs: None,
+        }];
+        let hits: Vec<_> = (0..4)
+            .map(|peer| SearchHit {
+                username: format!("peer{peer}"),
+                free_slot: true,
+                speed: 100,
+                files: (0..10)
+                    .map(|i| {
+                        file(
+                            &format!("peer{peer}"),
+                            &format!("Album\\{i:02} - Song.flac"),
+                            20_000_000,
+                        )
+                    })
+                    .collect(),
+            })
+            .collect();
+        let options = CandidateOptions {
+            per_track: 30,
+            length_tolerance: 5.0,
+            quality: AudioQuality::Flac,
+            artist: "Artist".into(),
+            album: "Album".into(),
+        };
+        let out = build_candidates(&tracks, &hits, &options);
+        assert_eq!(out[0].len(), 30);
     }
 }

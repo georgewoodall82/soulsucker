@@ -25,6 +25,20 @@ Built in Rust with [`ratatui`](https://ratatui.rs/) for the TUI,
 ╰────────────────────────────────────────────────────────────────────────────╯
 ```
 
+## Share your music
+
+Soulseek is a peer-to-peer network. It only works because its users share
+their own files, and many users block "leechers" — people who download but
+share nothing — so sharing is the best way to keep sources available and
+queues moving.
+
+soulsucker is a downloader and does not share files itself. To share your
+music, use [Nicotine+](https://nicotine-plus.org/) on desktop or
+[Seeker](https://github.com/jackBonadies/SeekerAndroid) on Android with the
+same Soulseek account. Soulseek allows one session per account, so close
+soulsucker while one of those clients is connected. If you want to share and
+download at the same time, use Nicotine+ or Seeker for that session.
+
 ## Features
 
 soulsucker uses one pooled Soulseek search, local track matching,
@@ -39,7 +53,8 @@ duration/fingerprint verification, and automatic retries:
 - **Better source selection.** Each remote file is assigned to the track it
   matches best, so similarly named tracks cannot steal each other's sources.
   Matching score comes first, then free slots, peer speed, duration closeness
-  and file size. Reported durations are used to reject cross-track matches
+  and file size. The best 30 sources per track are kept, with at most 10 from
+  the same peer. Reported durations are used to reject cross-track matches
   before bytes are spent.
 - **Resilient transfers.** Per-attempt staging folders, queue/stall
   watchdogs, next-source fallback, and last-resort passes with more patience.
@@ -125,6 +140,12 @@ If no credentials are configured, a setup screen asks for:
 1. Soulseek username
 2. Soulseek password
 3. AcoustID API key (optional; leave blank to skip)
+
+> [!TIP]
+> **Please share your music.** Many Soulseek users block people who only
+> download. soulsucker cannot share files itself, so see
+> [Share your music](#share-your-music) for the desktop and Android clients to
+> use with your account.
 
 They are saved to the config file shown on screen, normally:
 
@@ -308,7 +329,7 @@ fingerprint = true
 fingerprint_min_score = 0.8
 last_resort_rounds = 2
 last_resort_stall_timeout_secs = 60
-candidates_per_track = 12
+candidates_per_track = 30
 listen_port = 0
 mb_limit = 25
 disc_prefix_track_numbers = false

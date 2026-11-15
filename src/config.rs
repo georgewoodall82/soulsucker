@@ -155,7 +155,7 @@ impl Default for Config {
             fingerprint_min_score: 0.8,
             last_resort_rounds: 2,
             last_resort_stall_timeout_secs: 60,
-            candidates_per_track: 12,
+            candidates_per_track: 30,
             listen_port: 0,
             mb_limit: 25,
             disc_prefix_track_numbers: false,
