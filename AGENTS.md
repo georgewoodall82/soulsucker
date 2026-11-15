@@ -55,7 +55,7 @@ cargo build --release --features ffmpeg-static
 │   ├── silence.flac     tiny real FLAC used by the audio tagging test
 │   └── silence.mp3      tiny 320 kbps MP3 used by the MP3 audio tests
 ├── vendor/
-│   └── ffmpeg-sys-next  patched 8.1 crate (MSVC CPU flags)
+│   └── ffmpeg-sys-next  patched 8.1 crate (MSVC and portable CPU flags)
 └── .github/workflows/
     └── release.yml      tag-triggered multi-platform GitHub release
 ```
@@ -271,7 +271,7 @@ When adding or changing a setting:
 - Use `anyhow::Result` internally; convert to `String` for events/UI.
 - Name spawned threads (`soulseek-connect`, `soulsucker-verify`, `cover-art`, etc.) to make logs diagnosable.
 - Prefer existing dependencies (`ureq`, `serde`, `ratatui`, `lofty`, `strsim`, `ffmpeg-next`, `mp3lame-encoder`) over adding new crates.
-- Keep the `ffmpeg-sys-next` patch minimal. It only skips GCC CPU flags on MSVC; see `vendor/README.md`.
+- Keep the `ffmpeg-sys-next` patch minimal. It skips GCC CPU flags on MSVC and removes `-march=native` so release binaries run on older CPUs; see `vendor/README.md`.
 - Respect external rate limits and use the existing throttles/User-Agents.
 - Keep TUI text width-safe and sanitize untrusted peer/source names.
 - Don't log credentials, API keys, or raw config contents.

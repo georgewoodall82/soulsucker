@@ -329,10 +329,11 @@ fn build(sysroot: Option<&str>) -> io::Result<()> {
         }
     } else if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         // MSVC does not accept GCC-style -march/-mtune flags.
-    } else {
-        // tune the compiler for the host arhitecture
-        configure.arg("--extra-cflags=-march=native -mtune=native");
     }
+    // Do not pass -march=native/-mtune=native for native builds. Release
+    // binaries are built on CI runners that may support newer instruction sets
+    // than the machines that run them. FFmpeg selects its SIMD routines at
+    // runtime, so the compiler's target baseline is portable and still fast.
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         // essential librareis on windowsw

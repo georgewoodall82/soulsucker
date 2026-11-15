@@ -1,6 +1,6 @@
 [package]
 name = "soulsucker"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.91"
 description = "A polished TUI album downloader: MusicBrainz + Soulseek FLAC/MP3"
@@ -8,8 +8,9 @@ license = "MIT"
 default-run = "soulsucker"
 
 [patch.crates-io]
-# ffmpeg-sys-next 8.1 passes GCC -march/-mtune flags to MSVC and fails.
-# The vendor copy adds an MSVC guard; drop this once upstream supports 8.1.
+# ffmpeg-sys-next 8.1 passes GCC -march/-mtune flags to MSVC and fails, and
+# builds host-specific code for native releases. The vendor copy guards MSVC
+# and keeps native builds portable; drop this once upstream does the same.
 ffmpeg-sys-next = { path = "vendor/ffmpeg-sys-next" }
 
 [features]

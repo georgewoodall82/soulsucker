@@ -89,6 +89,15 @@ jobs:
         if: runner.os != 'Windows'
         run: cargo build --release --locked --target ${{ matrix.target }} --features ffmpeg-static
 
+      - name: Verify portable FFmpeg code (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          objdump -d --disassemble=av_packet_alloc "target/${{ matrix.target }}/release/soulsucker" > av_packet_alloc.asm
+          if grep -Eq 'zmm|ymm' av_packet_alloc.asm; then
+            echo "::error::av_packet_alloc contains AVX instructions; FFmpeg was built for the runner CPU"
+            exit 1
+          fi
+
       - name: Package (Unix)
         if: runner.os != 'Windows'
         shell: bash
