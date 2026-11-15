@@ -330,11 +330,16 @@ fn build(sysroot: Option<&str>) -> io::Result<()> {
         }
     } else if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         // MSVC does not accept GCC-style -march/-mtune flags.
+    } else if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64") {
+        // Pin the portable x86-64 baseline. Some distributions (for example
+        // Ubuntu 26.04) configure GCC to default to x86-64-v3, which emits AVX2
+        // code that crashes on older CPUs. FFmpeg still selects its hand-written
+        // SIMD routines at runtime.
+        configure.arg("--extra-cflags=-march=x86-64 -mtune=generic");
     }
-    // Do not pass -march=native/-mtune=native for native builds. Release
+    // Never pass -march=native/-mtune=native for native builds: release
     // binaries are built on CI runners that may support newer instruction sets
-    // than the machines that run them. FFmpeg selects its SIMD routines at
-    // runtime, so the compiler's target baseline is portable and still fast.
+    // than the machines that run them.
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         // essential librareis on windowsw

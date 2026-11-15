@@ -271,7 +271,7 @@ When adding or changing a setting:
 - Use `anyhow::Result` internally; convert to `String` for events/UI.
 - Name spawned threads (`soulseek-connect`, `soulsucker-verify`, `cover-art`, etc.) to make logs diagnosable.
 - Prefer existing dependencies (`ureq`, `serde`, `ratatui`, `lofty`, `strsim`, `ffmpeg-next`, `mp3lame-encoder`) over adding new crates.
-- Keep the `ffmpeg-sys-next` patch minimal. It skips GCC CPU flags on MSVC, removes `-march=native` so release binaries run on older CPUs, and rebuilds cached FFmpeg objects when configure flags change; see `vendor/README.md`.
+- Keep the `ffmpeg-sys-next` patch minimal. It skips GCC CPU flags on MSVC, pins x86_64 to the portable `-march=x86-64` baseline, and rebuilds cached FFmpeg objects when configure flags change; see `vendor/README.md`.
 - Respect external rate limits and use the existing throttles/User-Agents.
 - Keep TUI text width-safe and sanitize untrusted peer/source names.
 - Don't log credentials, API keys, or raw config contents.
