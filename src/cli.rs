@@ -66,6 +66,9 @@ pub struct Args {
     /// Parallel track downloads
     #[arg(long, value_name = "N")]
     pub max_concurrent: Option<usize>,
+    /// Tracks checked, measured or converted at once
+    #[arg(long, value_name = "N")]
+    pub max_processing: Option<usize>,
     /// Allowed duration difference from MusicBrainz, in seconds (0 disables)
     #[arg(long, value_name = "SECS")]
     pub length_tolerance: Option<f64>,
@@ -143,6 +146,9 @@ impl Args {
         }
         if let Some(value) = self.max_concurrent {
             config.max_concurrent = value;
+        }
+        if let Some(value) = self.max_processing {
+            config.max_processing = value;
         }
         if let Some(value) = self.length_tolerance {
             config.length_tolerance_secs = value;

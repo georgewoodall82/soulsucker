@@ -625,6 +625,7 @@ pub enum SettingKey {
     MusicDir,
     Quality,
     MaxConcurrent,
+    MaxProcessing,
     SearchTimeout,
     QueueTimeout,
     StallTimeout,
@@ -655,6 +656,7 @@ impl SettingKey {
             | Self::AlbumArtistTracks
             | Self::NormalizeLoudness => SettingsTab::Library,
             Self::MaxConcurrent
+            | Self::MaxProcessing
             | Self::SearchTimeout
             | Self::QueueTimeout
             | Self::StallTimeout
@@ -769,6 +771,13 @@ impl SettingsForm {
                 "Parallel downloads",
                 "1–16",
                 config.max_concurrent.to_string(),
+                SettingKind::Int { min: 1, max: 16 },
+            ),
+            field(
+                SettingKey::MaxProcessing,
+                "Parallel processing",
+                "checking, converting · 1–16",
+                config.max_processing.to_string(),
                 SettingKind::Int { min: 1, max: 16 },
             ),
             field(
@@ -1064,6 +1073,9 @@ impl SettingsForm {
                 }
                 SettingKey::MaxConcurrent => {
                     config.max_concurrent = parse_usize(&value, index, field)?
+                }
+                SettingKey::MaxProcessing => {
+                    config.max_processing = parse_usize(&value, index, field)?
                 }
                 SettingKey::SearchTimeout => {
                     config.search_timeout_secs = parse_u64(&value, index, field)?
@@ -2130,6 +2142,7 @@ impl App {
         let online = matches!(self.connection, ConnState::Online { .. });
         let options = DownloadOptions {
             max_concurrent: self.cfg.max_concurrent,
+            max_processing: self.cfg.max_processing,
             search_timeout: Duration::from_secs(self.cfg.search_timeout_secs),
             queue_timeout: Duration::from_secs(self.cfg.queue_timeout_secs),
             stall_timeout: Duration::from_secs(self.cfg.stall_timeout_secs),

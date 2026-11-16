@@ -1160,8 +1160,9 @@ fn render_tracks(app: &mut App, frame: &mut Frame, area: Rect) {
     let options_inner = options_block.inner(options_area);
     frame.render_widget(options_block, options_area);
     let mut line1 = format!(
-        "{} parallel · {}s search · {}s queue · {}s stall · ±{}s length · {} source(s)/track",
+        "{} downloads · {} processing · {}s search · {}s queue · {}s stall · ±{}s length · {} source(s)/track",
         app.cfg.max_concurrent,
+        app.cfg.max_processing,
         app.cfg.search_timeout_secs,
         app.cfg.queue_timeout_secs,
         app.cfg.stall_timeout_secs,

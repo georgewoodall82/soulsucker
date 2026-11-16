@@ -102,6 +102,8 @@ pub struct Config {
 
     /// Maximum number of tracks downloading at once.
     pub max_concurrent: usize,
+    /// Tracks being verified, measured or converted at once.
+    pub max_processing: usize,
     /// How long a Soulseek search may collect results.
     pub search_timeout_secs: u64,
     /// How long a transfer may sit in a peer's queue before we try another.
@@ -147,6 +149,7 @@ impl Default for Config {
             music_dir: default_music_dir().to_string_lossy().into_owned(),
             audio_quality: AudioQuality::Flac,
             max_concurrent: 1,
+            max_processing: 3,
             search_timeout_secs: 20,
             queue_timeout_secs: 120,
             stall_timeout_secs: 15,
@@ -175,6 +178,7 @@ impl std::fmt::Debug for Config {
             .field("music_dir", &self.music_dir)
             .field("audio_quality", &self.audio_quality)
             .field("max_concurrent", &self.max_concurrent)
+            .field("max_processing", &self.max_processing)
             .field("fingerprint", &self.fingerprint)
             .finish_non_exhaustive()
     }
@@ -192,6 +196,9 @@ impl Config {
         }
         if !(1..=16).contains(&self.max_concurrent) {
             self.max_concurrent = defaults.max_concurrent;
+        }
+        if !(1..=16).contains(&self.max_processing) {
+            self.max_processing = defaults.max_processing;
         }
         if self.search_timeout_secs == 0 || self.search_timeout_secs > 300 {
             self.search_timeout_secs = defaults.search_timeout_secs;
@@ -245,6 +252,9 @@ impl Config {
         }
         if !(1..=16).contains(&self.max_concurrent) {
             errors.push("Parallel downloads must be between 1 and 16".to_string());
+        }
+        if !(1..=16).contains(&self.max_processing) {
+            errors.push("Parallel processing must be between 1 and 16".to_string());
         }
         if self.search_timeout_secs == 0 || self.search_timeout_secs > 300 {
             errors.push("Search timeout must be between 1 and 300 seconds".to_string());
@@ -615,6 +625,7 @@ mod tests {
     fn missing_fields_fall_back_to_defaults() {
         let config: Config = toml::from_str("username = \"u\"\npassword = \"p\"\n").unwrap();
         assert_eq!(config.max_concurrent, 1);
+        assert_eq!(config.max_processing, 3);
         assert_eq!(config.search_timeout_secs, 20);
     }
 }
@@ -627,6 +638,7 @@ mod normalize_tests {
     fn out_of_range_values_are_clamped_to_defaults() {
         let mut config = Config {
             max_concurrent: 0,
+            max_processing: 0,
             search_timeout_secs: 9999,
             queue_timeout_secs: 0,
             stall_timeout_secs: 0,
@@ -641,6 +653,7 @@ mod normalize_tests {
         config.normalize();
         let defaults = Config::default();
         assert_eq!(config.max_concurrent, defaults.max_concurrent);
+        assert_eq!(config.max_processing, defaults.max_processing);
         assert_eq!(config.search_timeout_secs, defaults.search_timeout_secs);
         assert_eq!(config.queue_timeout_secs, defaults.queue_timeout_secs);
         assert_eq!(config.stall_timeout_secs, defaults.stall_timeout_secs);

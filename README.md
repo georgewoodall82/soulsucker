@@ -238,6 +238,10 @@ soulsucker --no-fingerprint
    download one at a time by default (`max_concurrent`). Each attempt gets its
    own hidden staging folder inside the destination folder, so partial files
    can never be mistaken for finished ones.
+
+   Only live transfers use those download slots. Checking, loudness
+   measurement and conversion of finished files run alongside the next
+   download, limited separately by `max_processing` (default 3).
 7. When a transfer completes, its duration is checked. With an AcoustID key,
    the built-in Chromaprint fingerprint is also checked: the expected
    MusicBrainz recording must appear in AcoustID's **top-scoring cluster**.
@@ -334,8 +338,9 @@ Settings is split into four tabs:
   score.
 - **Library** — music folder, FLAC/MP3 320 output, Tesla-friendly tags and
   loudness normalization.
-- **Downloading** — parallel downloads, search/queue/stall timeouts, length
-  tolerance, retry passes and sources per track.
+- **Downloading** — parallel downloads, parallel processing (checking and
+  converting), search/queue/stall timeouts, length tolerance, retry passes and
+  sources per track.
 - **Advanced** — listener port, MusicBrainz result count and the update check.
 
 **Check for updates** compares the running version with the latest public
@@ -357,6 +362,7 @@ acoustid_key = "your-acoustid-key"
 music_dir = "/home/you/Music"
 audio_quality = "flac"
 max_concurrent = 1
+max_processing = 3
 search_timeout_secs = 20
 queue_timeout_secs = 120
 stall_timeout_secs = 15
@@ -436,7 +442,8 @@ Run `soulsucker --help` for the full list. Useful ones:
 | `--search-timeout` | Seconds to collect Soulseek results |
 | `--queue-timeout` | Seconds to wait in a peer queue |
 | `--stall-timeout` | Seconds without progress before switching source |
-| `--max-concurrent` | Parallel tracks |
+| `--max-concurrent` | Parallel track downloads |
+| `--max-processing` | Tracks checked, measured or converted at once |
 | `--length-tolerance` | Allowed MusicBrainz duration difference |
 | `--fingerprint-min-score` | Minimum AcoustID match score |
 | `--last-resort-rounds` | Extra passes over exhausted sources |

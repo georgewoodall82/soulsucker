@@ -108,6 +108,8 @@ pub enum SlskEvent {
 #[derive(Clone)]
 pub struct DownloadOptions {
     pub max_concurrent: usize,
+    /// Checks, loudness measurements and conversions running at once.
+    pub max_processing: usize,
     pub search_timeout: Duration,
     pub queue_timeout: Duration,
     pub stall_timeout: Duration,
@@ -154,6 +156,7 @@ impl std::fmt::Debug for DownloadOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DownloadOptions")
             .field("max_concurrent", &self.max_concurrent)
+            .field("max_processing", &self.max_processing)
             .field("search_timeout", &self.search_timeout)
             .field("queue_timeout", &self.queue_timeout)
             .field("stall_timeout", &self.stall_timeout)
@@ -580,6 +583,7 @@ impl Session {
         self.check_session();
         // Album gain works on local files and does not need the session.
         self.check_album_gain_deadlines();
+        self.run_verification_queue();
         self.run_album_gain();
         if self.client.is_none() {
             self.check_completion();
@@ -1311,6 +1315,9 @@ impl Session {
             if let Some(hold) = track.pressing_hold.take() {
                 let _ = fs::remove_dir_all(&hold.staging);
             }
+            if let Some(queued) = track.queued_check.take() {
+                let _ = fs::remove_dir_all(&queued.staging);
+            }
             track.speed = 0.0;
             track.note = reason.to_string();
             (track.meta.position, track.meta.title.clone())
@@ -1349,14 +1356,76 @@ impl Session {
             advance_after_failure(album, index, &events);
             return;
         };
-        self.spawn_verification(
+        self.queue_verification(
             index,
-            staged,
-            active.staging,
-            active.attempt_no,
-            active.username,
-            active.path,
+            QueuedCheck {
+                attempt_no: active.attempt_no,
+                staged,
+                staging: active.staging,
+                username: active.username,
+                remote_path: active.path,
+            },
         );
+    }
+
+    /// Line a downloaded file up for checking. The transfer is over, so the
+    /// download slot is free; the check waits for a processing slot.
+    fn queue_verification(&mut self, index: usize, check: QueuedCheck) {
+        let events = self.events.clone();
+        if let Some(album) = self.album.as_mut() {
+            let job_id = album.job.job_id;
+            if let Some(track) = album.tracks.get_mut(index) {
+                track.status = TrackStatus::Verifying;
+                track.speed = 0.0;
+                track.note = "waiting to check".to_string();
+                track.queued_check = Some(check);
+                let _ = events.send(SlskEvent::Track(track.update(job_id)));
+            }
+        }
+        self.run_verification_queue();
+    }
+
+    /// Start queued checks while processing slots are free. Album-gain
+    /// workers and verification workers share the same limit.
+    fn run_verification_queue(&mut self) {
+        let Some(album) = self.album.as_ref() else {
+            return;
+        };
+        let mut free = album
+            .job
+            .options
+            .max_processing
+            .max(1)
+            .saturating_sub(processing_in_use(album));
+        let queued: Vec<usize> = album
+            .tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, track)| track.queued_check.is_some())
+            .map(|(index, _)| index)
+            .collect();
+        for index in queued {
+            if free == 0 {
+                break;
+            }
+            let Some(check) = self
+                .album
+                .as_mut()
+                .and_then(|album| album.tracks.get_mut(index))
+                .and_then(|track| track.queued_check.take())
+            else {
+                continue;
+            };
+            free -= 1;
+            self.spawn_verification(
+                index,
+                check.staged,
+                check.staging,
+                check.attempt_no,
+                check.username,
+                check.remote_path,
+            );
+        }
     }
 
     /// Verify (and, without album gain, convert) a staged file in a worker.
@@ -1836,13 +1905,15 @@ impl Session {
                     else {
                         continue;
                     };
-                    self.spawn_verification(
+                    self.queue_verification(
                         index,
-                        hold.staged,
-                        hold.staging,
-                        hold.attempt_no,
-                        hold.username,
-                        hold.remote_path,
+                        QueuedCheck {
+                            attempt_no: hold.attempt_no,
+                            staged: hold.staged,
+                            staging: hold.staging,
+                            username: hold.username,
+                            remote_path: hold.remote_path,
+                        },
                     );
                 }
             }
@@ -1921,17 +1992,8 @@ impl Session {
 
         let job_id = album.job.job_id;
         let quality = album.job.options.audio_quality;
-        let max = album.job.options.max_concurrent.max(1);
-        let mut running = album
-            .tracks
-            .iter()
-            .filter(|track| {
-                track
-                    .pending
-                    .as_ref()
-                    .is_some_and(|pending| pending.deadline.is_some())
-            })
-            .count();
+        let max = album.job.options.max_processing.max(1);
+        let mut running = processing_in_use(album);
         for (index, track) in album.tracks.iter_mut().enumerate() {
             if running >= max {
                 break;
@@ -2174,6 +2236,9 @@ impl Session {
             if let Some(hold) = track.pressing_hold.take() {
                 let _ = fs::remove_dir_all(&hold.staging);
             }
+            if let Some(queued) = track.queued_check.take() {
+                let _ = fs::remove_dir_all(&queued.staging);
+            }
             track.status = TrackStatus::Cancelled;
             track.speed = 0.0;
             track.note = "cancelled".to_string();
@@ -2261,8 +2326,15 @@ impl Session {
             ) {
                 continue;
             }
-            if keep_verified && (track.pending.is_some() || track.pressing_hold.is_some()) {
+            if keep_verified
+                && (track.pending.is_some()
+                    || track.pressing_hold.is_some()
+                    || track.queued_check.is_some())
+            {
                 continue;
+            }
+            if let Some(queued) = track.queued_check.take() {
+                let _ = fs::remove_dir_all(&queued.staging);
             }
             if let Some(pending) = track.pending.take() {
                 let _ = fs::remove_dir_all(&pending.staging);
@@ -2679,6 +2751,15 @@ struct VerifyingAttempt {
     remote_path: String,
 }
 
+/// A downloaded file waiting for a processing slot to be checked.
+struct QueuedCheck {
+    attempt_no: u32,
+    staged: PathBuf,
+    staging: PathBuf,
+    username: String,
+    remote_path: String,
+}
+
 struct TrackState {
     meta: TrackMeta,
     status: TrackStatus,
@@ -2692,6 +2773,7 @@ struct TrackState {
     verifying: Option<VerifyingAttempt>,
     pending: Option<PendingAlbumGain>,
     pressing_hold: Option<HeldForPressing>,
+    queued_check: Option<QueuedCheck>,
     downloaded: bool,
     bytes_done: u64,
     total: u64,
@@ -2722,6 +2804,7 @@ impl TrackState {
             verifying: None,
             pending: None,
             pressing_hold: None,
+            queued_check: None,
             downloaded: false,
             bytes_done: bytes,
             total,
@@ -3065,7 +3148,8 @@ fn use_fallback_sources(album: &mut AlbumState, events: &Sender<SlskEvent>) {
     }
 }
 
-/// The tracks the scheduler may start now, within `max_concurrent`.
+/// The tracks the scheduler may start now, within `max_concurrent` live
+/// transfers.
 fn tracks_to_start(album: &AlbumState, now: Instant) -> Vec<usize> {
     let probe_track = match album.source_mode {
         SourceMode::Probing { track, .. } => Some(track),
@@ -3096,16 +3180,27 @@ fn tracks_to_start(album: &AlbumState, now: Instant) -> Vec<usize> {
     to_start
 }
 
-/// Whether a track occupies one of the `max_concurrent` slots. A verified
-/// track held for the album gain keeps the `Verifying` status but no longer
-/// uses the network, so it must not block the rest of the album.
+/// Whether a track occupies one of the `max_concurrent` slots: only a live
+/// transfer does. Once a file is down, checking, measuring and converting it
+/// are limited by `max_processing` instead, so they never hold up the next
+/// download.
 fn uses_download_slot(track: &TrackState) -> bool {
-    track.pending.is_none()
-        && track.pressing_hold.is_none()
-        && matches!(
-            track.status,
-            TrackStatus::Downloading | TrackStatus::Verifying
-        )
+    track.current.is_some() && track.status == TrackStatus::Downloading
+}
+
+/// Workers currently checking, measuring or converting files.
+fn processing_in_use(album: &AlbumState) -> usize {
+    album
+        .tracks
+        .iter()
+        .filter(|track| {
+            track.verifying.is_some()
+                || track
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.deadline.is_some())
+        })
+        .count()
 }
 
 /// A track that still needs a source and is not transferring or verifying.
@@ -3116,6 +3211,7 @@ fn waiting_for_sources(track: &TrackState) -> bool {
         && track.verifying.is_none()
         && track.pending.is_none()
         && track.pressing_hold.is_none()
+        && track.queued_check.is_none()
         && !matches!(
             track.status,
             TrackStatus::Done | TrackStatus::Failed | TrackStatus::Cancelled
@@ -3464,6 +3560,7 @@ mod tests {
                 tracks: vec![meta],
                 options: DownloadOptions {
                     max_concurrent: 1,
+                    max_processing: 3,
                     search_timeout: Duration::from_secs(1),
                     queue_timeout: Duration::from_secs(1),
                     stall_timeout: Duration::from_secs(1),
@@ -3830,7 +3927,7 @@ mod tests {
         let (mut album, _, _) = album_after_search();
         album.job.options.normalize_loudness = true;
         album.job.options.audio_quality = quality;
-        album.job.options.max_concurrent = 1;
+        album.job.options.max_processing = 1;
         let staging = std::env::temp_dir().join(format!(
             "soulsucker-gain-hold-{}-{:?}",
             std::process::id(),
@@ -4047,9 +4144,82 @@ mod tests {
         commit_album_source(&mut album, &tx);
         assert_eq!(tracks_to_start(&album, Instant::now()), [1]);
 
-        // A track that is really verifying still uses its slot.
-        album.tracks[1].status = TrackStatus::Verifying;
+        // A live transfer still uses its slot.
+        album.tracks[1].status = TrackStatus::Downloading;
+        album.tracks[1].current = Some(DownloadActive {
+            username: "peer".into(),
+            path: "x.flac".into(),
+            staging: staging.clone(),
+            started: Instant::now(),
+            last_progress: Instant::now(),
+            last_bytes: 0,
+            in_progress: true,
+            stall_patience: Duration::from_secs(10),
+            queue_patience: Duration::from_secs(10),
+            attempt_no: 1,
+        });
         assert!(tracks_to_start(&album, Instant::now()).is_empty());
+    }
+
+    #[test]
+    fn checking_a_downloaded_file_does_not_use_a_download_slot() {
+        let (tx, _rx) = mpsc::channel();
+        let (mut album, sources, fallback) = album_after_search();
+        album.job.options.max_concurrent = 1;
+        plan_sources(&mut album, sources, fallback, &tx);
+        commit_album_source(&mut album, &tx);
+        // Track 0 is downloaded and being checked; track 1 can download.
+        album.tracks[0].status = TrackStatus::Verifying;
+        album.tracks[0].verifying = Some(VerifyingAttempt {
+            attempt_no: 1,
+            staging: PathBuf::from("/nonexistent"),
+            deadline: Instant::now() + Duration::from_secs(60),
+            username: "peer".into(),
+            remote_path: "x.flac".into(),
+        });
+        assert_eq!(tracks_to_start(&album, Instant::now()), [1]);
+        // A file waiting for a processing slot does not block it either.
+        album.tracks[0].verifying = None;
+        album.tracks[0].queued_check = Some(queued_check());
+        assert_eq!(tracks_to_start(&album, Instant::now()), [1]);
+    }
+
+    fn queued_check() -> QueuedCheck {
+        QueuedCheck {
+            attempt_no: 1,
+            staged: PathBuf::from("/nonexistent/staged.flac"),
+            staging: PathBuf::from("/nonexistent/staging"),
+            username: "peer".into(),
+            remote_path: "x.flac".into(),
+        }
+    }
+
+    #[test]
+    fn processing_slots_limit_checks_independently_of_downloads() {
+        let (mut album, _, _) = album_after_search();
+        album.job.options.max_concurrent = 1;
+        album.job.options.max_processing = 2;
+        for track in album.tracks.iter_mut().take(3) {
+            track.status = TrackStatus::Verifying;
+            track.queued_check = Some(queued_check());
+        }
+        let (mut session, _events) = offline_session(album);
+        session.run_verification_queue();
+        let album = session.album.as_ref().unwrap();
+        let started = album
+            .tracks
+            .iter()
+            .filter(|track| track.verifying.is_some())
+            .count();
+        let waiting = album
+            .tracks
+            .iter()
+            .filter(|track| track.queued_check.is_some())
+            .count();
+        assert_eq!((started, waiting), (2, 1));
+        assert_eq!(processing_in_use(album), 2);
+        // Nothing is downloading, so a download could still start.
+        assert!(!album.tracks.iter().any(uses_download_slot));
     }
 
     #[test]
@@ -4072,7 +4242,7 @@ mod tests {
         .unwrap()
         .gain_db;
         assert_eq!(album.album_gain, Some(expected));
-        // max_concurrent = 1: one gain worker at a time.
+        // max_processing = 1: one gain worker at a time.
         let started = album
             .tracks
             .iter()
