@@ -22,6 +22,9 @@ const USER_AGENT: &str = concat!(
     " (https://github.com/example/soulsucker)"
 );
 const REQUEST_SPACING: Duration = Duration::from_millis(1100);
+/// Browsing with recordings returns only ~20 releases per page; stop after
+/// this many pages so a huge group cannot keep the worker busy for minutes.
+const MAX_PRESSING_PAGES: usize = 12;
 const MAX_RETRIES: u32 = 3;
 
 static HTTP: OnceLock<ureq::Agent> = OnceLock::new();
@@ -396,6 +399,14 @@ struct BrowseMedium {
 }
 
 #[derive(Debug, Deserialize)]
+struct BrowseDetailResponse {
+    #[serde(rename = "release-count", default)]
+    release_count: usize,
+    #[serde(default)]
+    releases: Vec<DetailRelease>,
+}
+
+#[derive(Debug, Deserialize)]
 struct DetailRelease {
     id: String,
     title: String,
@@ -702,6 +713,121 @@ fn preferred_remaster(release: &ReleaseCandidate) -> bool {
             release.status.to_ascii_lowercase().as_str(),
             "bootleg" | "promotion" | "pseudo-release" | "withdrawn" | "cancelled"
         )
+}
+
+/// Every release (pressing) in a release group, with full tracklists and
+/// track lengths. Releases without audio tracks are skipped.
+pub fn get_group_release_details(release_group_mbid: &str) -> Result<Vec<ReleaseInfo>> {
+    let url = format!("{MB_BASE}/release/");
+    let mut releases = Vec::new();
+    let mut offset = 0usize;
+    for _ in 0..MAX_PRESSING_PAGES {
+        let response: BrowseDetailResponse = get_json(
+            &url,
+            &[
+                ("release-group", release_group_mbid.to_string()),
+                (
+                    "inc",
+                    "recordings+artist-credits+release-groups".to_string(),
+                ),
+                ("fmt", "json".to_string()),
+                ("limit", "100".to_string()),
+                ("offset", offset.to_string()),
+            ],
+        )?;
+        let received = response.releases.len();
+        releases.extend(
+            response
+                .releases
+                .into_iter()
+                .filter_map(|release| release_info_from_detail(release).ok()),
+        );
+        offset += received;
+        if received == 0 || offset >= response.release_count {
+            break;
+        }
+    }
+    Ok(releases)
+}
+
+/// One track of the album being downloaded, as seen when looking for a
+/// pressing whose lengths fit the files.
+#[derive(Debug, Clone)]
+pub struct PressingTrack {
+    pub disc: u32,
+    pub position: u32,
+    pub title: String,
+    /// The length of the file we have (or the peer reported) for this track.
+    pub observed_secs: Option<f64>,
+}
+
+/// Find another pressing of the same tracklist whose track lengths match the
+/// files: same discs and positions, matching titles, and every observed
+/// length within `tolerance` seconds. Closest overall wins; official
+/// releases break ties.
+pub fn best_matching_pressing<'a>(
+    tracks: &[PressingTrack],
+    pressings: &'a [ReleaseInfo],
+    exclude_mbid: &str,
+    tolerance: f64,
+) -> Option<&'a ReleaseInfo> {
+    if !tracks.iter().any(|track| track.observed_secs.is_some()) {
+        return None;
+    }
+    let tolerance = tolerance.max(1.0);
+    // (distance in ms, missing lengths, not official, mbid) — lower is better.
+    type Rank<'r> = (u64, usize, bool, &'r str);
+    let mut best: Option<(Rank<'a>, &'a ReleaseInfo)> = None;
+    'pressings: for pressing in pressings {
+        if pressing.mbid.eq_ignore_ascii_case(exclude_mbid) || pressing.tracks.len() != tracks.len()
+        {
+            continue;
+        }
+        let mut distance = 0.0;
+        let mut missing_lengths = 0usize;
+        for (wanted, candidate) in tracks.iter().zip(&pressing.tracks) {
+            if wanted.disc != candidate.disc
+                || wanted.position != candidate.position
+                || !same_track_title(&wanted.title, &candidate.title)
+            {
+                continue 'pressings;
+            }
+            match (wanted.observed_secs, candidate.length_secs()) {
+                (Some(observed), Some(length)) => {
+                    let diff = (observed - length).abs();
+                    if diff > tolerance {
+                        continue 'pressings;
+                    }
+                    distance += diff;
+                }
+                (Some(_), None) => continue 'pressings,
+                (None, None) => missing_lengths += 1,
+                (None, Some(_)) => {}
+            }
+        }
+        let key = (
+            (distance * 1000.0).round() as u64,
+            missing_lengths,
+            !pressing.status.eq_ignore_ascii_case("official"),
+            pressing.mbid.as_str(),
+        );
+        if best.as_ref().is_none_or(|(best_key, _)| key < *best_key) {
+            best = Some((key, pressing));
+        }
+    }
+    best.map(|(_, pressing)| pressing)
+}
+
+fn same_track_title(a: &str, b: &str) -> bool {
+    let a = normalize_text(a);
+    let b = normalize_text(b);
+    if a == b {
+        return true;
+    }
+    let (padded_a, padded_b) = (format!(" {a} "), format!(" {b} "));
+    padded_a.contains(&padded_b)
+        || padded_b.contains(&padded_a)
+        || normalized_levenshtein(&a, &b) >= 0.85
 }
 
 pub fn get_release(mbid: &str) -> Result<ReleaseInfo> {
@@ -1622,5 +1748,93 @@ mod tests {
         assert_eq!(response.results.len(), 1);
         assert_eq!(response.results[0].collection_name, "Dirt");
         assert_eq!(response.results[0].artist_name, "Alice in Chains");
+    }
+
+    fn pressing(mbid: &str, status: &str, lengths: &[Option<u64>]) -> ReleaseInfo {
+        let titles = ["In the Flesh?", "The Thin Ice", "Hey You"];
+        let discs = [(1, 1), (1, 2), (2, 1)];
+        ReleaseInfo {
+            mbid: mbid.into(),
+            release_group_mbid: "group".into(),
+            title: "The Wall".into(),
+            artist: "Pink Floyd".into(),
+            date: "1979".into(),
+            country: "GB".into(),
+            status: status.into(),
+            disambiguation: String::new(),
+            primary_type: "Album".into(),
+            tracks: titles
+                .iter()
+                .zip(discs)
+                .zip(lengths)
+                .enumerate()
+                .map(|(index, ((title, (disc, position)), length))| TrackInfo {
+                    index,
+                    disc,
+                    position,
+                    title: (*title).into(),
+                    artist: "Pink Floyd".into(),
+                    length_ms: length.map(|secs| secs * 1000),
+                    recording_mbid: format!("{mbid}-rec{index}"),
+                    track_mbid: format!("{mbid}-track{index}"),
+                })
+                .collect(),
+        }
+    }
+
+    fn wanted(observed: [Option<f64>; 3]) -> Vec<PressingTrack> {
+        [
+            ("In the Flesh", 1, 1),
+            ("The Thin Ice", 1, 2),
+            ("Hey You", 2, 1),
+        ]
+        .iter()
+        .zip(observed)
+        .map(|((title, disc, position), observed_secs)| PressingTrack {
+            disc: *disc,
+            position: *position,
+            title: (*title).into(),
+            observed_secs,
+        })
+        .collect()
+    }
+
+    #[test]
+    fn the_pressing_matching_the_files_lengths_is_chosen() {
+        let pressings = vec![
+            pressing("current", "Official", &[Some(199), Some(150), Some(284)]),
+            pressing("far", "Official", &[Some(199), Some(160), Some(284)]),
+            pressing("close", "Official", &[Some(199), Some(143), Some(284)]),
+            pressing(
+                "closer-bootleg",
+                "Bootleg",
+                &[Some(199), Some(142), Some(284)],
+            ),
+            pressing("closer", "Official", &[Some(199), Some(142), Some(284)]),
+        ];
+        let tracks = wanted([Some(199.4), Some(142.0), Some(284.0)]);
+        let best = best_matching_pressing(&tracks, &pressings, "current", 5.0).unwrap();
+        assert_eq!(best.mbid, "closer", "closest, then official");
+    }
+
+    #[test]
+    fn a_pressing_must_have_the_same_tracklist_and_fit_every_known_length() {
+        let mut shuffled = pressing("shuffled", "Official", &[Some(199), Some(142), Some(284)]);
+        shuffled.tracks[1].title = "Mother".into();
+        let mut short = pressing("short", "Official", &[Some(199), Some(142), Some(284)]);
+        short.tracks.pop();
+        let unknown = pressing("unknown", "Official", &[Some(199), None, Some(284)]);
+        let off = pressing("off", "Official", &[Some(190), Some(142), Some(284)]);
+        let pressings = vec![shuffled, short, unknown, off];
+        let tracks = wanted([Some(199.0), Some(142.0), None]);
+        assert!(best_matching_pressing(&tracks, &pressings, "current", 5.0).is_none());
+
+        // A track nobody has measured yet may lack a length.
+        let gaps = vec![pressing("gaps", "Official", &[Some(199), Some(142), None])];
+        let best = best_matching_pressing(&tracks, &gaps, "current", 5.0).unwrap();
+        assert_eq!(best.mbid, "gaps");
+
+        // Nothing observed: nothing to match against.
+        assert!(best_matching_pressing(&wanted([None, None, None]), &gaps, "x", 5.0).is_none());
     }
 }

@@ -871,7 +871,7 @@ impl SettingsForm {
             field(
                 SettingKey::NormalizeLoudness,
                 "Normalize loudness",
-                "-16 LUFS · two-pass",
+                "-16 LUFS · album gain",
                 if config.normalize_loudness {
                     "on"
                 } else {

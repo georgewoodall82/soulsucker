@@ -1,9 +1,13 @@
-//! Two-pass EBU R128 loudness normalization and FLAC/MP3 output.
+//! Album-wide EBU R128 loudness normalization and FLAC/MP3 output.
 //!
-//! Pass one measures the input and writes JSON stats. Pass two applies those
-//! measurements in linear mode when possible, with a true-peak ceiling. The
-//! output is written to a temporary file beside the source and only promoted
-//! after the whole encode succeeds.
+//! Every verified track is measured on its own (integrated loudness and true
+//! peak). Once the whole album is in, [`album_gain`] turns those measurements
+//! into one gain, and [`process_file`] applies that same linear gain to every
+//! track. A single static gain keeps the balance between tracks and leaves
+//! gapless transitions seamless; a per-track gain or limiter would make the
+//! level jump where songs run into each other. The output is written to a
+//! temporary file beside the source and only promoted after the whole encode
+//! succeeds.
 //!
 //! FLAC output is lossless. MP3 output is 320 kbps CBR, encoded with the
 //! bundled LAME library; FFmpeg still handles decoding, resampling, channel
@@ -22,7 +26,7 @@ use ffmpeg::codec::capabilities::Capabilities;
 use ffmpeg::format::Sample;
 use ffmpeg::{ChannelLayout, Rational, codec, filter, format, frame, media};
 use ffmpeg_next as ffmpeg;
-use mp3lame_encoder::{Bitrate, Builder, FlushNoGap, InterleavedPcm, Quality, VbrMode};
+use mp3lame_encoder::{Bitrate, Builder, FlushGap, InterleavedPcm, Quality, VbrMode};
 use serde::Deserialize;
 
 use crate::config::AudioQuality;
@@ -36,6 +40,9 @@ pub const TARGET_TRUE_PEAK_DB: f64 = -1.5;
 pub const TARGET_LRA: f64 = 11.0;
 /// MP3 output bitrate.
 pub const MP3_BITRATE_KBPS: u32 = 320;
+/// Sanity bounds for the album gain, in dB, in case of bogus measurements.
+const MAX_ALBUM_CUT_DB: f64 = -30.0;
+const MAX_ALBUM_BOOST_DB: f64 = 30.0;
 
 static INIT: Once = Once::new();
 
@@ -51,34 +58,81 @@ fn init() {
 struct LoudnormStats {
     input_i: String,
     input_tp: String,
-    input_lra: String,
-    input_thresh: String,
-    target_offset: String,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Measured {
-    input_i: f64,
-    input_tp: f64,
-    input_lra: f64,
-    input_thresh: f64,
-    target_offset: f64,
+/// One track's loudness, measured before any processing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Loudness {
+    /// Integrated loudness, LUFS.
+    pub integrated: f64,
+    /// True peak, dBTP.
+    pub true_peak: f64,
+    /// Track length in seconds; weights the track in the album loudness.
+    pub duration_secs: f64,
+}
+
+/// The single gain applied to every track of an album.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AlbumGain {
+    pub gain_db: f64,
+    /// Album integrated loudness before the gain, LUFS.
+    pub integrated: f64,
+    /// Loudest true peak on the album before the gain, dBTP.
+    pub true_peak: f64,
 }
 
 impl LoudnormStats {
-    fn measured(self) -> Result<Measured> {
-        let measured = Measured {
-            input_i: parse_measurement("input_i", &self.input_i)?,
-            input_tp: parse_measurement("input_tp", &self.input_tp)?,
-            input_lra: parse_measurement("input_lra", &self.input_lra)?,
-            input_thresh: parse_measurement("input_thresh", &self.input_thresh)?,
-            target_offset: parse_measurement("target_offset", &self.target_offset)?,
-        };
-        if measured.input_i <= -70.0 {
-            bail!("track is too quiet to normalize");
+    fn measured(self) -> Result<(f64, f64)> {
+        let integrated = parse_measurement("input_i", &self.input_i)?;
+        let true_peak = parse_measurement("input_tp", &self.input_tp)?;
+        if integrated <= -70.0 {
+            bail!("track is too quiet to measure");
         }
-        Ok(measured)
+        Ok((integrated, true_peak))
     }
+}
+
+/// One gain for the whole album: bring the album's integrated loudness to
+/// [`TARGET_LUFS`], unless that would push the loudest true peak above
+/// [`TARGET_TRUE_PEAK_DB`]. No limiter is used, so a single peaky track can
+/// leave the album a little below the target rather than squash it.
+///
+/// Album loudness is the duration-weighted energy mean of the tracks' gated
+/// integrated loudness, a close approximation of measuring the album as one
+/// stream. Returns `None` when no track could be measured.
+pub fn album_gain(tracks: &[Loudness]) -> Option<AlbumGain> {
+    let measured: Vec<&Loudness> = tracks
+        .iter()
+        .filter(|track| {
+            track.integrated.is_finite()
+                && track.integrated > -70.0
+                && track.true_peak.is_finite()
+                && track.duration_secs.is_finite()
+                && track.duration_secs > 0.0
+        })
+        .collect();
+    if measured.is_empty() {
+        return None;
+    }
+    let total: f64 = measured.iter().map(|track| track.duration_secs).sum();
+    let energy: f64 = measured
+        .iter()
+        .map(|track| track.duration_secs * 10f64.powf(track.integrated / 10.0))
+        .sum::<f64>()
+        / total;
+    let integrated = 10.0 * energy.log10();
+    let true_peak = measured
+        .iter()
+        .map(|track| track.true_peak)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let gain_db = (TARGET_LUFS - integrated)
+        .min(TARGET_TRUE_PEAK_DB - true_peak)
+        .clamp(MAX_ALBUM_CUT_DB, MAX_ALBUM_BOOST_DB);
+    Some(AlbumGain {
+        gain_db,
+        integrated,
+        true_peak,
+    })
 }
 
 fn parse_measurement(name: &str, value: &str) -> Result<f64> {
@@ -105,25 +159,52 @@ pub fn source_compatible(path: &Path, quality: AudioQuality) -> bool {
     }
 }
 
-/// Whether the verified source needs a second pass before it can be saved.
-pub fn needs_processing(path: &Path, quality: AudioQuality, normalize: bool) -> bool {
-    source_compatible(path, quality) && (normalize || (quality.is_mp3() && !source_is_mp3(path)))
+/// Whether the source is in the wrong format for the selected quality.
+pub fn needs_conversion(path: &Path, quality: AudioQuality) -> bool {
+    quality.is_mp3() && !source_is_mp3(path)
 }
 
 pub fn processing_phase(path: &Path, quality: AudioQuality, normalize: bool) -> &'static str {
-    match (quality.is_mp3(), source_is_mp3(path), normalize) {
-        (true, false, true) => "normalizing and converting to MP3 320 (two-pass)…",
-        (true, false, false) => "converting to MP3 320…",
-        (_, _, true) => "normalizing loudness (two-pass)…",
+    match (needs_conversion(path, quality), normalize) {
+        (true, true) => "applying album gain and converting to MP3 320…",
+        (true, false) => "converting to MP3 320…",
+        (false, true) => "applying album gain…",
         _ => "preparing audio…",
     }
 }
 
-/// Normalize and/or convert a verified file, returning the temporary output.
+/// Measure a track's integrated loudness and true peak (one decode pass).
+pub fn measure_loudness(path: &Path) -> Result<Loudness> {
+    init();
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent folder", path.display()))?;
+    let stats_path = parent.join(format!(".{}.json", temp_stem()));
+    let result = measure(path, &stats_path);
+    let _ = fs::remove_file(&stats_path);
+    let (integrated, true_peak) = result?;
+    let duration_secs = crate::audio::duration_secs(path)?;
+    Ok(Loudness {
+        integrated,
+        true_peak,
+        duration_secs,
+    })
+}
+
+fn temp_stem() -> String {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("soulsucker-audio-{}-{nonce}", std::process::id())
+}
+
+/// Apply a gain and/or convert a verified file, returning the temporary
+/// output.
 ///
 /// The source is left untouched. The caller owns the returned file and should
 /// either promote it or delete it.
-pub fn process_file(path: &Path, quality: AudioQuality, normalize: bool) -> Result<PathBuf> {
+pub fn process_file(path: &Path, quality: AudioQuality, gain_db: Option<f64>) -> Result<PathBuf> {
     init();
     if !path.is_file() {
         bail!("{} is not a file", path.display());
@@ -138,36 +219,33 @@ pub fn process_file(path: &Path, quality: AudioQuality, normalize: bool) -> Resu
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("{} has no parent folder", path.display()))?;
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let stem = format!("soulsucker-audio-{}-{nonce}", std::process::id());
-    let stats_path = parent.join(format!(".{stem}.json"));
-    let output = parent.join(format!(".{stem}.{}", quality.extension()));
+    let output = parent.join(format!(".{}.{}", temp_stem(), quality.extension()));
+    let filter = gain_filter(gain_db);
 
     let result = (|| {
-        let measured = if normalize {
-            Some(measure(path, &stats_path)?)
-        } else {
-            None
-        };
         match quality {
-            AudioQuality::Flac => apply_flac(path, &output, measured)?,
-            AudioQuality::Mp3 => apply_mp3(path, &output, measured)?,
+            AudioQuality::Flac => apply_flac(path, &output, filter.as_deref())?,
+            AudioQuality::Mp3 => apply_mp3(path, &output, filter.as_deref())?,
         }
         crate::audio::copy_pictures(path, &output)
             .context("could not preserve embedded cover art")?;
         Ok(output.clone())
     })();
-    let _ = fs::remove_file(&stats_path);
     if result.is_err() {
         let _ = fs::remove_file(&output);
     }
     result
 }
 
-fn measure(input: &Path, stats_path: &Path) -> Result<Measured> {
+/// A static linear gain. `volume` keeps no state across samples, so tracks
+/// that run into each other still join seamlessly.
+fn gain_filter(gain_db: Option<f64>) -> Option<String> {
+    gain_db
+        .filter(|gain| gain.is_finite() && gain.abs() >= 0.005)
+        .map(|gain| format!("volume={gain:.2}dB:precision=double"))
+}
+
+fn measure(input: &Path, stats_path: &Path) -> Result<(f64, f64)> {
     let mut ictx =
         format::input(input).with_context(|| format!("could not open {}", input.display()))?;
     let stream = ictx
@@ -180,15 +258,21 @@ fn measure(input: &Path, stats_path: &Path) -> Result<Measured> {
         .audio()?;
     decoder.set_parameters(stream.parameters())?;
 
-    let spec =
-        format!("I={TARGET_LUFS}:TP={TARGET_TRUE_PEAK_DB}:LRA={TARGET_LRA}:print_format=json");
+    // loudnorm's first pass only measures; its output frames are discarded.
+    let spec = format!(
+        "loudnorm=I={TARGET_LUFS}:TP={TARGET_TRUE_PEAK_DB}:LRA={TARGET_LRA}:print_format=json:stats_file={}",
+        escape_filter_value(
+            stats_path
+                .to_str()
+                .ok_or_else(|| anyhow!("the stats path is not valid UTF-8"))?
+        )
+    );
     let mut graph = build_graph(
         &decoder,
         decoder.format(),
         decoder.rate(),
         decoder.channel_layout(),
         Some(&spec),
-        Some(stats_path),
     )?;
 
     run_decode(
@@ -207,19 +291,7 @@ fn measure(input: &Path, stats_path: &Path) -> Result<Measured> {
     stats.measured()
 }
 
-fn loudnorm_apply_args(measured: Measured) -> String {
-    format!(
-        "I={TARGET_LUFS}:TP={TARGET_TRUE_PEAK_DB}:LRA={TARGET_LRA}:\
-         measured_I={}:measured_TP={}:measured_LRA={}:measured_thresh={}:offset={}:linear=true",
-        measured.input_i,
-        measured.input_tp,
-        measured.input_lra,
-        measured.input_thresh,
-        measured.target_offset,
-    )
-}
-
-fn apply_flac(input: &Path, output: &Path, measured: Option<Measured>) -> Result<()> {
+fn apply_flac(input: &Path, output: &Path, filter: Option<&str>) -> Result<()> {
     let mut ictx =
         format::input(input).with_context(|| format!("could not reopen {}", input.display()))?;
     let stream = ictx
@@ -269,15 +341,7 @@ fn apply_flac(input: &Path, output: &Path, measured: Option<Measured>) -> Result
         out_time_base = out_stream.time_base();
     }
 
-    let spec = measured.map(loudnorm_apply_args);
-    let mut graph = build_graph(
-        &decoder,
-        sample_format,
-        sample_rate,
-        layout,
-        spec.as_deref(),
-        None,
-    )?;
+    let mut graph = build_graph(&decoder, sample_format, sample_rate, layout, filter)?;
     if let Some(codec) = encoder.codec()
         && !codec
             .capabilities()
@@ -312,7 +376,7 @@ fn apply_flac(input: &Path, output: &Path, measured: Option<Measured>) -> Result
     Ok(())
 }
 
-fn apply_mp3(input: &Path, output: &Path, measured: Option<Measured>) -> Result<()> {
+fn apply_mp3(input: &Path, output: &Path, filter: Option<&str>) -> Result<()> {
     let mut ictx =
         format::input(input).with_context(|| format!("could not reopen {}", input.display()))?;
     let stream = ictx
@@ -336,14 +400,12 @@ fn apply_mp3(input: &Path, output: &Path, measured: Option<Measured>) -> Result<
     } else {
         ChannelLayout::STEREO
     };
-    let spec = measured.map(loudnorm_apply_args);
     let mut graph = build_graph(
         &decoder,
         Sample::I16(format::sample::Type::Packed),
         sample_rate,
         layout,
-        spec.as_deref(),
-        None,
+        filter,
     )?;
     let mut sink = Mp3Sink::new(sample_rate, channels)?;
     run_decode(
@@ -433,36 +495,55 @@ impl Mp3Sink {
     }
 
     fn finish(mut self, output: &Path) -> Result<()> {
-        self.frames
-            .reserve(mp3lame_encoder::max_required_buffer_size(
-                1152 * self.channels,
-            ));
-        let written = self
-            .encoder
-            .flush::<FlushNoGap>(self.frames.spare_capacity_mut())
+        // A full flush encodes LAME's buffered tail and records the end
+        // padding in the LAME tag. `FlushNoGap` is for chaining streams: it
+        // leaves the last PCM samples unencoded and writes zero padding.
+        self.frames.reserve(
+            mp3lame_encoder::max_required_buffer_size(1152 * self.channels).max(MP3_FLUSH_BYTES),
+        );
+        self.encoder
+            .flush_to_vec::<FlushGap>(&mut self.frames)
             .map_err(|err| anyhow!("could not finish the MP3 stream: {err}"))?;
-        let length = self.frames.len();
-        unsafe {
-            self.frames.set_len(length + written);
-        }
 
-        let mut file = File::create(output)
-            .with_context(|| format!("could not create {}", output.display()))?;
         let tag_size = self.encoder.lame_tag_size();
         if tag_size > 0 {
             let mut tag = vec![MaybeUninit::uninit(); tag_size];
             if let Some(written) = self.encoder.lame_tag_encode(&mut tag) {
-                let bytes =
+                let tag =
                     unsafe { std::slice::from_raw_parts(tag.as_ptr() as *const u8, written.get()) };
-                file.write_all(bytes)
-                    .context("could not write the MP3 header")?;
+                install_lame_tag(&mut self.frames, tag)?;
             }
         }
+
+        let mut file = File::create(output)
+            .with_context(|| format!("could not create {}", output.display()))?;
         file.write_all(&self.frames)
             .context("could not write the MP3 audio")?;
         file.sync_all().context("could not sync the MP3 file")?;
         Ok(())
     }
+}
+
+/// LAME's documented minimum buffer for a final flush.
+const MP3_FLUSH_BYTES: usize = 7200;
+
+/// LAME reserves the first frame of the stream as an all-zero placeholder for
+/// its Xing/LAME tag. The finished tag (encoder delay, padding, frame count)
+/// must overwrite that frame. Prepending it instead leaves the blank frame in
+/// the audio, which players decode as an extra frame of silence and which
+/// throws off gapless trimming.
+fn install_lame_tag(frames: &mut [u8], tag: &[u8]) -> Result<()> {
+    let placeholder = frames
+        .get(..tag.len())
+        .ok_or_else(|| anyhow!("the MP3 stream is shorter than its LAME tag"))?;
+    if tag.len() < 4 || placeholder[0] != 0xFF || placeholder[1] & 0xE0 != 0xE0 {
+        bail!("the MP3 stream does not start with a LAME tag placeholder");
+    }
+    if placeholder[4..].iter().any(|&byte| byte != 0) {
+        bail!("the first MP3 frame is not an empty LAME tag placeholder");
+    }
+    frames[..tag.len()].copy_from_slice(tag);
+    Ok(())
 }
 
 fn preferred_sample_format(codec: &codec::audio::Audio, preferred: Sample) -> Result<Sample> {
@@ -485,8 +566,7 @@ fn build_graph(
     sample_format: Sample,
     sample_rate: u32,
     layout: ChannelLayout,
-    loudnorm_args: Option<&str>,
-    stats_path: Option<&Path>,
+    pre_filter: Option<&str>,
 ) -> Result<filter::Graph> {
     let mut graph = filter::Graph::new();
     let args = format!(
@@ -496,19 +576,6 @@ fn build_graph(
         decoder.format().name(),
         decoder.channel_layout().bits()
     );
-    let loudnorm = match (loudnorm_args, stats_path) {
-        (Some(args), Some(stats_path)) => Some(format!(
-            "{args}:stats_file={}",
-            escape_filter_value(
-                stats_path
-                    .to_str()
-                    .ok_or_else(|| anyhow!("the stats path is not valid UTF-8"))?
-            )
-        )),
-        (Some(args), None) => Some(args.to_string()),
-        (None, Some(_)) => bail!("loudnorm stats requested without a loudnorm filter"),
-        (None, None) => None,
-    };
     graph.add(
         &filter::find("abuffer").ok_or_else(|| anyhow!("FFmpeg has no abuffer filter"))?,
         "in",
@@ -531,8 +598,8 @@ fn build_graph(
         sample_rate,
         layout.bits()
     );
-    let chain = match loudnorm {
-        Some(args) => format!("loudnorm={args},{audio_format}"),
+    let chain = match pre_filter {
+        Some(filter) => format!("{filter},{audio_format}"),
         None => audio_format,
     };
     graph.output("in", 0)?.input("out", 0)?.parse(&chain)?;
@@ -712,12 +779,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let measured = stats.measured().unwrap();
-        assert_eq!(measured.input_i, -27.61);
-        assert_eq!(measured.input_tp, -2.32);
-        assert_eq!(measured.input_lra, 0.70);
-        assert_eq!(measured.input_thresh, -38.83);
-        assert_eq!(measured.target_offset, 0.01);
+        assert_eq!(stats.measured().unwrap(), (-27.61, -2.32));
     }
 
     #[test]
@@ -753,12 +815,69 @@ mod tests {
         assert!(source_compatible(flac, AudioQuality::Mp3));
         assert!(source_compatible(mp3, AudioQuality::Mp3));
 
-        assert!(needs_processing(flac, AudioQuality::Mp3, false));
-        assert!(!needs_processing(mp3, AudioQuality::Mp3, false));
-        assert!(needs_processing(mp3, AudioQuality::Mp3, true));
-        assert!(!needs_processing(flac, AudioQuality::Flac, false));
-        assert!(needs_processing(flac, AudioQuality::Flac, true));
-        assert!(!needs_processing(mp3, AudioQuality::Flac, false));
+        assert!(needs_conversion(flac, AudioQuality::Mp3));
+        assert!(!needs_conversion(mp3, AudioQuality::Mp3));
+        assert!(!needs_conversion(flac, AudioQuality::Flac));
+    }
+
+    fn track(integrated: f64, true_peak: f64, duration_secs: f64) -> Loudness {
+        Loudness {
+            integrated,
+            true_peak,
+            duration_secs,
+        }
+    }
+
+    #[test]
+    fn album_gain_is_one_gain_from_the_duration_weighted_album_loudness() {
+        // Two equal-length tracks 10 dB apart: the album is ~2.6 dB below the
+        // louder one (energy mean), not the arithmetic mean of -25.
+        let gain = album_gain(&[track(-20.0, -10.0, 100.0), track(-30.0, -20.0, 100.0)]).unwrap();
+        assert!((gain.integrated - -22.596).abs() < 0.01, "{gain:?}");
+        assert!((gain.gain_db - (TARGET_LUFS - gain.integrated)).abs() < 1e-9);
+        assert_eq!(gain.true_peak, -10.0);
+
+        // A long quiet track counts for more than a short loud one.
+        let weighted =
+            album_gain(&[track(-20.0, -10.0, 10.0), track(-30.0, -20.0, 300.0)]).unwrap();
+        assert!(weighted.integrated < -28.0, "{weighted:?}");
+    }
+
+    #[test]
+    fn album_gain_never_pushes_the_loudest_peak_over_the_ceiling() {
+        // A quiet album with one peaky track: the boost stops at the ceiling.
+        let gain = album_gain(&[track(-24.0, -3.0, 200.0), track(-24.0, -9.0, 200.0)]).unwrap();
+        assert!(
+            (gain.gain_db - (TARGET_TRUE_PEAK_DB - -3.0)).abs() < 1e-9,
+            "{gain:?}"
+        );
+        // A loud album is turned down, whatever its peaks.
+        let gain = album_gain(&[track(-8.0, 0.5, 200.0)]).unwrap();
+        assert!((gain.gain_db - -8.0).abs() < 1e-9, "{gain:?}");
+    }
+
+    #[test]
+    fn album_gain_ignores_unmeasurable_tracks() {
+        assert!(album_gain(&[]).is_none());
+        assert!(album_gain(&[track(f64::NEG_INFINITY, -70.0, 30.0)]).is_none());
+        let gain = album_gain(&[
+            track(f64::NEG_INFINITY, -70.0, 30.0),
+            track(-16.0, -6.0, 0.0),
+            track(-20.0, -6.0, 120.0),
+        ])
+        .unwrap();
+        assert!((gain.integrated - -20.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn gain_filter_is_a_static_volume_change() {
+        assert_eq!(gain_filter(None), None);
+        assert_eq!(gain_filter(Some(0.0)), None);
+        assert_eq!(gain_filter(Some(f64::NAN)), None);
+        assert_eq!(
+            gain_filter(Some(-3.456)).as_deref(),
+            Some("volume=-3.46dB:precision=double")
+        );
     }
 
     #[test]
@@ -770,5 +889,163 @@ mod tests {
         assert_eq!(mp3_sample_rate(88_200), 44_100);
         assert_eq!(mp3_sample_rate(96_000), 48_000);
         assert_eq!(mp3_sample_rate(192_000), 48_000);
+    }
+
+    fn write_tone_wav(path: &Path, rate: u32, frames: u32) {
+        let channels = 2u16;
+        let data_len = frames * u32::from(channels) * 2;
+        // WAVE_FORMAT_EXTENSIBLE with a front-left/right mask, so FFmpeg
+        // reports a stereo layout like it does for real FLAC/MP3 sources.
+        let mut bytes = Vec::with_capacity(68 + data_len as usize);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(60 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&40u32.to_le_bytes());
+        bytes.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        bytes.extend_from_slice(&channels.to_le_bytes());
+        bytes.extend_from_slice(&rate.to_le_bytes());
+        bytes.extend_from_slice(&(rate * u32::from(channels) * 2).to_le_bytes());
+        bytes.extend_from_slice(&(channels * 2).to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(&22u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(&0x3u32.to_le_bytes());
+        // KSDATAFORMAT_SUBTYPE_PCM
+        bytes.extend_from_slice(&[
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38,
+            0x9B, 0x71,
+        ]);
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        for frame in 0..frames {
+            let t = frame as f32 / rate as f32;
+            // Start at full amplitude so leading silence is easy to spot.
+            let sample =
+                ((t * 440.0 * std::f32::consts::TAU).cos() * 0.25 * i16::MAX as f32) as i16;
+            for _ in 0..channels {
+                bytes.extend_from_slice(&sample.to_le_bytes());
+            }
+        }
+        fs::write(path, bytes).unwrap();
+    }
+
+    /// Decode a file the way a gapless player would (honoring the LAME
+    /// delay/padding) and return its sample count and first samples.
+    fn decode_samples(path: &Path) -> (u64, Vec<i16>) {
+        init();
+        let mut ictx = format::input(path).unwrap();
+        let stream = ictx.streams().best(media::Type::Audio).unwrap();
+        let index = stream.index();
+        let mut decoder = codec::context::Context::from_parameters(stream.parameters())
+            .unwrap()
+            .decoder()
+            .audio()
+            .unwrap();
+        let mut total = 0u64;
+        let mut head = Vec::new();
+        let mut decoded = frame::Audio::empty();
+        let take = |decoded: &frame::Audio, total: &mut u64, head: &mut Vec<i16>| {
+            *total += decoded.samples() as u64;
+            if head.len() < 64 && decoded.samples() > 0 {
+                match decoded.format() {
+                    Sample::F32(format::sample::Type::Planar) => {
+                        head.extend(
+                            decoded
+                                .plane::<f32>(0)
+                                .iter()
+                                .take(64)
+                                .map(|v| (v * 32767.0) as i16),
+                        );
+                    }
+                    Sample::I16(format::sample::Type::Planar) => {
+                        head.extend(decoded.plane::<i16>(0).iter().take(64));
+                    }
+                    other => panic!("unexpected decoder format {other:?}"),
+                }
+            }
+        };
+        for (stream, packet) in ictx.packets() {
+            if stream.index() != index {
+                continue;
+            }
+            decoder.send_packet(&packet).unwrap();
+            while decoder.receive_frame(&mut decoded).is_ok() {
+                take(&decoded, &mut total, &mut head);
+            }
+        }
+        decoder.send_eof().unwrap();
+        while decoder.receive_frame(&mut decoded).is_ok() {
+            take(&decoded, &mut total, &mut head);
+        }
+        (total, head)
+    }
+
+    #[test]
+    fn mp3_output_is_sample_exact_for_gapless_playback() {
+        init();
+        let dir = std::env::temp_dir().join(format!("soulsucker-gapless-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("tone.wav");
+        let mp3 = dir.join("tone.mp3");
+        // Deliberately not a multiple of the 1152-sample MP3 frame.
+        let frames = 44_100 + 777;
+        write_tone_wav(&wav, 44_100, frames);
+
+        apply_mp3(&wav, &mp3, None).unwrap();
+
+        let bytes = fs::read(&mp3).unwrap();
+        let first_frame = 144 * 320_000 / 44_100;
+        assert!(
+            bytes[..first_frame + 1].windows(4).any(|w| w == b"Info"),
+            "the first frame must carry the LAME tag"
+        );
+        assert!(
+            !bytes[first_frame..first_frame + 8]
+                .windows(1)
+                .all(|w| w[0] == 0)
+                && bytes[first_frame] == 0xFF,
+            "the LAME placeholder frame must be replaced, not left behind the tag"
+        );
+
+        let (decoded, head) = decode_samples(&mp3);
+        assert_eq!(
+            decoded,
+            u64::from(frames),
+            "encoder delay and padding must trim back to the source length"
+        );
+        assert!(
+            head.iter().take(8).any(|&sample| sample.abs() > 1000),
+            "audio must start immediately, without a frame of silence"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn album_gain_changes_measured_loudness_by_exactly_the_gain() {
+        init();
+        let dir = std::env::temp_dir().join(format!("soulsucker-gain-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("tone.wav");
+        let flac = dir.join("tone.flac");
+        write_tone_wav(&wav, 44_100, 44_100 * 3);
+        apply_flac(&wav, &flac, None).unwrap();
+
+        let before = measure_loudness(&flac).unwrap();
+        assert!((before.duration_secs - 3.0).abs() < 0.01, "{before:?}");
+        let processed = process_file(&flac, AudioQuality::Flac, Some(-6.0)).unwrap();
+        let renamed = dir.join("quieter.flac");
+        fs::rename(&processed, &renamed).unwrap();
+        let after = measure_loudness(&renamed).unwrap();
+
+        assert!(
+            (after.integrated - (before.integrated - 6.0)).abs() < 0.1,
+            "{before:?} -> {after:?}"
+        );
+        assert!(
+            (after.true_peak - (before.true_peak - 6.0)).abs() < 0.2,
+            "{before:?} -> {after:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

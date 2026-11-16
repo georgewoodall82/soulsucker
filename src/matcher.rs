@@ -92,10 +92,29 @@ pub struct CandidateOptions {
     pub quality: AudioQuality,
 }
 
+/// One peer's copy of the whole album: a single folder (disc subfolders such
+/// as `CD1`/`CD2` count as one folder) with a file for every needed track.
+/// Taking every track from one rip keeps gapless transitions intact; mixing
+/// rips of different masters can cut or repeat audio between tracks.
+#[derive(Debug, Clone)]
+pub struct AlbumSource {
+    pub username: String,
+    /// The album folder on the peer, as the peer shared it.
+    pub folder: String,
+    /// One file per track, in track order. `None` only for tracks that were
+    /// not needed (already on disk).
+    pub files: Vec<Option<Candidate>>,
+    pub average_score: f64,
+    pub free_slot: bool,
+    pub user_speed: u32,
+}
+
 #[derive(Debug, Clone)]
 struct PreparedFile {
     username: String,
     path: String,
+    /// The album folder: the parent folder, or its parent for disc folders.
+    album_root: String,
     size: u64,
     duration_secs: Option<u32>,
     free_slot: bool,
@@ -107,15 +126,166 @@ struct PreparedFile {
     file_disc: Option<u32>,
 }
 
+struct FileMatch {
+    track: usize,
+    file: usize,
+    score: f64,
+    duration_distance: f64,
+}
+
 /// Build a ranked source list for every track from one pooled Soulseek search.
 pub fn build_candidates(
     tracks: &[TrackQuery],
     hits: &[SearchHit],
     options: &CandidateOptions,
 ) -> Vec<Vec<Candidate>> {
-    let artist_tokens = token_set(&normalize_text(&options.artist));
-    let album_tokens = token_set(&normalize_text(&options.album));
+    let prepared = prepare_files(hits, options);
+    let matches = score_matches(tracks, &prepared, options);
 
+    let mut per_track: Vec<Vec<Candidate>> = tracks.iter().map(|_| Vec::new()).collect();
+    let mut assigned: Vec<Option<usize>> = vec![None; prepared.len()];
+    let mut per_user: Vec<HashMap<String, usize>> = tracks.iter().map(|_| HashMap::new()).collect();
+
+    for candidate in matches {
+        if assigned[candidate.file].is_some()
+            || per_track[candidate.track].len() >= options.per_track.max(1)
+        {
+            continue;
+        }
+        let file = &prepared[candidate.file];
+        let count = per_user[candidate.track]
+            .entry(file.username.clone())
+            .or_default();
+        if *count >= MAX_FILES_PER_USER_PER_TRACK {
+            continue;
+        }
+        *count += 1;
+        assigned[candidate.file] = Some(candidate.track);
+        per_track[candidate.track].push(file.candidate(candidate.score));
+    }
+
+    for (track, candidates) in tracks.iter().zip(per_track.iter_mut()) {
+        candidates.sort_by(|a, b| {
+            let score_a = (a.match_score * 100.0).round() as i32;
+            let score_b = (b.match_score * 100.0).round() as i32;
+            let duration_a = duration_distance(track.expected_secs, a.duration_secs);
+            let duration_b = duration_distance(track.expected_secs, b.duration_secs);
+            score_b
+                .cmp(&score_a)
+                .then_with(|| {
+                    let a_mp3 = SourceFormat::from_path(&a.path) == Some(SourceFormat::Mp3);
+                    let b_mp3 = SourceFormat::from_path(&b.path) == Some(SourceFormat::Mp3);
+                    b_mp3.cmp(&a_mp3)
+                })
+                .then_with(|| b.free_slot.cmp(&a.free_slot))
+                .then_with(|| b.user_speed.cmp(&a.user_speed))
+                .then_with(|| {
+                    duration_a
+                        .partial_cmp(&duration_b)
+                        .unwrap_or(Ordering::Equal)
+                })
+                .then_with(|| b.size.cmp(&a.size))
+        });
+    }
+
+    per_track
+}
+
+/// Find peers sharing the whole album in one folder, best first.
+///
+/// `needed[i]` marks the tracks that still have to be downloaded; a source
+/// must have a matching file for every one of them. At most
+/// `options.per_track` sources are returned, since each is checked by
+/// downloading a track.
+pub fn build_album_sources(
+    tracks: &[TrackQuery],
+    needed: &[bool],
+    hits: &[SearchHit],
+    options: &CandidateOptions,
+) -> Vec<AlbumSource> {
+    let prepared = prepare_files(hits, options);
+    let matches = score_matches(tracks, &prepared, options);
+
+    // Group by peer and album folder, preserving the global best-first order
+    // inside each group so assignment matches build_candidates.
+    let mut groups: HashMap<(&str, &str), Vec<&FileMatch>> = HashMap::new();
+    for candidate in &matches {
+        let file = &prepared[candidate.file];
+        groups
+            .entry((file.username.as_str(), file.album_root.as_str()))
+            .or_default()
+            .push(candidate);
+    }
+
+    let mut sources = Vec::new();
+    for ((username, _), group) in groups {
+        let mut files: Vec<Option<Candidate>> = vec![None; tracks.len()];
+        let mut used: HashSet<usize> = HashSet::new();
+        for candidate in group {
+            if files[candidate.track].is_some() || !used.insert(candidate.file) {
+                continue;
+            }
+            files[candidate.track] = Some(prepared[candidate.file].candidate(candidate.score));
+        }
+        let complete = tracks.iter().enumerate().all(|(index, _)| {
+            !needed.get(index).copied().unwrap_or(true) || files[index].is_some()
+        });
+        let needed_count = needed.iter().filter(|needed| **needed).count();
+        if !complete || needed_count == 0 {
+            continue;
+        }
+        let scores: Vec<f64> = files
+            .iter()
+            .zip(needed)
+            .filter(|(_, needed)| **needed)
+            .filter_map(|(file, _)| file.as_ref().map(|file| file.match_score))
+            .collect();
+        let average_score = scores.iter().sum::<f64>() / scores.len().max(1) as f64;
+        let first = files.iter().flatten().next().cloned();
+        let Some(first) = first else {
+            continue;
+        };
+        let folder = album_root(&first.path).to_string();
+        sources.push(AlbumSource {
+            username: username.to_string(),
+            folder,
+            files,
+            average_score,
+            free_slot: first.free_slot,
+            user_speed: first.user_speed,
+        });
+    }
+
+    let mp3_share = |source: &AlbumSource| {
+        let files: Vec<&Candidate> = source.files.iter().flatten().collect();
+        let mp3 = files
+            .iter()
+            .filter(|file| SourceFormat::from_path(&file.path) == Some(SourceFormat::Mp3))
+            .count();
+        (mp3 * 100 / files.len().max(1)) as i32
+    };
+    sources.sort_by(|a, b| {
+        let score_a = (a.average_score * 100.0).round() as i32;
+        let score_b = (b.average_score * 100.0).round() as i32;
+        score_b
+            .cmp(&score_a)
+            .then_with(|| {
+                if options.quality.is_mp3() {
+                    mp3_share(b).cmp(&mp3_share(a))
+                } else {
+                    Ordering::Equal
+                }
+            })
+            .then_with(|| b.free_slot.cmp(&a.free_slot))
+            .then_with(|| b.user_speed.cmp(&a.user_speed))
+            .then_with(|| a.username.cmp(&b.username))
+            .then_with(|| a.folder.cmp(&b.folder))
+    });
+    sources.truncate(options.per_track.max(1));
+    sources
+}
+
+fn prepare_files(hits: &[SearchHit], options: &CandidateOptions) -> Vec<PreparedFile> {
     let mut prepared: Vec<PreparedFile> = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();
     for hit in hits {
@@ -147,6 +317,8 @@ pub fn build_candidates(
 
             let raw_stem = stem(base);
             let (file_disc, file_track) = leading_track_number(raw_stem);
+            // "Album/CD2/01 - Song.flac" carries its disc in the folder name.
+            let file_disc = file_disc.or_else(|| folder_disc_number(&file.path));
             let clean_stem = strip_release_noise(raw_stem);
             let stem_norm = normalize_text(&clean_stem);
             if stem_norm.is_empty() {
@@ -157,6 +329,7 @@ pub fn build_candidates(
             prepared.push(PreparedFile {
                 username: hit.username.clone(),
                 path: file.path.clone(),
+                album_root: album_root(&file.path).to_lowercase(),
                 size: file.size,
                 duration_secs: file.duration_secs.filter(|seconds| *seconds > 0),
                 free_slot: hit.free_slot,
@@ -169,13 +342,17 @@ pub fn build_candidates(
             });
         }
     }
+    prepared
+}
 
-    struct FileMatch {
-        track: usize,
-        file: usize,
-        score: f64,
-        duration_distance: f64,
-    }
+/// Score every file against every track, best match first.
+fn score_matches(
+    tracks: &[TrackQuery],
+    prepared: &[PreparedFile],
+    options: &CandidateOptions,
+) -> Vec<FileMatch> {
+    let artist_tokens = token_set(&normalize_text(&options.artist));
+    let album_tokens = token_set(&normalize_text(&options.album));
 
     // Score every file against every track first. Assigning greedily per track
     // in album order lets an earlier track consume a similarly named later
@@ -252,61 +429,75 @@ pub fn build_candidates(
             .then_with(|| a.file.cmp(&b.file))
             .then_with(|| a.track.cmp(&b.track))
     });
-    let mut per_track: Vec<Vec<Candidate>> = tracks.iter().map(|_| Vec::new()).collect();
-    let mut assigned: Vec<Option<usize>> = vec![None; prepared.len()];
-    let mut per_user: Vec<HashMap<String, usize>> = tracks.iter().map(|_| HashMap::new()).collect();
+    matches
+}
 
-    for candidate in matches {
-        if assigned[candidate.file].is_some()
-            || per_track[candidate.track].len() >= options.per_track.max(1)
-        {
-            continue;
+impl PreparedFile {
+    fn candidate(&self, match_score: f64) -> Candidate {
+        Candidate {
+            username: self.username.clone(),
+            path: self.path.clone(),
+            size: self.size,
+            duration_secs: self.duration_secs,
+            match_score,
+            free_slot: self.free_slot,
+            user_speed: self.user_speed,
         }
-        let file = &prepared[candidate.file];
-        let count = per_user[candidate.track]
-            .entry(file.username.clone())
-            .or_default();
-        if *count >= MAX_FILES_PER_USER_PER_TRACK {
-            continue;
+    }
+}
+
+/// The folders of a remote path, without the filename.
+fn remote_folders(path: &str) -> Vec<&str> {
+    let mut parts: Vec<&str> = path.split(['/', '\\']).collect();
+    parts.pop();
+    parts
+}
+
+/// The disc number a folder such as `CD2`, `Disc 2` or `The Wall (Disc 2)`
+/// names, if any.
+fn disc_folder_number(folder: &str) -> Option<u32> {
+    let normalized = normalize_text(folder);
+    let tokens: Vec<&str> = normalized.split_whitespace().collect();
+    for (index, token) in tokens.iter().enumerate() {
+        for prefix in ["cd", "disc", "disk"] {
+            if *token == prefix {
+                if let Some(number) = tokens.get(index + 1).and_then(|next| next.parse().ok())
+                    && (1..=99).contains(&number)
+                {
+                    return Some(number);
+                }
+            } else if let Some(rest) = token.strip_prefix(prefix)
+                && let Ok(number) = rest.parse::<u32>()
+                && (1..=99).contains(&number)
+            {
+                return Some(number);
+            }
         }
-        *count += 1;
-        assigned[candidate.file] = Some(candidate.track);
-        per_track[candidate.track].push(Candidate {
-            username: file.username.clone(),
-            path: file.path.clone(),
-            size: file.size,
-            duration_secs: file.duration_secs,
-            match_score: candidate.score,
-            free_slot: file.free_slot,
-            user_speed: file.user_speed,
-        });
     }
+    None
+}
 
-    for (track, candidates) in tracks.iter().zip(per_track.iter_mut()) {
-        candidates.sort_by(|a, b| {
-            let score_a = (a.match_score * 100.0).round() as i32;
-            let score_b = (b.match_score * 100.0).round() as i32;
-            let duration_a = duration_distance(track.expected_secs, a.duration_secs);
-            let duration_b = duration_distance(track.expected_secs, b.duration_secs);
-            score_b
-                .cmp(&score_a)
-                .then_with(|| {
-                    let a_mp3 = SourceFormat::from_path(&a.path) == Some(SourceFormat::Mp3);
-                    let b_mp3 = SourceFormat::from_path(&b.path) == Some(SourceFormat::Mp3);
-                    b_mp3.cmp(&a_mp3)
-                })
-                .then_with(|| b.free_slot.cmp(&a.free_slot))
-                .then_with(|| b.user_speed.cmp(&a.user_speed))
-                .then_with(|| {
-                    duration_a
-                        .partial_cmp(&duration_b)
-                        .unwrap_or(Ordering::Equal)
-                })
-                .then_with(|| b.size.cmp(&a.size))
-        });
-    }
+fn folder_disc_number(path: &str) -> Option<u32> {
+    remote_folders(path)
+        .last()
+        .and_then(|folder| disc_folder_number(folder))
+}
 
-    per_track
+/// The album folder of a remote file: its parent folder, or the parent's
+/// parent when the file sits in a disc folder (`Album/CD1/01 - Song.flac`).
+pub(crate) fn album_root(path: &str) -> &str {
+    let folders = remote_folders(path);
+    let depth = if folders.len() >= 2
+        && folders
+            .last()
+            .is_some_and(|folder| disc_folder_number(folder).is_some())
+    {
+        folders.len() - 1
+    } else {
+        folders.len()
+    };
+    let length: usize = folders[..depth].iter().map(|part| part.len() + 1).sum();
+    &path[..length.saturating_sub(1)]
 }
 
 fn allowed_duration_drift(expected: f64, tolerance: f64) -> f64 {
@@ -562,6 +753,7 @@ mod tests {
         let f = PreparedFile {
             username: "u".into(),
             path: "x\\Metallica - Ride the Lightning - 01 - Fight Fire With Fire.flac".into(),
+            album_root: "x".into(),
             size: 30_000_000,
             duration_secs: Some(285),
             free_slot: true,
@@ -588,6 +780,7 @@ mod tests {
         let f = PreparedFile {
             username: "u".into(),
             path: "someone.flac".into(),
+            album_root: String::new(),
             size: 20_000_000,
             duration_secs: None,
             free_slot: true,
@@ -949,5 +1142,157 @@ mod tests {
         };
         let out = build_candidates(&tracks, &hits, &options);
         assert_eq!(out[0].len(), 30);
+    }
+
+    fn timed(path: &str, size: u64, secs: u32) -> RemoteFile {
+        RemoteFile {
+            path: path.to_string(),
+            size,
+            duration_secs: Some(secs),
+            bitrate_kbps: None,
+        }
+    }
+
+    fn wall_tracks() -> Vec<TrackQuery> {
+        vec![
+            TrackQuery {
+                disc: 1,
+                position: 1,
+                title: "In the Flesh?".into(),
+                expected_secs: Some(199.0),
+            },
+            TrackQuery {
+                disc: 1,
+                position: 2,
+                title: "The Thin Ice".into(),
+                expected_secs: Some(150.0),
+            },
+            TrackQuery {
+                disc: 2,
+                position: 1,
+                title: "Hey You".into(),
+                expected_secs: Some(284.0),
+            },
+        ]
+    }
+
+    fn wall_options() -> CandidateOptions {
+        CandidateOptions {
+            per_track: 12,
+            length_tolerance: 5.0,
+            quality: AudioQuality::Flac,
+            artist: "Pink Floyd".into(),
+            album: "The Wall".into(),
+        }
+    }
+
+    #[test]
+    fn disc_folders_belong_to_their_album_folder() {
+        assert_eq!(
+            album_root("Music\\The Wall\\CD1\\01 - x.flac"),
+            "Music\\The Wall"
+        );
+        assert_eq!(
+            album_root("Music/The Wall/Disc 2/01 - x.flac"),
+            "Music/The Wall"
+        );
+        assert_eq!(
+            album_root("Music\\The Wall\\01 - x.flac"),
+            "Music\\The Wall"
+        );
+        assert_eq!(album_root("01 - x.flac"), "");
+        assert_eq!(
+            folder_disc_number("A\\The Wall (Disc 2)\\01 - x.flac"),
+            Some(2)
+        );
+        assert_eq!(folder_disc_number("A\\CD2\\01 - x.flac"), Some(2));
+        assert_eq!(folder_disc_number("A\\The Wall [CD]\\01 - x.flac"), None);
+        assert_eq!(folder_disc_number("A\\Discography\\01 - x.flac"), None);
+    }
+
+    #[test]
+    fn a_peer_with_the_whole_album_in_disc_folders_is_one_source() {
+        let hits = vec![
+            SearchHit {
+                username: "complete".into(),
+                free_slot: false,
+                speed: 100,
+                files: vec![
+                    timed(
+                        "Rips\\The Wall\\CD1\\01 - In the Flesh.flac",
+                        30_000_000,
+                        199,
+                    ),
+                    timed(
+                        "Rips\\The Wall\\CD1\\02 - The Thin Ice.flac",
+                        25_000_000,
+                        150,
+                    ),
+                    timed("Rips\\The Wall\\CD2\\01 - Hey You.flac", 40_000_000, 284),
+                ],
+            },
+            SearchHit {
+                // Faster, but missing a track.
+                username: "partial".into(),
+                free_slot: true,
+                speed: 9_000,
+                files: vec![
+                    timed("The Wall\\01 - In the Flesh.flac", 30_000_000, 199),
+                    timed("The Wall\\02 - The Thin Ice.flac", 25_000_000, 150),
+                ],
+            },
+        ];
+        let sources =
+            build_album_sources(&wall_tracks(), &[true, true, true], &hits, &wall_options());
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].username, "complete");
+        assert_eq!(sources[0].folder, "Rips\\The Wall");
+        let paths: Vec<&str> = sources[0]
+            .files
+            .iter()
+            .map(|file| file.as_ref().unwrap().path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "Rips\\The Wall\\CD1\\01 - In the Flesh.flac",
+                "Rips\\The Wall\\CD1\\02 - The Thin Ice.flac",
+                "Rips\\The Wall\\CD2\\01 - Hey You.flac",
+            ]
+        );
+
+        // Only the tracks still needed have to be present.
+        let sources =
+            build_album_sources(&wall_tracks(), &[true, true, false], &hits, &wall_options());
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].username, "partial");
+        assert!(sources[0].files[2].is_none());
+    }
+
+    #[test]
+    fn two_rips_from_one_peer_are_separate_sources() {
+        let hits = vec![SearchHit {
+            username: "collector".into(),
+            free_slot: true,
+            speed: 100,
+            files: vec![
+                timed("1979 CD\\01 - In the Flesh.flac", 30_000_000, 199),
+                timed("1979 CD\\02 - The Thin Ice.flac", 25_000_000, 150),
+                timed("2011 Remaster\\01 - In the Flesh.flac", 30_000_000, 199),
+                timed("2011 Remaster\\02 - The Thin Ice.flac", 25_000_000, 150),
+                timed("2011 Remaster\\03 - Hey You.flac", 40_000_000, 284),
+            ],
+        }];
+        let sources =
+            build_album_sources(&wall_tracks(), &[true, true, true], &hits, &wall_options());
+        assert_eq!(sources.len(), 1, "the 1979 folder is incomplete");
+        assert_eq!(sources[0].folder, "2011 Remaster");
+        assert!(
+            sources[0]
+                .files
+                .iter()
+                .flatten()
+                .all(|file| file.path.starts_with("2011 Remaster"))
+        );
     }
 }

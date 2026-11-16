@@ -2,8 +2,8 @@
 
 A terminal album downloader that is actually pleasant to use. Pick an album, EP
 or single from **MusicBrainz**, and soulsucker finds matching **FLAC** or **320
-kbps MP3** files on **Soulseek**, downloads them in parallel, verifies what it
-got, and files cleanly numbered tracks into an artist/album library.
+kbps MP3** files on **Soulseek**, downloads them, verifies what it got, and
+files cleanly numbered tracks into an artist/album library.
 
 Built in Rust with [`ratatui`](https://ratatui.rs/) for the TUI,
 [`clap`](https://clap.rs/) for the command line, and
@@ -42,6 +42,22 @@ duration/fingerprint verification, and automatic retries:
   and file size. The best 30 sources per track are kept, with at most 10 from
   the same peer. Reported durations are used to reject cross-track matches
   before bytes are spent.
+- **One rip per album.** Different masters split tracks at slightly different
+  points, so an album stitched together from several peers can lose or repeat
+  audio where songs run into each other (The Wall, Abbey Road side two, live
+  albums). soulsucker first looks for a peer sharing a file for every needed
+  track in one folder (`CD1`/`CD2` subfolders count as one folder), downloads
+  and verifies the first track from it alone, and only then takes the rest of
+  the album from that same folder. If the check fails, the next full-album peer
+  is tried. Sources are mixed only as a last resort.
+- **Finds the pressing you actually got.** Pressings of the same album often
+  differ in track lengths (a track split a second earlier, a longer fade). If
+  a file from the chosen peer is rejected only because its length does not
+  match the selected release, soulsucker checks every other pressing of that
+  album on MusicBrainz for one with the same tracklist whose lengths fit that
+  peer's files. If one fits, it becomes the release: the same file is checked
+  again without being downloaded twice, and tracks are tagged with that
+  pressing's IDs. Only when no pressing fits is another source tried.
 - **Resilient transfers.** Per-attempt staging folders, queue/stall
   watchdogs, next-source fallback, and last-resort passes with more patience.
 - **Actual verification.** Finished files are checked against the
@@ -59,11 +75,16 @@ duration/fingerprint verification, and automatic retries:
   for multi-disc releases; `.mp3` in MP3 mode).
 - **FLAC or MP3 320.** Choose lossless FLAC or 320 kbps MP3 in Settings. MP3
   mode prefers a verified 320 kbps MP3 source; when none is available it takes
-  a FLAC source and converts it after verification. The conversion and loudness
-  normalization share the same second pass.
-- **Loudness normalization.** An optional two-pass EBU R128 pass brings each
-  download to -16 LUFS with a -1.5 dBTP true-peak ceiling, so quiet and loud
-  albums sit at a similar level in a car or on a portable player.
+  a FLAC source and converts it after verification. With loudness
+  normalization on, the conversion and the album gain share one encode.
+  Encoded MP3s carry an accurate
+  LAME gapless header (encoder delay and padding), so gapless players join
+  tracks sample-exactly.
+- **Album loudness normalization.** An optional EBU R128 album gain brings
+  each album to -16 LUFS with a -1.5 dBTP true-peak ceiling, so quiet and loud
+  albums sit at a similar level in a car or on a portable player. Every track
+  of an album gets the same gain, so the balance between tracks and gapless
+  transitions are left exactly as mastered.
 - **Skip or force.** Valid existing tracks are skipped by default; `--force`
   downloads them again. A stray/empty file with the right name is validated and
   replaced rather than trusted.
@@ -207,20 +228,37 @@ soulsucker --no-fingerprint
    MP3 320 mode, MP3 results identified as 320 kbps are preferred and FLAC is
    kept as a fallback. Junk (`sample`, `preview`, `snippet`), the wrong format,
    tiny files and wildly wrong durations are ignored.
-6. Tracks download in parallel. Each attempt gets its own hidden staging
-   folder inside the destination folder, so partial files can never be mistaken
-   for finished ones.
+6. If peers share the whole album in one folder, the best one is checked
+   first: only the first needed track is downloaded from it and verified (step
+   7). When it passes, every other track comes from that same folder; while
+   that peer is busy sending other tracks, tracks waiting in its queue keep
+   waiting instead of timing out. When the check fails, the next full-album
+   peer is checked the same way. Only when no full-album copy passes are
+   tracks taken from the best source for each track individually. Tracks
+   download one at a time by default (`max_concurrent`). Each attempt gets its
+   own hidden staging folder inside the destination folder, so partial files
+   can never be mistaken for finished ones.
 7. When a transfer completes, its duration is checked. With an AcoustID key,
    the built-in Chromaprint fingerprint is also checked: the expected
    MusicBrainz recording must appear in AcoustID's **top-scoring cluster**.
    MP3 sources are also checked for a genuine 320 kbps bitrate.
-8. A wrong version, a stall, a queue timeout or a rejected transfer moves on
-   to the next-best source. If every source fails, the list is retried in
+8. If a file from the chosen full-album peer fails only on length, the other
+   pressings in the release group are fetched from MusicBrainz and compared
+   with that peer's measured and reported track lengths (same discs,
+   positions and titles; every known length within the length tolerance). A
+   fitting pressing replaces the selected release — expected lengths,
+   MusicBrainz IDs and release date — and the held file is verified again;
+   tracks already saved are retagged. An album switches pressing at most
+   twice.
+   A wrong version, a stall, a queue timeout or a rejected transfer moves on
+   to the next-best source (for a track from the chosen full-album peer, the
+   other peers' copies of that track). If every source fails, the list is retried in
    last-resort passes with longer patience.
-9. Only after verification, an accepted file is normalized and/or converted.
-   In MP3 mode a FLAC source becomes a 320 kbps MP3 here; with loudness
-   normalization enabled, that conversion shares the second normalization
-   pass.
+9. Only after verification, an accepted file is converted and/or normalized.
+   In MP3 mode a FLAC source becomes a 320 kbps MP3 here. With loudness
+   normalization on, each verified track is measured and held until every
+   track of the album is in; then one album gain is applied to all of them,
+   in the same encode as any MP3 conversion.
 10. Accepted files are renamed, then retagged from the chosen MusicBrainz
     release: title, track artist, album artist, album, release date,
     track/disc numbers, and MusicBrainz IDs. Cover art is fetched from the
@@ -318,9 +356,9 @@ acoustid_key = "your-acoustid-key"
 
 music_dir = "/home/you/Music"
 audio_quality = "flac"
-max_concurrent = 4
+max_concurrent = 1
 search_timeout_secs = 20
-queue_timeout_secs = 30
+queue_timeout_secs = 120
 stall_timeout_secs = 15
 length_tolerance_secs = 5.0
 fingerprint = true
@@ -346,7 +384,8 @@ also checked after transfer so a mislabeled 128 kbps file is rejected. If no
 320 kbps MP3 source is available, soulsucker downloads a FLAC and converts it
 after the duration and AcoustID checks. MP3 sources are kept untouched when
 normalization is off; with normalization on they are decoded and re-encoded at
-320 kbps as part of the two-pass normalization. If conversion fails for a
+320 kbps to apply the album gain (unless the gain rounds to 0 dB). If
+conversion fails for a
 FLAC-to-MP3 track, that source is rejected and the next source is tried.
 
 `disc_prefix_track_numbers = false` keeps standard per-disc track tags. Set it
@@ -363,17 +402,25 @@ inside the album instead of creating a second artist entry. This also applies
 when tags are written, so enable it and rerun with `--force` to retag an
 existing download.
 
-`normalize_loudness = true` runs a two-pass EBU R128 normalization on each
-downloaded track before it is tagged. The first pass measures the track with
-FFmpeg's `loudnorm` filter; the second pass applies **-16 LUFS** integrated
-loudness, a **-1.5 dBTP** true-peak ceiling, and an **11 LU** loudness range.
-FLAC output is re-encoded losslessly. In MP3 320 mode the same second pass also
-performs the FLAC-to-MP3 conversion, so there is no separate conversion pass.
-The processed file replaces the original only after the entire encode succeeds.
-If normalization fails, an already-correct source is kept and tagged
-unprocessed; a FLAC source that still needs MP3 conversion is rejected so
-another source can be tried. Existing files are skipped unless you rerun with
-`--force`.
+`normalize_loudness = true` applies an EBU R128 **album gain**. Each verified
+track's integrated loudness and true peak are measured with FFmpeg's `loudnorm`
+filter, and the track waits in staging ("verified · waiting for the rest of
+the album") until every track has finished or given up. The album loudness is
+the duration-weighted energy mean of the tracks, and one gain brings it to
+**-16 LUFS**, limited so the loudest true peak on the album stays at or below
+**-1.5 dBTP**. That same static gain is applied to every track; there is no
+per-track adjustment or limiter, so tracks keep their mastered balance and
+gapless transitions stay seamless. A quiet album with one very peaky track can
+therefore end up a little below -16 LUFS rather than being squashed.
+
+FLAC output is re-encoded losslessly. In MP3 320 mode the album gain and any
+FLAC-to-MP3 conversion happen in one encode. The processed file replaces the
+original only after the entire encode succeeds. If processing fails, an
+already-correct source is kept and saved at its original level; a FLAC source
+that still needs MP3 conversion is rejected so another source can be tried. A
+track retried later reuses the album's gain. Tracks already on disk are skipped
+and not part of the measurement, so rerun with `--force` to normalize a whole
+existing album consistently.
 
 ## CLI options
 

@@ -146,9 +146,9 @@ impl Default for Config {
             acoustid_key: String::new(),
             music_dir: default_music_dir().to_string_lossy().into_owned(),
             audio_quality: AudioQuality::Flac,
-            max_concurrent: 4,
+            max_concurrent: 1,
             search_timeout_secs: 20,
-            queue_timeout_secs: 30,
+            queue_timeout_secs: 120,
             stall_timeout_secs: 15,
             length_tolerance_secs: 5.0,
             fingerprint: true,
@@ -614,7 +614,7 @@ mod tests {
     #[test]
     fn missing_fields_fall_back_to_defaults() {
         let config: Config = toml::from_str("username = \"u\"\npassword = \"p\"\n").unwrap();
-        assert_eq!(config.max_concurrent, 4);
+        assert_eq!(config.max_concurrent, 1);
         assert_eq!(config.search_timeout_secs, 20);
     }
 }

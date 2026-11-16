@@ -44,7 +44,7 @@ cargo build --release --features ffmpeg-static
 │   ├── musicbrainz.rs   release search/ranking, release details, cover lookup
 │   ├── matcher.rs       local fuzzy matching and source selection
 │   ├── acoustid.rs      built-in Chromaprint + AcoustID verification
-│   ├── normalize.rs     two-pass EBU R128 normalization + FLAC/MP3 output
+│   ├── normalize.rs     EBU R128 album gain + FLAC/MP3 output
 │   ├── audio.rs         FLAC/MP3 inspection, metadata tagging, cover embedding
 │   ├── config.rs        TOML config, normalization, secure atomic saves
 │   ├── cli.rs           clap arguments and persistence semantics
@@ -125,22 +125,31 @@ The background album engine. This is the most state-heavy file.
 Main flow:
 
 1. `start_album` checks existing files, starts cover lookup, and runs one pooled Soulseek search for the whole album.
-2. `search_done` converts hits into candidates with `matcher::build_candidates`.
-3. `schedule` starts tracks up to `max_concurrent`.
+2. `search_done` converts hits into per-track candidates with `matcher::build_candidates` and full-album sources with `matcher::build_album_sources`, then `plan_sources` picks a `SourceMode`.
+3. `schedule` starts tracks up to `max_concurrent`. While `SourceMode::Probing`, only the probe track may start.
 4. `start_candidate` downloads into a unique per-attempt staging directory.
 5. `poll_downloads` watches queue/stall/progress, rejects bad attempts, and queues completed files for verification.
-6. `begin_verification` removes the library download record, finds the staged non-`.part` file, and verifies it in a worker. Duration and AcoustID checks always run before any normalization or conversion. When `normalize_loudness` or MP3 output requires processing, the same worker runs `normalize::process_file` and sends back the processed staging path.
-7. `verified` promotes the (possibly normalized/converted) file to its final name, writes MusicBrainz tags and cover art, and marks the track done. A conversion failure for a FLAC-to-MP3 track rejects that source and tries the next one; a failed normalization of an already-correct format keeps the original.
+6. `begin_verification` removes the library download record, finds the staged non-`.part` file, and verifies it in a worker. Duration and AcoustID checks always run before any normalization or conversion. With `normalize_loudness`, the worker only measures (`normalize::measure_loudness`) and returns the untouched staged file plus its `Loudness`. Without it, a FLAC that needs MP3 conversion is converted here (`process_file(.., None)`).
+7. `verified` either holds the track for the album gain (`hold_for_album_gain`: status stays `Verifying`, the staged file is kept in `TrackState::pending`) or calls `finish_track`, which promotes the file to its final name, writes MusicBrainz tags and cover art, and marks the track done. A conversion failure for a FLAC-to-MP3 track rejects that source and tries the next one.
+7a. Album gain: `run_album_gain` runs from `tick` (even without a Soulseek session) once `album_ready_for_gain` holds (every track is held or terminal). It computes `AlbumState::album_gain` once with `normalize::album_gain`, then starts `album-gain` workers (up to `max_concurrent`) running `process_file(.., Some(gain))`. Results arrive as `SessionCommand::AlbumGainDone` and are checked against `attempt_no`. `album_gain_failed` keeps an already-correct file at its original level, or rejects a FLAC that still needs MP3 conversion. `check_album_gain_deadlines` treats a hung worker as a failure. `fail_active_tracks(.., keep_verified = true)` (session loss, reconnect) keeps held tracks; cancelling drops them. Held tracks keep the `Verifying` status but must not count against `max_concurrent` (`uses_download_slot`), or the album deadlocks once every slot is held.
 8. Failures go through `fail_attempt` and then `advance_after_failure`: next candidate, last-resort rounds, or `Failed`.
 9. `check_completion` fires when every track is `Done`, `Failed`, or `Cancelled`.
 
 Track states: `Queued`, `Downloading`, `Verifying`, `Retrying`, `Done`, `Failed`, `Cancelled`.
+
+Source modes (gapless albums): different masters split tracks at different points, so mixing rips can cut or repeat audio at transitions.
+
+- `Probing { source, track }`: the first needed track is downloaded from one full-album source alone. `advance_after_failure` routes a probe failure to `advance_probe` (next full-album source, or `Mixed` when none are left). `ensure_probe_track` re-picks the probe track if it was cancelled or found on disk.
+- `Committed { source }`: set by `commit_album_source` when the probe track is promoted. Every other waiting track gets that folder's file first, then the pooled `fallback` sources (deduplicated). Queued transfers from the committed peer measure their queue timeout from `source_activity` (last progress/completion from that peer), so they are not abandoned while the peer is busy serving other tracks.
+- Pressing switch: when a file from the chosen full-album copy (`album_source_file`) is rejected with `VerifyResult::length_mismatch`, `hold_for_pressing` keeps the staged file (`TrackState::pressing_hold`, status `Verifying`, no download slot) and a `pressing-lookup` worker fetches `musicbrainz::get_group_release_details` (cached in `AlbumState::pressings`; results checked with `pressing_search_id`). `resolve_pressing_holds` picks `best_matching_pressing` against `pressing_tracks` (measured `observed_secs`, else the peer-reported length) and either `apply_pressing` + re-runs `spawn_verification` on the same file, or `fail_attempt`s the held tracks with their original reason. `apply_pressing` updates expected lengths, recording/track MBIDs, release MBID and date only; titles, paths and numbering stay. At most `MAX_PRESSING_SWITCHES` per album.
+- `Mixed`: the old per-track behavior, using `fallback`. Used when fewer than two tracks are needed, no peer has the whole album, or every full-album source failed its probe.
 Album phases: `Searching`, `Downloading`, `Complete`.
 
 ### `musicbrainz.rs`
 
 - `search_release_groups` builds a `releasegroup:` Lucene query and returns albums, EPs, live albums, live EPs, singles and other release groups. `ReleaseGroupCandidate.score` is a penalty: lower is better, with exact title/artist matches first and studio albums ahead of EPs/singles.
 - `get_group_releases` browses `/release?release-group=<mbid>` and converts the pressings into `ReleaseCandidate`s. `rank_group_releases` puts official remastered pressings first, then applies the normal edition/format/status scoring. Bootleg remasters are not preferred.
+- `get_group_release_details` browses `/release?release-group=<mbid>&inc=recordings+…`; with recordings MusicBrainz returns only ~20 releases per page whatever `limit` says, so it pages by `offset` up to `MAX_PRESSING_PAGES`. `best_matching_pressing` is pure: same track count, disc/position and similar titles, every observed length within tolerance; lowest total distance, then fewer missing lengths, then official status.
 - `get_release` requests `recordings+artist-credits+release-groups`, skips video media, numbers audio discs, and captures track/recording MBIDs and per-track artist credits.
 - `ReleaseInfo.primary_type` comes from the release group. `is_single()` makes `TracksView::build` save singles as loose files in the artist folder instead of creating an album folder.
 - `fetch_cover` order:
@@ -160,6 +169,7 @@ Turns Soulseek search hits into ranked per-track candidates.
 - In MP3 320 mode, accepts FLAC as a fallback and only MP3 files identified as 320 kbps from Soulseek's bitrate attribute or size/duration (or an explicit `320` filename when attributes are missing). Low-bitrate MP3s are ignored.
 - Candidate ranking still puts match score first; equal score bands prefer MP3 over FLAC in MP3 mode, then free slots, peer speed, duration closeness and file size.
 - Scores title similarity, duration closeness, track/disc numbers, free slots, peer speed, and file size.
+- `build_album_sources` groups files by peer and album folder (`album_root`; disc subfolders like `CD1`/`Disc 2` belong to their parent) and keeps groups with a file for every needed track, ranked by average match score, then MP3 share in MP3 mode, free slot and speed. At most `candidates_per_track` sources are returned. A disc folder also supplies the file's disc number when the filename has none.
 - Assigns each remote file globally to its best-matching track before applying per-track/per-user limits. A file is still only used for one track; do not revert to greedy per-track assignment, which lets an earlier track consume a similarly named later track's sources.
 - Rejects files whose reported duration is far from the expected track length, using `allowed_duration_drift` rather than a fixed 90-second window.
 - `normalize_text` is shared by MusicBrainz cover matching.
@@ -190,14 +200,14 @@ Turns Soulseek search hits into ranked per-track candidates.
 
 ### `normalize.rs`
 
-- `normalize_loudness` (opt-in) runs a two-pass EBU R128 pass on downloaded tracks before tagging. In MP3 320 mode a FLAC source always needs a conversion pass after verification; when normalization is enabled it shares the second pass.
-- Targets: **-16 LUFS** integrated, **-1.5 dBTP** true peak, **11 LU** loudness range. Keep these safe defaults unless the user asks otherwise.
-- Pass one builds an `abuffer -> loudnorm` graph, writes JSON stats through `loudnorm`'s `stats_file`, and only pulls/discards frames. Pass two reopens the source, applies `measured_*` values with `linear=true`, and writes a temporary FLAC or 320 kbps MP3 beside the source.
-- MP3 encoding uses the bundled `mp3lame-encoder`/LAME library (LGPL) at 320 kbps CBR. FFmpeg still handles decoding, resampling, channel conversion and `loudnorm`; high-resolution sources are resampled to 44.1/48 kHz and multichannel sources are downmixed to stereo.
+- `normalize_loudness` (opt-in) is **album-wide**: every track of an album gets one static gain. Per-track gain or `loudnorm`'s dynamic mode changes the level where tracks run into each other and breaks gapless albums; do not reintroduce it. In MP3 320 mode the album gain and any FLAC-to-MP3 conversion share one encode, so audio is encoded once.
+- Targets: **-16 LUFS** integrated, **-1.5 dBTP** true-peak ceiling. Keep these safe defaults unless the user asks otherwise. `album_gain` = min(target − album loudness, ceiling − loudest track peak), clamped to ±30 dB; album loudness is the duration-weighted energy mean of the per-track integrated values. No limiter.
+- `measure_loudness` builds an `abuffer -> loudnorm` graph, writes JSON stats through `loudnorm`'s `stats_file`, and only pulls/discards frames. `process_file` applies the gain with a `volume=…dB:precision=double` filter (stateless, so joins stay seamless) and writes a temporary FLAC or 320 kbps MP3 beside the source.
+- MP3 encoding uses the bundled `mp3lame-encoder`/LAME library (LGPL) at 320 kbps CBR. Finish with `FlushGap` (`lame_encode_flush`), never `FlushNoGap`: the no-gap flush leaves the last buffered PCM unencoded and records zero end padding. LAME writes an all-zero placeholder as the first frame; `install_lame_tag` overwrites it with the finished LAME tag. Prepending the tag instead leaves a silent frame and breaks gapless trimming. `mp3_output_is_sample_exact_for_gapless_playback` guards both. FFmpeg still handles decoding, resampling, channel conversion, `loudnorm` measurement and `volume`; high-resolution sources are resampled to 44.1/48 kHz and multichannel sources are downmixed to stereo.
 - FLAC output uses an explicit `aformat` stage and fixed encoder frame size; FLAC requires fixed-size frames. `encode_stream` counts encoded samples.
 - FFmpeg's FLAC muxer would store total samples through a zero-size side-data packet, but this FFmpeg build rejects it. `update_flac_total_samples` patches the 36-bit STREAMINFO field after muxing so duration and seeking work.
 - Normalization/processing is best-effort: on failure, keep an already-correct source and tag it; if a FLAC still needs MP3 conversion, reject the attempt. The source is never modified in place; the temp file is returned and promoted by the session thread.
-- Never run normalization or conversion on the UI or session loop. It belongs in the verification worker.
+- Never run normalization or conversion on the UI or session loop. Measurement and conversion belong in the verification worker; the album gain runs in `album-gain` workers.
 - Set FFmpeg's log level to quiet: the TUI owns the terminal and FFmpeg must not write diagnostics to it.
 
 ### `update.rs`

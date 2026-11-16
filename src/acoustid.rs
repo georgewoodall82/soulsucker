@@ -52,10 +52,15 @@ pub struct VerifySpec {
     pub min_mp3_bitrate_kbps: Option<u32>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct VerifyResult {
     pub accepted: bool,
     pub note: String,
+    /// The file's actual length, when it could be read.
+    pub duration_secs: Option<f64>,
+    /// Rejected only because the length differs from the expected one. The
+    /// file may still be right for another pressing of the same album.
+    pub length_mismatch: bool,
 }
 
 impl VerifyResult {
@@ -63,13 +68,15 @@ impl VerifyResult {
         Self {
             accepted: true,
             note: note.into(),
+            ..Self::default()
         }
     }
 
-    fn reject(note: impl Into<String>) -> Self {
+    pub fn reject(note: impl Into<String>) -> Self {
         Self {
             accepted: false,
             note: note.into(),
+            ..Self::default()
         }
     }
 }
@@ -587,18 +594,30 @@ pub fn verify_file(path: &Path, spec: &VerifySpec, on_phase: &dyn Fn(&str)) -> V
             return VerifyResult::reject(format!("not a readable audio file ({err})"));
         }
     };
+    let mut result = verify_with_duration(path, spec, on_phase, duration);
+    result.duration_secs = Some(duration);
+    result
+}
 
+fn verify_with_duration(
+    path: &Path,
+    spec: &VerifySpec,
+    on_phase: &dyn Fn(&str),
+    duration: f64,
+) -> VerifyResult {
     if let Some(expected) = spec.expected_secs
         && spec.tolerance_secs > 0.0
     {
         let diff = (duration - expected).abs();
         if diff > spec.tolerance_secs {
-            return VerifyResult::reject(format!(
+            let mut result = VerifyResult::reject(format!(
                 "length {} vs expected {} (±{:.0}s)",
                 crate::util::fmt_duration(duration),
                 crate::util::fmt_duration(expected),
                 spec.tolerance_secs
             ));
+            result.length_mismatch = true;
+            return result;
         }
     }
 
