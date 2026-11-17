@@ -212,6 +212,14 @@ enum SessionCommand {
         path: PathBuf,
         loudness: Option<Loudness>,
     },
+    /// The probe track passed its duration/fingerprint check. Sent before
+    /// loudness measurement or conversion so the rest of the album can start
+    /// downloading while the probe file is still being processed.
+    ProbeVerified {
+        job_id: u64,
+        index: usize,
+        attempt_no: u32,
+    },
     AlbumGainDone {
         job_id: u64,
         index: usize,
@@ -342,12 +350,35 @@ fn run_session(
     Session::new(config, events, commands, inner_tx).run();
 }
 
+/// A secondary Soulseek login used for parallel downloads. Peers accept one
+/// transfer per username at a time, so each concurrent download runs on its
+/// own account. The name is the main username plus the slot number and the
+/// password is shared; the server creates unknown accounts on first login.
+struct ExtraAccount {
+    username: String,
+    client: Option<Arc<Client>>,
+    connector: Option<Receiver<ConnResult>>,
+    retry_at: Option<Instant>,
+    failures: u32,
+    /// The server refused this login; leave it alone until the session
+    /// restarts.
+    rejected: bool,
+}
+
+/// Username of the `slot`th extra account (slot 0 is the main account).
+fn extra_username(base: &str, slot: usize) -> String {
+    format!("{base}{slot}")
+}
+
 struct Session {
     config: Config,
     events: Sender<SlskEvent>,
     commands: Receiver<SessionCommand>,
     inner_tx: Sender<SessionCommand>,
     client: Option<Arc<Client>>,
+    /// Extra logins (`<username>1`, `<username>2`, …) so parallel downloads
+    /// from one peer do not share an account. Slot `n` is `extras[n - 1]`.
+    extras: Vec<ExtraAccount>,
     connector: Option<Receiver<ConnResult>>,
     connecting: bool,
     reconnect_at: Option<Instant>,
@@ -370,6 +401,7 @@ impl Session {
             commands,
             inner_tx,
             client: None,
+            extras: Vec::new(),
             connector: None,
             connecting: false,
             reconnect_at: None,
@@ -543,6 +575,11 @@ impl Session {
                 {
                     client.disconnect();
                 }
+                // Dropping a client logs it out. The extra accounts come back
+                // once the main one is connected again.
+                let wanted = self.extras.len();
+                self.set_wanted_extras(0);
+                self.set_wanted_extras(wanted);
                 self.connecting = false;
                 self.connect_failures = 0;
                 self.start_connect();
@@ -561,6 +598,18 @@ impl Session {
                 path,
                 loudness,
             } => self.verified(job_id, index, attempt_no, result, path, loudness),
+            SessionCommand::ProbeVerified {
+                job_id,
+                index,
+                attempt_no,
+            } => {
+                let events = self.events.clone();
+                if let Some(album) = self.album.as_mut()
+                    && album.job.job_id == job_id
+                {
+                    commit_probe_if_verified(album, index, attempt_no, &events);
+                }
+            }
             SessionCommand::AlbumGainDone {
                 job_id,
                 index,
@@ -581,6 +630,7 @@ impl Session {
 
     fn tick(&mut self) {
         self.check_session();
+        self.manage_extras();
         // Album gain works on local files and does not need the session.
         self.check_album_gain_deadlines();
         self.run_verification_queue();
@@ -757,9 +807,148 @@ impl Session {
             return;
         }
 
+        let wanted_extras = album.job.options.max_concurrent.max(1) - 1;
         self.album = Some(album);
+        self.set_wanted_extras(wanted_extras);
         self.fetch_cover(job_id, cover_artist, cover_album, release_mbid);
         self.begin_search();
+    }
+
+    /// Every logged-in account by slot: the main one first, then the extras.
+    fn slot_clients(&self) -> Vec<Option<Arc<Client>>> {
+        let mut clients = Vec::with_capacity(self.extras.len() + 1);
+        clients.push(self.client.clone());
+        clients.extend(self.extras.iter().map(|extra| extra.client.clone()));
+        clients
+    }
+
+    /// Keep `wanted` extra accounts: add missing ones (they connect from
+    /// `manage_extras`) and log out surplus ones.
+    fn set_wanted_extras(&mut self, wanted: usize) {
+        self.extras.truncate(wanted);
+        while self.extras.len() < wanted {
+            let slot = self.extras.len() + 1;
+            self.extras.push(ExtraAccount {
+                username: extra_username(&self.config.username, slot),
+                client: None,
+                connector: None,
+                retry_at: None,
+                failures: 0,
+                rejected: false,
+            });
+        }
+    }
+
+    /// Connect the extra accounts, pick up finished logins and notice lost
+    /// sessions. Downloads start on whichever accounts are ready, so a slow
+    /// or refused extra login never holds up the album.
+    fn manage_extras(&mut self) {
+        if self.extras.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let primary_up = self.client.is_some();
+        let mut messages: Vec<(LogLevel, String)> = Vec::new();
+        let mut lost_slots: Vec<usize> = Vec::new();
+        for (index, extra) in self.extras.iter_mut().enumerate() {
+            let slot = index + 1;
+            if let Some(loss) = extra
+                .client
+                .as_ref()
+                .and_then(|client| client.session_loss())
+            {
+                messages.push((
+                    LogLevel::Warn,
+                    format!("Download account {} disconnected: {loss}", extra.username),
+                ));
+                extra.client = None;
+                extra.retry_at = Some(now + Duration::from_secs(8));
+                lost_slots.push(slot);
+            }
+            if let Some(rx) = &extra.connector {
+                match rx.try_recv() {
+                    Ok(ConnResult::Connected(client)) => {
+                        extra.connector = None;
+                        extra.failures = 0;
+                        extra.client = Some(client);
+                        messages.push((
+                            LogLevel::Info,
+                            format!("Download account {} is connected.", extra.username),
+                        ));
+                    }
+                    Ok(ConnResult::Failed { message, auth }) => {
+                        extra.connector = None;
+                        if auth {
+                            extra.rejected = true;
+                            messages.push((
+                                LogLevel::Warn,
+                                format!(
+                                    "Download account {} was rejected ({message}); \
+                                     parallel downloads will use fewer accounts.",
+                                    extra.username
+                                ),
+                            ));
+                        } else {
+                            extra.failures += 1;
+                            extra.retry_at = Some(now + Duration::from_secs(8));
+                            messages.push((
+                                LogLevel::Warn,
+                                format!(
+                                    "Download account {} could not connect: {message}",
+                                    extra.username
+                                ),
+                            ));
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        extra.connector = None;
+                        extra.failures += 1;
+                        extra.retry_at = Some(now + Duration::from_secs(8));
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
+            }
+            let due = extra.retry_at.is_none_or(|at| now >= at);
+            if primary_up
+                && extra.client.is_none()
+                && extra.connector.is_none()
+                && !extra.rejected
+                && extra.failures <= MAX_AUTO_RECONNECTS
+                && due
+            {
+                extra.retry_at = None;
+                extra.connector = spawn_extra_connect(&self.config, &extra.username, slot);
+                if extra.connector.is_none() {
+                    extra.failures += 1;
+                }
+            }
+        }
+        for (level, message) in messages {
+            self.log(level, message);
+        }
+        for slot in lost_slots {
+            let affected: Vec<usize> = self
+                .album
+                .as_ref()
+                .map(|album| {
+                    album
+                        .tracks
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, track)| {
+                            track
+                                .current
+                                .as_ref()
+                                .is_some_and(|active| active.slot == slot)
+                        })
+                        .map(|(index, _)| index)
+                        .collect()
+                })
+                .unwrap_or_default();
+            for index in affected {
+                self.fail_attempt(index, "download account disconnected");
+            }
+        }
     }
 
     fn fetch_cover(&self, job_id: u64, artist: String, album: String, release_mbid: String) {
@@ -948,11 +1137,21 @@ impl Session {
     }
 
     fn poll_downloads(&mut self) {
-        let Some(client) = self.client.clone() else {
+        if self.client.is_none() {
             return;
-        };
+        }
         let events = self.events.clone();
-        let downloads = client.get_all_downloads();
+        // Each account only knows its own transfers.
+        let downloads: Vec<Vec<soulseek_rs::types::Download>> = self
+            .slot_clients()
+            .iter()
+            .map(|client| {
+                client
+                    .as_ref()
+                    .map(|client| client.get_all_downloads())
+                    .unwrap_or_default()
+            })
+            .collect();
 
         let (finished, rejected) = {
             let Some(album) = self.album.as_mut() else {
@@ -974,7 +1173,9 @@ impl Session {
                 // The library replaces the download token when the peer sends
                 // its TransferRequest, so tokens are not stable. The remote
                 // username+path is.
-                let Some(download) = find_live_download(&downloads, &active.username, &active.path)
+                let Some(download) = downloads
+                    .get(active.slot)
+                    .and_then(|list| find_live_download(list, &active.username, &active.path))
                 else {
                     rejected.push((index, "transfer vanished".to_string()));
                     continue;
@@ -1110,11 +1311,12 @@ impl Session {
         {
             ensure_probe_track(album, &events);
         }
+        let slots = self.slot_clients().iter().flatten().count();
         let Some(album) = self.album.as_ref() else {
             return;
         };
         let job_id = album.job.job_id;
-        let to_start = tracks_to_start(album, now);
+        let to_start = tracks_to_start(album, now, slots);
 
         for index in to_start {
             let is_retry = self
@@ -1133,11 +1335,14 @@ impl Session {
     }
 
     fn start_candidate(&mut self, index: usize) -> bool {
-        let Some(client) = self.client.clone() else {
-            return false;
-        };
+        let clients = self.slot_clients();
         let events = self.events.clone();
         let Some(album) = self.album.as_mut() else {
+            return false;
+        };
+        // Peers serve one transfer per username, so every live download gets
+        // an account of its own.
+        let Some((slot, client)) = free_slot(&clients, album) else {
             return false;
         };
         loop {
@@ -1243,6 +1448,7 @@ impl Session {
                         track.speed = 0.0;
                         track.note.clear();
                         track.current = Some(DownloadActive {
+                            slot,
                             username: candidate.username.clone(),
                             path: candidate.path.clone(),
                             staging: staging.clone(),
@@ -1288,7 +1494,7 @@ impl Session {
     fn fail_attempt(&mut self, index: usize, reason: &str) {
         // Without a session there is no transfer to cancel, but the track
         // must still move on (album gain can fail while disconnected).
-        let client = self.client.clone();
+        let clients = self.slot_clients();
         let events = self.events.clone();
         let Some(album) = self.album.as_mut() else {
             return;
@@ -1298,12 +1504,7 @@ impl Session {
                 return;
             };
             if let Some(active) = track.current.take() {
-                if let Some(client) = &client {
-                    let cancelled = client.cancel_download(&active.username, &active.path);
-                    if !cancelled {
-                        let _ = client.remove_download(&active.username, &active.path);
-                    }
-                }
+                cancel_transfer(&clients, &active);
                 let _ = fs::remove_dir_all(&active.staging);
             }
             if let Some(verifying) = track.verifying.take() {
@@ -1330,9 +1531,10 @@ impl Session {
     }
 
     fn begin_verification(&mut self, index: usize) {
-        let Some(client) = self.client.clone() else {
+        if self.client.is_none() {
             return;
-        };
+        }
+        let clients = self.slot_clients();
         let events = self.events.clone();
         let Some(album) = self.album.as_mut() else {
             return;
@@ -1340,7 +1542,9 @@ impl Session {
         let Some(active) = album.tracks[index].current.take() else {
             return;
         };
-        let _ = client.remove_download(&active.username, &active.path);
+        if let Some(Some(client)) = clients.get(active.slot) {
+            let _ = client.remove_download(&active.username, &active.path);
+        }
         let Some(staged) = staged_file(&active.staging) else {
             let _ = fs::remove_dir_all(&active.staging);
             if let Some(track) = album.tracks.get_mut(index) {
@@ -1444,6 +1648,8 @@ impl Session {
             return;
         };
         let job_id = album.job.job_id;
+        let is_probe =
+            matches!(album.source_mode, SourceMode::Probing { track, .. } if track == index);
         let (update, spec, position, title, source, normalize_loudness, audio_quality) = {
             let Some(track) = album.tracks.get_mut(index) else {
                 return;
@@ -1510,6 +1716,15 @@ impl Session {
                         "downloaded file is not a {} source",
                         audio_quality.label()
                     ));
+                }
+                if result.accepted && is_probe {
+                    // The right album copy is confirmed; the rest of the
+                    // album need not wait for measuring or conversion.
+                    let _ = tx.send(SessionCommand::ProbeVerified {
+                        job_id,
+                        index,
+                        attempt_no,
+                    });
                 }
                 let mut result_path = path.clone();
                 let mut loudness = None;
@@ -2203,9 +2418,10 @@ impl Session {
     }
 
     fn cancel_track(&mut self, job_id: u64, index: usize) {
-        let Some(client) = self.client.clone() else {
+        if self.client.is_none() {
             return;
-        };
+        }
+        let clients = self.slot_clients();
         let events = self.events.clone();
         {
             let Some(album) = self.album.as_mut() else {
@@ -2221,10 +2437,7 @@ impl Session {
                 return;
             }
             if let Some(active) = track.current.take() {
-                let cancelled = client.cancel_download(&active.username, &active.path);
-                if !cancelled {
-                    let _ = client.remove_download(&active.username, &active.path);
-                }
+                cancel_transfer(&clients, &active);
                 let _ = fs::remove_dir_all(&active.staging);
             }
             if let Some(verifying) = track.verifying.take() {
@@ -2306,7 +2519,7 @@ impl Session {
     /// already verified and only waiting for the album gain are kept: that
     /// work is local and does not need the Soulseek session.
     fn fail_active_tracks(&mut self, reason: &str, keep_verified: bool) {
-        let client = self.client.clone();
+        let clients = self.slot_clients();
         let events = self.events.clone();
         let Some(album) = self.album.as_mut() else {
             return;
@@ -2343,12 +2556,7 @@ impl Session {
                 let _ = fs::remove_dir_all(&hold.staging);
             }
             if let Some(active) = track.current.take() {
-                if let Some(client) = &client {
-                    let cancelled = client.cancel_download(&active.username, &active.path);
-                    if !cancelled {
-                        let _ = client.remove_download(&active.username, &active.path);
-                    }
-                }
+                cancel_transfer(&clients, &active);
                 let _ = fs::remove_dir_all(&active.staging);
             }
             if let Some(verifying) = track.verifying.take() {
@@ -2452,6 +2660,7 @@ impl Session {
         if let Some(album) = self.album.take() {
             let _ = fs::remove_dir_all(album.job.album_dir.join(STAGING_DIR));
         }
+        self.set_wanted_extras(0);
         if let Some(mut client) = self.client.take()
             && let Some(client) = Arc::get_mut(&mut client)
         {
@@ -2467,6 +2676,63 @@ impl Session {
 
 fn connect_client(config: &Config) -> ConnResult {
     connect_client_with(config, true)
+}
+
+/// Log an extra account in on a worker thread. It listens on the next port
+/// after the configured one so port forwarding for a small range keeps
+/// working, and falls back to any free port.
+fn spawn_extra_connect(
+    config: &Config,
+    username: &str,
+    slot: usize,
+) -> Option<Receiver<ConnResult>> {
+    let mut config = config.clone();
+    config.username = username.to_string();
+    let preferred = match u16::try_from(slot) {
+        Ok(offset) if config.listen_port != 0 => config.listen_port.checked_add(offset),
+        _ => None,
+    }
+    .unwrap_or(0);
+    let (tx, rx) = mpsc::channel();
+    thread::Builder::new()
+        .name(format!("soulseek-connect-{slot}"))
+        .spawn(move || {
+            config.listen_port = preferred;
+            let mut result = connect_client(&config);
+            if preferred != 0 && matches!(result, ConnResult::Failed { auth: false, .. }) {
+                config.listen_port = 0;
+                result = connect_client(&config);
+            }
+            let _ = tx.send(result);
+        })
+        .ok()?;
+    Some(rx)
+}
+
+/// The first logged-in account with no live transfer of this album.
+fn free_slot(clients: &[Option<Arc<Client>>], album: &AlbumState) -> Option<(usize, Arc<Client>)> {
+    clients.iter().enumerate().find_map(|(slot, client)| {
+        let client = client.as_ref()?;
+        let busy = album.tracks.iter().any(|track| {
+            track
+                .current
+                .as_ref()
+                .is_some_and(|active| active.slot == slot)
+        });
+        (!busy).then(|| (slot, client.clone()))
+    })
+}
+
+/// Cancel a transfer on the account that carries it. The library keeps a
+/// cancelled record when it wants to deny a late peer offer; only drop the
+/// record when cancelling found nothing.
+fn cancel_transfer(clients: &[Option<Arc<Client>>], active: &DownloadActive) {
+    if let Some(Some(client)) = clients.get(active.slot) {
+        let cancelled = client.cancel_download(&active.username, &active.path);
+        if !cancelled {
+            let _ = client.remove_download(&active.username, &active.path);
+        }
+    }
 }
 
 fn connect_client_with(config: &Config, enable_listen: bool) -> ConnResult {
@@ -2729,6 +2995,9 @@ impl AlbumState {
 }
 
 struct DownloadActive {
+    /// Which Soulseek login carries this transfer: 0 is the main account,
+    /// `n` is the `n`th extra account (see `ExtraAccount`).
+    slot: usize,
     username: String,
     path: String,
     staging: PathBuf,
@@ -3071,6 +3340,29 @@ fn advance_probe(album: &mut AlbumState, events: &Sender<SlskEvent>) {
     }
 }
 
+/// Commit to the full-album source once the probe's current attempt passed
+/// verification. Stale or unrelated results are ignored.
+fn commit_probe_if_verified(
+    album: &mut AlbumState,
+    index: usize,
+    attempt_no: u32,
+    events: &Sender<SlskEvent>,
+) {
+    let SourceMode::Probing { track, .. } = album.source_mode else {
+        return;
+    };
+    let current = album.tracks.get(index).is_some_and(|state| {
+        state.status == TrackStatus::Verifying
+            && state
+                .verifying
+                .as_ref()
+                .is_some_and(|verifying| verifying.attempt_no == attempt_no)
+    });
+    if track == index && current {
+        commit_album_source(album, events);
+    }
+}
+
 /// The probe track verified: take every other track from the same folder.
 fn commit_album_source(album: &mut AlbumState, events: &Sender<SlskEvent>) {
     let SourceMode::Probing {
@@ -3149,13 +3441,13 @@ fn use_fallback_sources(album: &mut AlbumState, events: &Sender<SlskEvent>) {
 }
 
 /// The tracks the scheduler may start now, within `max_concurrent` live
-/// transfers.
-fn tracks_to_start(album: &AlbumState, now: Instant) -> Vec<usize> {
+/// transfers and the `slots` logged-in accounts that can carry them.
+fn tracks_to_start(album: &AlbumState, now: Instant, slots: usize) -> Vec<usize> {
     let probe_track = match album.source_mode {
         SourceMode::Probing { track, .. } => Some(track),
         _ => None,
     };
-    let max = album.job.options.max_concurrent.max(1);
+    let max = album.job.options.max_concurrent.max(1).min(slots);
     let mut active = album
         .tracks
         .iter()
@@ -3819,6 +4111,7 @@ mod tests {
             commands: cmd_rx,
             inner_tx: cmd_tx,
             client: None,
+            extras: Vec::new(),
             connector: None,
             connecting: false,
             reconnect_at: None,
@@ -3859,6 +4152,7 @@ mod tests {
             commands: cmd_rx,
             inner_tx: cmd_tx,
             client: None,
+            extras: Vec::new(),
             connector: None,
             connecting: false,
             reconnect_at: None,
@@ -3895,6 +4189,7 @@ mod tests {
             commands: cmd_rx,
             inner_tx: cmd_tx,
             client: None,
+            extras: Vec::new(),
             connector: None,
             connecting: false,
             reconnect_at: None,
@@ -4137,16 +4432,17 @@ mod tests {
         album.job.options.max_concurrent = 1;
         album.job.options.normalize_loudness = true;
         plan_sources(&mut album, sources, fallback, &tx);
-        assert_eq!(tracks_to_start(&album, Instant::now()), [0]);
+        assert_eq!(tracks_to_start(&album, Instant::now(), usize::MAX), [0]);
 
         let staging = std::env::temp_dir().join("soulsucker-held-slot");
         hold(&mut album.tracks[0], -20.0, &staging);
         commit_album_source(&mut album, &tx);
-        assert_eq!(tracks_to_start(&album, Instant::now()), [1]);
+        assert_eq!(tracks_to_start(&album, Instant::now(), usize::MAX), [1]);
 
         // A live transfer still uses its slot.
         album.tracks[1].status = TrackStatus::Downloading;
         album.tracks[1].current = Some(DownloadActive {
+            slot: 0,
             username: "peer".into(),
             path: "x.flac".into(),
             staging: staging.clone(),
@@ -4158,7 +4454,7 @@ mod tests {
             queue_patience: Duration::from_secs(10),
             attempt_no: 1,
         });
-        assert!(tracks_to_start(&album, Instant::now()).is_empty());
+        assert!(tracks_to_start(&album, Instant::now(), usize::MAX).is_empty());
     }
 
     #[test]
@@ -4177,11 +4473,60 @@ mod tests {
             username: "peer".into(),
             remote_path: "x.flac".into(),
         });
-        assert_eq!(tracks_to_start(&album, Instant::now()), [1]);
+        assert_eq!(tracks_to_start(&album, Instant::now(), usize::MAX), [1]);
         // A file waiting for a processing slot does not block it either.
         album.tracks[0].verifying = None;
         album.tracks[0].queued_check = Some(queued_check());
-        assert_eq!(tracks_to_start(&album, Instant::now()), [1]);
+        assert_eq!(tracks_to_start(&album, Instant::now(), usize::MAX), [1]);
+    }
+
+    #[test]
+    fn parallel_downloads_are_limited_by_logged_in_accounts() {
+        let (tx, _rx) = mpsc::channel();
+        let (mut album, sources, fallback) = album_after_search();
+        album.job.options.max_concurrent = 3;
+        plan_sources(&mut album, sources, fallback, &tx);
+        commit_album_source(&mut album, &tx);
+        assert_eq!(tracks_to_start(&album, Instant::now(), 1).len(), 1);
+        assert_eq!(tracks_to_start(&album, Instant::now(), 2).len(), 2);
+        assert_eq!(tracks_to_start(&album, Instant::now(), 3).len(), 3);
+        assert_eq!(tracks_to_start(&album, Instant::now(), 8).len(), 3);
+    }
+
+    #[test]
+    fn extra_accounts_append_their_slot_number() {
+        assert_eq!(extra_username("hippoforestbob", 1), "hippoforestbob1");
+        assert_eq!(extra_username("hippoforestbob", 2), "hippoforestbob2");
+    }
+
+    #[test]
+    fn probe_commits_as_soon_as_it_is_verified_not_after_processing() {
+        let (tx, _rx) = mpsc::channel();
+        let (mut album, sources, fallback) = album_after_search();
+        plan_sources(&mut album, sources, fallback, &tx);
+        let SourceMode::Probing { track: probe, .. } = album.source_mode else {
+            panic!("expected probing");
+        };
+        let other = (0..album.tracks.len())
+            .find(|index| *index != probe)
+            .unwrap();
+        album.tracks[probe].status = TrackStatus::Verifying;
+        album.tracks[probe].verifying = Some(VerifyingAttempt {
+            attempt_no: 2,
+            staging: PathBuf::from("/nonexistent"),
+            deadline: Instant::now() + Duration::from_secs(60),
+            username: "peer".into(),
+            remote_path: "x.flac".into(),
+        });
+
+        // Stale attempt and non-probe tracks do not commit.
+        commit_probe_if_verified(&mut album, probe, 1, &tx);
+        commit_probe_if_verified(&mut album, other, 2, &tx);
+        assert!(matches!(album.source_mode, SourceMode::Probing { .. }));
+
+        commit_probe_if_verified(&mut album, probe, 2, &tx);
+        assert!(matches!(album.source_mode, SourceMode::Committed { .. }));
+        assert_eq!(tracks_to_start(&album, Instant::now(), usize::MAX), [other]);
     }
 
     fn queued_check() -> QueuedCheck {
@@ -4310,6 +4655,7 @@ mod tests {
             commands: cmd_rx,
             inner_tx: cmd_tx,
             client: None,
+            extras: Vec::new(),
             connector: None,
             connecting: false,
             reconnect_at: None,

@@ -218,7 +218,9 @@ soulsucker --no-fingerprint
    release — remastered pressings first, then official standard editions — with
    **Continue** selected by default, or **Choose another release** to browse
    every pressing. Continue loads the full audio tracklist, including
-   multi-disc releases and skipping DVD/Blu-ray mediums.
+   multi-disc releases and skipping DVD/Blu-ray mediums. Video-only releases
+   (a concert DVD, a Blu-ray) are left out of the release list, since they have
+   no audio to download.
 3. The destination is created at `<music folder>/<Artist>/<Album>/`.
    Releases MusicBrainz marks as **Single** skip the album folder and are saved
    as loose files directly in `<music folder>/<Artist>/`, alongside the album
@@ -238,6 +240,14 @@ soulsucker --no-fingerprint
    download one at a time by default (`max_concurrent`). Each attempt gets its
    own hidden staging folder inside the destination folder, so partial files
    can never be mistaken for finished ones.
+
+   Soulseek peers only serve one transfer at a time per username, so when
+   `max_concurrent` is above 1 soulsucker also logs in with extra accounts: your
+   username with `1`, `2`, `3`… appended and the same password (for example
+   `hippoforestbob`, `hippoforestbob1`, `hippoforestbob2` for three parallel
+   downloads). Soulseek creates an account the first time it sees new
+   credentials. Each live download runs on its own account; if an extra login
+   is refused or fails, downloads simply use fewer accounts.
 
    Only live transfers use those download slots. Checking, loudness
    measurement and conversion of finished files run alongside the next
@@ -442,7 +452,7 @@ Run `soulsucker --help` for the full list. Useful ones:
 | `--search-timeout` | Seconds to collect Soulseek results |
 | `--queue-timeout` | Seconds to wait in a peer queue |
 | `--stall-timeout` | Seconds without progress before switching source |
-| `--max-concurrent` | Parallel track downloads |
+| `--max-concurrent` | Parallel track downloads (each uses its own extra Soulseek account) |
 | `--max-processing` | Tracks checked, measured or converted at once |
 | `--length-tolerance` | Allowed MusicBrainz duration difference |
 | `--fingerprint-min-score` | Minimum AcoustID match score |

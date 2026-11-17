@@ -556,11 +556,25 @@ fn candidates_from_group(
     response: BrowseReleasesResponse,
     group: &ReleaseGroupCandidate,
 ) -> Vec<ReleaseCandidate> {
-    let releases = response
+    // Video discs (DVD-Video, Blu-ray, ...) have no audio tracks to download.
+    // They would otherwise win on track count and fail once chosen, so a
+    // release made only of video media is left out of the list.
+    let (audio, video_only): (Vec<_>, Vec<_>) = response
         .releases
         .into_iter()
+        .partition(|release| has_audio_media(&release.media));
+    // A group with nothing but video releases keeps them, so the user gets
+    // the explanatory error instead of an empty list.
+    let kept = if audio.is_empty() { video_only } else { audio };
+    let releases = kept
+        .into_iter()
         .map(|release| {
-            let track_count: u32 = release.media.iter().map(|m| m.track_count).sum();
+            let track_count: u32 = release
+                .media
+                .iter()
+                .filter(|medium| !is_video_browse_medium(medium))
+                .map(|m| m.track_count)
+                .sum();
             let formats = release
                 .media
                 .iter()
@@ -583,6 +597,16 @@ fn candidates_from_group(
         })
         .collect();
     rank_group_releases(releases, group)
+}
+
+fn is_video_browse_medium(medium: &BrowseMedium) -> bool {
+    medium.format.as_deref().is_some_and(is_video_format)
+}
+
+/// A release with at least one non-video disc (or no media information at
+/// all, which is given the benefit of the doubt).
+fn has_audio_media(media: &[BrowseMedium]) -> bool {
+    media.is_empty() || media.iter().any(|medium| !is_video_browse_medium(medium))
 }
 
 fn rank_groups(
@@ -1565,6 +1589,56 @@ mod tests {
         assert_eq!(releases[0].mbid, "remaster");
         assert!(releases[0].is_remastered());
         assert_eq!(releases[0].track_count, 8);
+    }
+
+    #[test]
+    fn video_only_releases_are_not_offered_and_hybrids_count_audio_tracks_only() {
+        // Shaped like the real P·U·L·S·E group: the 2006 DVD-Video has fewer
+        // "tracks" than the CDs and used to be ranked first.
+        let json = r#"{
+          "releases": [
+            {"id": "dvd", "title": "Pulse", "date": "2006-07-07", "country": "XE",
+             "status": "Official", "artist-credit": [{"name": "Pink Floyd", "joinphrase": ""}],
+             "media": [{"format": "DVD-Video", "track-count": 9},
+                       {"format": "DVD-Video", "track-count": 13}]},
+            {"id": "bluray", "title": "Pulse", "date": "2022-02-18", "country": "XE",
+             "status": "Official", "artist-credit": [{"name": "Pink Floyd", "joinphrase": ""}],
+             "media": [{"format": "Blu-ray", "track-count": 22}]},
+            {"id": "cd", "title": "Pulse", "date": "1995-05-29", "country": "GB",
+             "status": "Official", "artist-credit": [{"name": "Pink Floyd", "joinphrase": ""}],
+             "media": [{"format": "CD", "track-count": 11},
+                       {"format": "CD", "track-count": 13}]},
+            {"id": "hybrid", "title": "Pulse", "date": "2006-01-01", "country": "XE",
+             "status": "Official", "artist-credit": [{"name": "Pink Floyd", "joinphrase": ""}],
+             "media": [{"format": "CD", "track-count": 11},
+                       {"format": "CD", "track-count": 13},
+                       {"format": "DVD-Video", "track-count": 30}]}
+          ]
+        }"#;
+        let response: BrowseReleasesResponse = serde_json::from_str(json).unwrap();
+        let group = group_candidate("Pulse", "Album", "1995");
+        let releases = candidates_from_group(response, &group);
+        let ids: Vec<&str> = releases.iter().map(|r| r.mbid.as_str()).collect();
+        assert!(!ids.contains(&"dvd") && !ids.contains(&"bluray"), "{ids:?}");
+        assert_eq!(releases.len(), 2);
+        let hybrid = releases.iter().find(|r| r.mbid == "hybrid").unwrap();
+        assert_eq!(
+            hybrid.track_count, 24,
+            "the DVD's 30 tracks are not counted"
+        );
+    }
+
+    #[test]
+    fn a_group_with_only_video_releases_still_lists_them() {
+        let json = r#"{
+          "releases": [
+            {"id": "dvd", "title": "Concert", "artist-credit": [],
+             "media": [{"format": "DVD-Video", "track-count": 9}]}
+          ]
+        }"#;
+        let response: BrowseReleasesResponse = serde_json::from_str(json).unwrap();
+        let group = group_candidate("Concert", "Album", "2006");
+        assert_eq!(candidates_from_group(response, &group).len(), 1);
     }
 
     #[test]
