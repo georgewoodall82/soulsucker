@@ -13,7 +13,6 @@
 //! bundled LAME library; FFmpeg still handles decoding, resampling, channel
 //! conversion and the loudness filter.
 
-use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem::MaybeUninit;
@@ -27,7 +26,6 @@ use ffmpeg::format::Sample;
 use ffmpeg::{ChannelLayout, Rational, codec, filter, format, frame, media};
 use ffmpeg_next as ffmpeg;
 use mp3lame_encoder::{Bitrate, Builder, FlushGap, InterleavedPcm, Quality, VbrMode};
-use serde::Deserialize;
 
 use crate::config::AudioQuality;
 
@@ -36,8 +34,6 @@ use crate::config::AudioQuality;
 pub const TARGET_LUFS: f64 = -16.0;
 /// True-peak ceiling. -1.5 dBTP avoids clipping after lossy car playback.
 pub const TARGET_TRUE_PEAK_DB: f64 = -1.5;
-/// Loudness range target, in LU.
-pub const TARGET_LRA: f64 = 11.0;
 /// MP3 output bitrate.
 pub const MP3_BITRATE_KBPS: u32 = 320;
 /// Sanity bounds for the album gain, in dB, in case of bogus measurements.
@@ -52,12 +48,6 @@ fn init() {
         // The TUI owns the terminal; FFmpeg must not write diagnostics to it.
         ffmpeg::util::log::set_level(ffmpeg::util::log::Level::Quiet);
     });
-}
-
-#[derive(Debug, Deserialize)]
-struct LoudnormStats {
-    input_i: String,
-    input_tp: String,
 }
 
 /// One track's loudness, measured before any processing.
@@ -79,17 +69,6 @@ pub struct AlbumGain {
     pub integrated: f64,
     /// Loudest true peak on the album before the gain, dBTP.
     pub true_peak: f64,
-}
-
-impl LoudnormStats {
-    fn measured(self) -> Result<(f64, f64)> {
-        let integrated = parse_measurement("input_i", &self.input_i)?;
-        let true_peak = parse_measurement("input_tp", &self.input_tp)?;
-        if integrated <= -70.0 {
-            bail!("track is too quiet to measure");
-        }
-        Ok((integrated, true_peak))
-    }
 }
 
 /// One gain for the whole album: bring the album's integrated loudness to
@@ -135,11 +114,19 @@ pub fn album_gain(tracks: &[Loudness]) -> Option<AlbumGain> {
     })
 }
 
-fn parse_measurement(name: &str, value: &str) -> Result<f64> {
-    value
-        .trim()
-        .parse::<f64>()
-        .with_context(|| format!("loudnorm returned an invalid {name}: {value}"))
+/// Turn the filter's last integrated reading (LUFS) and loudest linear true
+/// peak into the measurement pair, rejecting silence and missing readings.
+fn measurement(integrated: Option<f64>, peak_linear: f64) -> Result<(f64, f64)> {
+    let integrated = integrated.ok_or_else(|| anyhow!("the loudness filter reported nothing"))?;
+    if !integrated.is_finite() || integrated <= -70.0 {
+        bail!("track is too quiet to measure");
+    }
+    let true_peak = if peak_linear > 0.0 {
+        20.0 * peak_linear.log10()
+    } else {
+        f64::NEG_INFINITY
+    };
+    Ok((integrated, true_peak))
 }
 
 fn extension(path: &Path) -> &str {
@@ -176,13 +163,7 @@ pub fn processing_phase(path: &Path, quality: AudioQuality, normalize: bool) -> 
 /// Measure a track's integrated loudness and true peak (one decode pass).
 pub fn measure_loudness(path: &Path) -> Result<Loudness> {
     init();
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("{} has no parent folder", path.display()))?;
-    let stats_path = parent.join(format!(".{}.json", temp_stem()));
-    let result = measure(path, &stats_path);
-    let _ = fs::remove_file(&stats_path);
-    let (integrated, true_peak) = result?;
+    let (integrated, true_peak) = measure(path)?;
     let duration_secs = crate::audio::duration_secs(path)?;
     Ok(Loudness {
         integrated,
@@ -245,7 +226,7 @@ fn gain_filter(gain_db: Option<f64>) -> Option<String> {
         .map(|gain| format!("volume={gain:.2}dB:precision=double"))
 }
 
-fn measure(input: &Path, stats_path: &Path) -> Result<(f64, f64)> {
+fn measure(input: &Path) -> Result<(f64, f64)> {
     let mut ictx =
         format::input(input).with_context(|| format!("could not open {}", input.display()))?;
     let stream = ictx
@@ -258,37 +239,41 @@ fn measure(input: &Path, stats_path: &Path) -> Result<(f64, f64)> {
         .audio()?;
     decoder.set_parameters(stream.parameters())?;
 
-    // loudnorm's first pass only measures; its output frames are discarded.
-    let spec = format!(
-        "loudnorm=I={TARGET_LUFS}:TP={TARGET_TRUE_PEAK_DB}:LRA={TARGET_LRA}:print_format=json:stats_file={}",
-        escape_filter_value(
-            stats_path
-                .to_str()
-                .ok_or_else(|| anyhow!("the stats path is not valid UTF-8"))?
-        )
-    );
+    // The `ebur128` filter measures BS.1770 integrated loudness and true peak
+    // several times faster than `loudnorm`'s analysis pass (which also
+    // computes things the album gain does not use). It passes audio through
+    // and publishes its running readings as frame metadata; the last
+    // integrated reading covers the whole track, and the true peak is the
+    // loudest frame's. Its output is packed doubles, so ask the sink for that
+    // to avoid a pointless conversion.
     let mut graph = build_graph(
         &decoder,
-        decoder.format(),
+        Sample::F64(format::sample::Type::Packed),
         decoder.rate(),
         decoder.channel_layout(),
-        Some(&spec),
+        Some("ebur128=peak=true:metadata=1:framelog=quiet"),
     )?;
 
-    run_decode(
-        &mut ictx,
-        stream_index,
-        &mut decoder,
-        &mut graph,
-        |_| Ok(()),
-    )?;
+    let mut integrated = None;
+    let mut peak_linear = 0.0_f64;
+    run_decode(&mut ictx, stream_index, &mut decoder, &mut graph, |frame| {
+        let metadata = frame.metadata();
+        if let Some(value) = metadata
+            .get("lavfi.r128.I")
+            .and_then(|value| value.trim().parse::<f64>().ok())
+        {
+            integrated = Some(value);
+        }
+        if let Some(value) = metadata
+            .get("lavfi.r128.true_peak")
+            .and_then(|value| value.trim().parse::<f64>().ok())
+        {
+            peak_linear = peak_linear.max(value);
+        }
+        Ok(())
+    })?;
     drop(graph);
-
-    let json = fs::read_to_string(stats_path)
-        .with_context(|| format!("loudnorm did not write {}", stats_path.display()))?;
-    let stats: LoudnormStats =
-        serde_json::from_str(&json).context("could not parse loudnorm measurements")?;
-    stats.measured()
+    measurement(integrated, peak_linear)
 }
 
 fn apply_flac(input: &Path, output: &Path, filter: Option<&str>) -> Result<()> {
@@ -607,17 +592,6 @@ fn build_graph(
     Ok(graph)
 }
 
-fn escape_filter_value(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for ch in value.chars() {
-        if matches!(ch, '\\' | '\'' | ':' | ',' | '[' | ']' | ';') {
-            let _ = escaped.write_char('\\');
-        }
-        let _ = escaped.write_char(ch);
-    }
-    escaped
-}
-
 fn run_decode<F>(
     ictx: &mut format::context::Input,
     stream_index: usize,
@@ -763,45 +737,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn loudnorm_stats_become_measurements() {
-        let stats: LoudnormStats = serde_json::from_str(
-            r#"{
-                "input_i" : "-27.61",
-                "input_tp" : "-2.32",
-                "input_lra" : "0.70",
-                "input_thresh" : "-38.83",
-                "output_i" : "-16.01",
-                "output_tp" : "-1.50",
-                "output_lra" : "0.70",
-                "output_thresh" : "-27.23",
-                "normalization_type" : "linear",
-                "target_offset" : "0.01"
-            }"#,
-        )
-        .unwrap();
-        assert_eq!(stats.measured().unwrap(), (-27.61, -2.32));
+    fn filter_readings_become_measurements() {
+        // A linear true peak of 0.13 is about -17.7 dBTP.
+        let (integrated, true_peak) = measurement(Some(-29.02), 0.130).unwrap();
+        assert_eq!(integrated, -29.02);
+        assert!((true_peak - -17.72).abs() < 0.01, "{true_peak}");
     }
 
     #[test]
-    fn invalid_or_silent_stats_are_rejected() {
-        let stats: LoudnormStats = serde_json::from_str(
-            r#"{
-                "input_i" : "-inf",
-                "input_tp" : "-inf",
-                "input_lra" : "0.00",
-                "input_thresh" : "-70.00",
-                "target_offset" : "0.00"
-            }"#,
-        )
-        .unwrap();
-        assert!(stats.measured().is_err());
+    fn missing_or_silent_readings_are_rejected() {
+        assert!(measurement(None, 0.5).is_err());
+        assert!(measurement(Some(f64::NEG_INFINITY), 0.0).is_err());
+        assert!(measurement(Some(-70.0), 0.0).is_err());
     }
 
     #[test]
     fn targets_are_safe_defaults() {
         assert_eq!(TARGET_LUFS, -16.0);
         assert_eq!(TARGET_TRUE_PEAK_DB, -1.5);
-        assert_eq!(TARGET_LRA, 11.0);
         assert_eq!(MP3_BITRATE_KBPS, 320);
     }
 

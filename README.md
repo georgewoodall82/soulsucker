@@ -419,7 +419,7 @@ when tags are written, so enable it and rerun with `--force` to retag an
 existing download.
 
 `normalize_loudness = true` applies an EBU R128 **album gain**. Each verified
-track's integrated loudness and true peak are measured with FFmpeg's `loudnorm`
+track's integrated loudness and true peak are measured with FFmpeg's `ebur128`
 filter, and the track waits in staging ("verified · waiting for the rest of
 the album") until every track has finished or given up. The album loudness is
 the duration-weighted energy mean of the tracks, and one gain brings it to
