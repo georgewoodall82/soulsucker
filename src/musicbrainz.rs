@@ -51,45 +51,77 @@ fn throttle() {
     *guard = Some(Instant::now());
 }
 
-fn should_retry(retryable: bool, attempt: u32) -> bool {
-    retryable && attempt < MAX_RETRIES
+fn should_retry(retryable: bool, attempt: u32, retries: u32) -> bool {
+    retryable && attempt < retries
 }
 
 fn retry_delay(attempt: u32) -> Duration {
     Duration::from_secs(2 + attempt as u64 * 2)
 }
 
+/// Whether a failure is about reaching MusicBrainz (or it being overloaded)
+/// rather than about the request itself, so trying again can help.
+fn is_transient(err: &ureq::Error) -> bool {
+    matches!(
+        err,
+        ureq::Error::StatusCode(429 | 500 | 502 | 503 | 504)
+            | ureq::Error::Timeout(_)
+            | ureq::Error::Io(_)
+            | ureq::Error::HostNotFound
+            | ureq::Error::ConnectionFailed
+    )
+}
+
+/// A failure to reach MusicBrainz. Callers that must not give up on a flaky
+/// connection look for this type with `downcast_ref`.
+#[derive(Debug)]
+pub struct Unreachable(pub String);
+
+impl std::fmt::Display for Unreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unreachable {}
+
 fn get_json<T: DeserializeOwned>(url: &str, query: &[(&str, String)]) -> Result<T> {
-    let mut last_error = None;
-    for attempt in 0..=MAX_RETRIES {
+    get_json_with_retries(url, query, MAX_RETRIES)
+}
+
+/// One request plus up to `retries` slow retries of transient failures. A
+/// transient failure that outlasts them is reported as [`Unreachable`].
+fn get_json_with_retries<T: DeserializeOwned>(
+    url: &str,
+    query: &[(&str, String)],
+    retries: u32,
+) -> Result<T> {
+    let mut last_error: Option<(String, bool)> = None;
+    for attempt in 0..=retries {
         throttle();
         let request = http()
             .get(url)
             .query_pairs(query.iter().map(|(key, value)| (*key, value.as_str())));
-        match request.call() {
-            Ok(mut response) => {
-                return response
-                    .body_mut()
-                    .read_json::<T>()
-                    .with_context(|| format!("could not parse MusicBrainz response from {url}"));
-            }
+        let outcome = request
+            .call()
+            .and_then(|mut response| response.body_mut().read_json::<T>());
+        match outcome {
+            Ok(value) => return Ok(value),
             Err(err) => {
-                let retryable = matches!(
-                    err,
-                    ureq::Error::StatusCode(429 | 502 | 503 | 504)
-                        | ureq::Error::Timeout(_)
-                        | ureq::Error::Io(_)
-                );
-                let message = friendly_http_error(&err);
-                last_error = Some(anyhow!(message));
-                if !should_retry(retryable, attempt) {
+                let retryable = is_transient(&err);
+                last_error = Some((friendly_http_error(&err), retryable));
+                if !should_retry(retryable, attempt, retries) {
                     break;
                 }
                 std::thread::sleep(retry_delay(attempt));
             }
         }
     }
-    Err(last_error.unwrap_or_else(|| anyhow!("MusicBrainz request failed")))
+    match last_error {
+        Some((message, true)) => Err(anyhow::Error::new(Unreachable(message))),
+        Some((message, false)) => Err(anyhow!(message)),
+        None => Err(anyhow!("MusicBrainz request failed")),
+    }
 }
 
 fn friendly_http_error(err: &ureq::Error) -> String {
@@ -741,24 +773,90 @@ fn preferred_remaster(release: &ReleaseCandidate) -> bool {
 
 /// Every release (pressing) in a release group, with full tracklists and
 /// track lengths. Releases without audio tracks are skipped.
-pub fn get_group_release_details(release_group_mbid: &str) -> Result<Vec<ReleaseInfo>> {
-    let url = format!("{MB_BASE}/release/");
+/// A MusicBrainz that cannot be reached is tried again about once a second (the request spacing) until it
+/// answers or `cancelled` says to stop. Every attempt is reported through
+/// `log`. Pages already fetched are kept across attempts. Only errors that are
+/// not about the connection (a 404, an unreadable answer) are returned.
+pub fn get_group_release_details(
+    release_group_mbid: &str,
+    cancelled: &dyn Fn() -> bool,
+    log: &dyn Fn(String),
+) -> Result<Vec<ReleaseInfo>> {
+    let mut attempt = 0u32;
+    let result = collect_group_release_details(|offset| {
+        retry_until_reachable(&mut attempt, cancelled, log, || {
+            fetch_detail_page(release_group_mbid, offset, 0)
+        })
+    });
+    if result.is_ok() && attempt == 1 {
+        log("MusicBrainz answered on the first attempt.".to_string());
+    }
+    result
+}
+
+/// Run `fetch` until it stops failing with [`Unreachable`], logging every
+/// attempt. `attempt` counts across calls so a multi-page lookup numbers its
+/// attempts continuously. Spacing between attempts comes from the request
+/// throttle inside `fetch`.
+fn retry_until_reachable<T>(
+    attempt: &mut u32,
+    cancelled: &dyn Fn() -> bool,
+    log: &dyn Fn(String),
+    mut fetch: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    loop {
+        if cancelled() {
+            return Err(anyhow!("pressing lookup cancelled"));
+        }
+        *attempt += 1;
+        if *attempt == 1 {
+            log("Connecting to MusicBrainz to look up other pressings…".to_string());
+        }
+        match fetch() {
+            Ok(value) => {
+                if *attempt > 1 {
+                    log(format!("MusicBrainz attempt {attempt} succeeded."));
+                }
+                return Ok(value);
+            }
+            Err(err) if err.downcast_ref::<Unreachable>().is_some() => {
+                log(format!(
+                    "MusicBrainz attempt {attempt} failed ({err}); trying again in a second…"
+                ));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn fetch_detail_page(
+    release_group_mbid: &str,
+    offset: usize,
+    retries: u32,
+) -> Result<BrowseDetailResponse> {
+    get_json_with_retries(
+        &format!("{MB_BASE}/release/"),
+        &[
+            ("release-group", release_group_mbid.to_string()),
+            (
+                "inc",
+                "recordings+artist-credits+release-groups".to_string(),
+            ),
+            ("fmt", "json".to_string()),
+            ("limit", "100".to_string()),
+            ("offset", offset.to_string()),
+        ],
+        retries,
+    )
+}
+
+fn collect_group_release_details(
+    mut page: impl FnMut(usize) -> Result<BrowseDetailResponse>,
+) -> Result<Vec<ReleaseInfo>> {
     let mut releases = Vec::new();
     let mut offset = 0usize;
     for _ in 0..MAX_PRESSING_PAGES {
-        let response: BrowseDetailResponse = get_json(
-            &url,
-            &[
-                ("release-group", release_group_mbid.to_string()),
-                (
-                    "inc",
-                    "recordings+artist-credits+release-groups".to_string(),
-                ),
-                ("fmt", "json".to_string()),
-                ("limit", "100".to_string()),
-                ("offset", offset.to_string()),
-            ],
-        )?;
+        let response = page(offset)?;
         let received = response.releases.len();
         releases.extend(
             response
@@ -1458,12 +1556,74 @@ mod tests {
     }
 
     #[test]
+    fn an_unreachable_musicbrainz_is_retried_until_it_answers_and_every_attempt_is_logged() {
+        use std::cell::{Cell, RefCell};
+        let lines = RefCell::new(Vec::new());
+        let calls = Cell::new(0u32);
+        let mut attempt = 0;
+        let value = retry_until_reachable(
+            &mut attempt,
+            &|| false,
+            &|line| lines.borrow_mut().push(line),
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() < 4 {
+                    Err(anyhow::Error::new(Unreachable("timed out".into())))
+                } else {
+                    Ok(7)
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!((value, attempt), (7, 4));
+        let lines = lines.into_inner();
+        assert!(lines[0].starts_with("Connecting to MusicBrainz"));
+        assert_eq!(
+            lines.iter().filter(|line| line.contains("failed")).count(),
+            3
+        );
+        assert!(lines.last().unwrap().contains("attempt 4 succeeded"));
+    }
+
+    #[test]
+    fn retrying_stops_on_cancel_and_on_errors_that_are_not_about_the_connection() {
+        use std::cell::Cell;
+        let mut attempt = 0;
+        let cancelled = Cell::new(false);
+        let result: Result<()> =
+            retry_until_reachable(&mut attempt, &|| cancelled.get(), &|_| {}, || {
+                cancelled.set(true);
+                Err(anyhow::Error::new(Unreachable("down".into())))
+            });
+        assert!(result.is_err());
+        assert_eq!(attempt, 1);
+
+        let mut attempt = 0;
+        let result: Result<()> = retry_until_reachable(&mut attempt, &|| false, &|_| {}, || {
+            Err(anyhow!("MusicBrainz has no such release"))
+        });
+        assert!(result.is_err());
+        assert_eq!(attempt, 1);
+    }
+
+    #[test]
+    fn connection_failures_are_transient_but_request_errors_are_not() {
+        assert!(is_transient(&ureq::Error::HostNotFound));
+        assert!(is_transient(&ureq::Error::ConnectionFailed));
+        assert!(is_transient(&ureq::Error::StatusCode(503)));
+        assert!(is_transient(&ureq::Error::StatusCode(429)));
+        assert!(!is_transient(&ureq::Error::StatusCode(404)));
+        assert!(!is_transient(&ureq::Error::StatusCode(400)));
+    }
+
+    #[test]
     fn transient_errors_are_retried_three_times() {
-        assert!(should_retry(true, 0));
-        assert!(should_retry(true, 1));
-        assert!(should_retry(true, 2));
-        assert!(!should_retry(true, MAX_RETRIES));
-        assert!(!should_retry(false, 0));
+        assert!(should_retry(true, 0, MAX_RETRIES));
+        assert!(should_retry(true, 1, MAX_RETRIES));
+        assert!(should_retry(true, 2, MAX_RETRIES));
+        assert!(!should_retry(true, MAX_RETRIES, MAX_RETRIES));
+        assert!(!should_retry(false, 0, MAX_RETRIES));
+        assert!(!should_retry(true, 0, 0));
         assert_eq!(retry_delay(0), Duration::from_secs(2));
         assert_eq!(retry_delay(1), Duration::from_secs(4));
         assert_eq!(retry_delay(2), Duration::from_secs(6));

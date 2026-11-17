@@ -263,7 +263,10 @@ soulsucker --no-fingerprint
    fitting pressing replaces the selected release — expected lengths,
    MusicBrainz IDs and release date — and the held file is verified again;
    tracks already saved are retagged. An album switches pressing at most
-   twice.
+   twice. If MusicBrainz cannot be reached, the lookup does not give up: it
+   retries about once a second until MusicBrainz answers, and every attempt
+   appears in the activity log (the held track shows "checking pressings"
+   meanwhile; cancelling it stops the retries).
    A wrong version, a stall, a queue timeout or a rejected transfer moves on
    to the next-best source (for a track from the chosen full-album peer, the
    other peers' copies of that track). If every source fails, the list is retried in
@@ -428,6 +431,14 @@ the duration-weighted energy mean of the tracks, and one gain brings it to
 per-track adjustment or limiter, so tracks keep their mastered balance and
 gapless transitions stay seamless. A quiet album with one very peaky track can
 therefore end up a little below -16 LUFS rather than being squashed.
+
+The one exception is a track that had to come from a different source than the
+rest of the album (for example when the chosen copy's track was the wrong
+length and no matching pressing was found). Another master of a song can be
+many dB louder, so such tracks are left out of the album loudness and are
+instead matched to the level the rest of the album ends up at (still within
+the -1.5 dBTP ceiling). That way one loud outlier neither sticks out nor holds
+the whole album's gain down.
 
 FLAC output is re-encoded losslessly. In MP3 320 mode the album gain and any
 FLAC-to-MP3 conversion happen in one encode. The processed file replaces the

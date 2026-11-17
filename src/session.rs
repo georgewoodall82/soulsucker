@@ -631,6 +631,17 @@ impl Session {
     fn tick(&mut self) {
         self.check_session();
         self.manage_extras();
+        // Nobody is waiting for the pressing lookup any more (the held tracks
+        // were cancelled): stop retrying MusicBrainz.
+        if let Some(album) = self.album.as_ref()
+            && album.pressing_search_running
+            && !album
+                .tracks
+                .iter()
+                .any(|track| track.pressing_hold.is_some())
+        {
+            album.pressing_cancel.store(true, Ordering::Relaxed);
+        }
         // Album gain works on local files and does not need the session.
         self.check_album_gain_deadlines();
         self.run_verification_queue();
@@ -780,9 +791,11 @@ impl Session {
             source_mode: SourceMode::Mixed,
             source_activity: None,
             album_gain: None,
+            off_source_level: None,
             observed_secs: Vec::new(),
             pressings: None,
             pressing_search_running: false,
+            pressing_cancel: Arc::new(AtomicBool::new(false)),
             pressing_search_id: 0,
             pressing_switches: 0,
         };
@@ -1844,6 +1857,7 @@ impl Session {
                 path: normalized_path,
                 note: result.note,
                 loudness,
+                from_album_source,
                 deadline: None,
             };
             self.hold_for_album_gain(album, index, pending);
@@ -2025,11 +2039,22 @@ impl Session {
         let search_id = album.pressing_search_id;
         let group = album.job.release_group_mbid.clone();
         let tx = self.inner_tx.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        album.pressing_cancel = cancel.clone();
+        let log_events = events.clone();
         let spawned = thread::Builder::new()
             .name("pressing-lookup".to_string())
             .spawn(move || {
-                let result =
-                    musicbrainz::get_group_release_details(&group).map_err(|err| err.to_string());
+                // MusicBrainz being unreachable must not be read as "no other
+                // pressing exists", so keep trying until it answers.
+                let result = musicbrainz::get_group_release_details(
+                    &group,
+                    &|| cancel.load(Ordering::Relaxed),
+                    &|line| {
+                        let _ = log_events.send(SlskEvent::Log(LogLevel::Info, line));
+                    },
+                )
+                .map_err(|err| err.to_string());
                 let _ = tx.send(SessionCommand::PressingsFetched {
                     job_id,
                     search_id,
@@ -2064,6 +2089,7 @@ impl Session {
         album.pressing_search_running = false;
         match result {
             Ok(pressings) => album.pressings = Some(Arc::new(pressings)),
+            Err(_) if album.pressing_cancel.load(Ordering::Relaxed) => {}
             Err(err) => {
                 // Not cached: a later length mismatch may try again.
                 let _ = self.events.send(SlskEvent::Log(
@@ -2172,13 +2198,40 @@ impl Session {
         let gain_db = match album.album_gain {
             Some(gain) => gain,
             None => {
+                // With a chosen album copy, only its tracks set the album
+                // gain; tracks taken from other sources are matched to the
+                // result instead of dragging it around.
+                let own_tracks = album
+                    .tracks
+                    .iter()
+                    .filter_map(|track| track.pending.as_ref())
+                    .filter(|pending| pending.from_album_source && pending.loudness.is_some())
+                    .count();
+                let split = own_tracks >= 2;
                 let measured: Vec<Loudness> = album
                     .tracks
                     .iter()
-                    .filter_map(|track| track.pending.as_ref()?.loudness)
+                    .filter_map(|track| track.pending.as_ref())
+                    .filter(|pending| !split || pending.from_album_source)
+                    .filter_map(|pending| pending.loudness)
                     .collect();
+                let off_source = album
+                    .tracks
+                    .iter()
+                    .filter_map(|track| track.pending.as_ref())
+                    .filter(|pending| !pending.from_album_source && pending.loudness.is_some())
+                    .count();
                 let gain_db = match normalize::album_gain(&measured) {
                     Some(gain) => {
+                        if split && off_source > 0 {
+                            album.off_source_level = Some(gain.integrated + gain.gain_db);
+                            let _ = events.send(SlskEvent::Log(
+                                LogLevel::Info,
+                                format!(
+                                    "{off_source} track(s) came from another source; matching them to the album's level instead."
+                                ),
+                            ));
+                        }
                         let _ = events.send(SlskEvent::Log(
                             LogLevel::Info,
                             format!(
@@ -2208,6 +2261,7 @@ impl Session {
         let job_id = album.job.job_id;
         let quality = album.job.options.audio_quality;
         let max = album.job.options.max_processing.max(1);
+        let off_source_level = album.off_source_level;
         let mut running = processing_in_use(album);
         for (index, track) in album.tracks.iter_mut().enumerate() {
             if running >= max {
@@ -2220,6 +2274,17 @@ impl Session {
                 continue;
             }
             running += 1;
+            let matched = match (
+                pending.from_album_source,
+                off_source_level,
+                pending.loudness,
+            ) {
+                (false, Some(level), Some(loudness)) => {
+                    Some(normalize::matched_gain(&loudness, level))
+                }
+                _ => None,
+            };
+            let gain_db = matched.unwrap_or(gain_db);
             pending.deadline = Some(verification_deadline(
                 Instant::now(),
                 track.meta.expected_secs,
@@ -2251,10 +2316,15 @@ impl Session {
                 // Let the deadline check handle it on the next tick.
                 pending.deadline = Some(Instant::now());
             }
-            track.note = if normalize::needs_conversion(&pending.path, quality) {
-                format!("album gain {gain_db:+.1} dB → MP3")
+            let label = if matched.is_some() {
+                "matched to album"
             } else {
-                format!("album gain {gain_db:+.1} dB")
+                "album gain"
+            };
+            track.note = if normalize::needs_conversion(&pending.path, quality) {
+                format!("{label} {gain_db:+.1} dB → MP3")
+            } else {
+                format!("{label} {gain_db:+.1} dB")
             };
             let _ = events.send(SlskEvent::Track(track.update(job_id)));
         }
@@ -2636,6 +2706,7 @@ impl Session {
     fn cancel_album(&mut self) {
         if let Some(album) = self.album.as_mut() {
             album.search_cancel.store(true, Ordering::Relaxed);
+            album.pressing_cancel.store(true, Ordering::Relaxed);
         }
         self.fail_active_tracks("download cancelled", false);
         let events = self.events.clone();
@@ -2655,6 +2726,7 @@ impl Session {
     fn cleanup_shutdown(&mut self) {
         if let Some(album) = self.album.as_mut() {
             album.search_cancel.store(true, Ordering::Relaxed);
+            album.pressing_cancel.store(true, Ordering::Relaxed);
         }
         self.fail_active_tracks("app closed", false);
         if let Some(album) = self.album.take() {
@@ -2811,12 +2883,20 @@ struct AlbumState {
     /// The one gain applied to every track, once computed. Tracks finished
     /// later (a retry) reuse it so the album stays consistent.
     album_gain: Option<f64>,
+    /// Loudness (LUFS, after the album gain) that tracks from outside the
+    /// chosen album copy are matched to. Another master of a song can be many
+    /// dB louder, and one static gain would leave it sticking out and let its
+    /// peak hold the whole album down. Set together with `album_gain`.
+    off_source_level: Option<f64>,
     /// Actual lengths of the chosen full-album copy's files, per track, from
     /// verification (including files rejected only on length).
     observed_secs: Vec<Option<f64>>,
     /// Every pressing in the release group, once fetched.
     pressings: Option<Arc<Vec<ReleaseInfo>>>,
     pressing_search_running: bool,
+    /// Stops the running pressing lookup, which otherwise keeps retrying an
+    /// unreachable MusicBrainz.
+    pressing_cancel: Arc<AtomicBool>,
     pressing_search_id: u64,
     pressing_switches: u32,
 }
@@ -2949,6 +3029,9 @@ struct PendingAlbumGain {
     /// The verification note, shown when the track is done.
     note: String,
     loudness: Option<Loudness>,
+    /// Whether the file is the chosen full-album copy's own file. Only those
+    /// tracks share the album gain; see `AlbumState::off_source_level`.
+    from_album_source: bool,
     /// Set when the gain worker starts.
     deadline: Option<Instant>,
 }
@@ -3887,9 +3970,11 @@ mod tests {
             source_mode: SourceMode::Mixed,
             source_activity: None,
             album_gain: None,
+            off_source_level: None,
             observed_secs: vec![None],
             pressings: None,
             pressing_search_running: false,
+            pressing_cancel: Arc::new(AtomicBool::new(false)),
             pressing_search_id: 0,
             pressing_switches: 0,
         }
@@ -4213,6 +4298,7 @@ mod tests {
                 true_peak: -6.0,
                 duration_secs: 180.0,
             }),
+            from_album_source: true,
             deadline: None,
         });
     }
@@ -4232,6 +4318,26 @@ mod tests {
         hold(&mut album.tracks[1], -24.0, &staging);
         album.tracks[2].status = TrackStatus::Downloading;
         (album, staging)
+    }
+
+    #[test]
+    fn a_track_from_another_source_does_not_set_the_album_gain() {
+        let (mut album, staging) = album_waiting_for_gain(AudioQuality::Flac);
+        hold(&mut album.tracks[2], -10.0, &staging);
+        album.tracks[2].pending.as_mut().unwrap().from_album_source = false;
+        let own_only = normalize::album_gain(&[
+            album.tracks[0].pending.as_ref().unwrap().loudness.unwrap(),
+            album.tracks[1].pending.as_ref().unwrap().loudness.unwrap(),
+        ])
+        .unwrap();
+        let (mut session, _events) = offline_session(album);
+        session.run_album_gain();
+        let album = session.album.as_ref().unwrap();
+        assert_eq!(album.album_gain, Some(own_only.gain_db));
+        assert_eq!(
+            album.off_source_level,
+            Some(own_only.integrated + own_only.gain_db)
+        );
     }
 
     fn release_with_lengths(mbid: &str, lengths: [u64; 3]) -> ReleaseInfo {

@@ -114,6 +114,15 @@ pub fn album_gain(tracks: &[Loudness]) -> Option<AlbumGain> {
     })
 }
 
+/// The gain that brings one track to `target_lufs`, for tracks that do not
+/// share the album gain (another master of the song). The same true-peak
+/// ceiling applies, so a very peaky track may end up a little below target.
+pub fn matched_gain(track: &Loudness, target_lufs: f64) -> f64 {
+    (target_lufs - track.integrated)
+        .min(TARGET_TRUE_PEAK_DB - track.true_peak)
+        .clamp(MAX_ALBUM_CUT_DB, MAX_ALBUM_BOOST_DB)
+}
+
 /// Turn the filter's last integrated reading (LUFS) and loudest linear true
 /// peak into the measurement pair, rejecting silence and missing readings.
 fn measurement(integrated: Option<f64>, peak_linear: f64) -> Result<(f64, f64)> {
@@ -749,6 +758,25 @@ mod tests {
         assert!(measurement(None, 0.5).is_err());
         assert!(measurement(Some(f64::NEG_INFINITY), 0.0).is_err());
         assert!(measurement(Some(-70.0), 0.0).is_err());
+    }
+
+    #[test]
+    fn an_outlier_track_is_matched_to_the_album_level_without_moving_the_album() {
+        let own = [track(-23.0, -8.0, 200.0), track(-21.0, -5.0, 200.0)];
+        let album = album_gain(&own).unwrap();
+        let level = album.integrated + album.gain_db;
+        // A much louder master of another song on the album.
+        let loud = track(-11.8, -1.6, 130.0);
+        let gain = matched_gain(&loud, level);
+        assert!(gain < album.gain_db, "{gain} vs {}", album.gain_db);
+        assert!((loud.integrated + gain - level).abs() < 0.01);
+        // Including it in the album gain instead would cap the album: its
+        // peak holds everything else down.
+        let mixed = album_gain(&[own[0], own[1], loud]).unwrap();
+        assert!(mixed.gain_db < album.gain_db - 1.0);
+        // The ceiling still applies to a very peaky track.
+        let peaky = track(-30.0, -0.5, 100.0);
+        assert!(peaky.true_peak + matched_gain(&peaky, level) <= TARGET_TRUE_PEAK_DB + 1e-9);
     }
 
     #[test]
