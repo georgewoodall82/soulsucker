@@ -3,6 +3,7 @@ mod app;
 mod audio;
 mod cli;
 mod config;
+mod cover;
 mod input;
 mod matcher;
 mod musicbrainz;

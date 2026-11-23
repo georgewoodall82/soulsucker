@@ -12,7 +12,7 @@ use ratatui::DefaultTerminal;
 
 use crate::acoustid;
 use crate::cli::Args;
-use crate::config::{self, AudioQuality, Config};
+use crate::config::{self, AudioQuality, Config, NormalizeMethod};
 use crate::input::TextInput;
 use crate::musicbrainz::{self, ReleaseCandidate, ReleaseGroupCandidate, ReleaseInfo};
 use crate::session::{
@@ -639,6 +639,9 @@ pub enum SettingKey {
     DiscPrefixTracks,
     AlbumArtistTracks,
     NormalizeLoudness,
+    NormalizeTarget,
+    NormalizeMethod,
+    FolderCover,
     CheckUpdates,
 }
 
@@ -654,7 +657,10 @@ impl SettingKey {
             | Self::Quality
             | Self::DiscPrefixTracks
             | Self::AlbumArtistTracks
-            | Self::NormalizeLoudness => SettingsTab::Library,
+            | Self::NormalizeLoudness
+            | Self::NormalizeTarget
+            | Self::NormalizeMethod
+            | Self::FolderCover => SettingsTab::Library,
             Self::MaxConcurrent
             | Self::MaxProcessing
             | Self::SearchTimeout
@@ -762,9 +768,9 @@ impl SettingsForm {
             field(
                 SettingKey::Quality,
                 "Audio quality",
-                "MP3 320 falls back to FLAC",
+                "MP3/Opus are made from FLAC",
                 config.audio_quality.label().to_string(),
-                SettingKind::Choice(&["FLAC", "MP3 320"]),
+                SettingKind::Choice(&["FLAC", "MP3 320", "Opus 128 VBR"]),
             ),
             field(
                 SettingKey::MaxConcurrent,
@@ -880,13 +886,37 @@ impl SettingsForm {
             field(
                 SettingKey::NormalizeLoudness,
                 "Normalize loudness",
-                "-16 LUFS · album gain",
+                "one gain for the whole album",
                 if config.normalize_loudness {
                     "on"
                 } else {
                     "off"
                 }
                 .to_string(),
+                SettingKind::Bool,
+            ),
+            field(
+                SettingKey::NormalizeTarget,
+                "Loudness target",
+                "LUFS, -30 to -6 · default -16",
+                format_number(config.normalize_target_lufs),
+                SettingKind::Float {
+                    min: config::MIN_TARGET_LUFS,
+                    max: config::MAX_TARGET_LUFS,
+                },
+            ),
+            field(
+                SettingKey::NormalizeMethod,
+                "Normalize by",
+                "gain re-encodes · tags only",
+                config.normalize_method.label().to_string(),
+                SettingKind::Choice(&["Apply gain", "ReplayGain tags"]),
+            ),
+            field(
+                SettingKey::FolderCover,
+                "Folder cover.jpg",
+                "500x500 beside the tracks",
+                if config.folder_cover { "on" } else { "off" }.to_string(),
                 SettingKind::Bool,
             ),
             field(
@@ -1112,6 +1142,16 @@ impl SettingsForm {
                 SettingKey::NormalizeLoudness => {
                     config.normalize_loudness = value == "on";
                 }
+                SettingKey::NormalizeTarget => {
+                    config.normalize_target_lufs = parse_f64(&value, index, field)?
+                }
+                SettingKey::NormalizeMethod => {
+                    config.normalize_method = NormalizeMethod::parse(&value)
+                        .ok_or_else(|| (index, format!("{}: invalid method", field.label)))?
+                }
+                SettingKey::FolderCover => {
+                    config.folder_cover = value == "on";
+                }
                 SettingKey::CheckUpdates => {}
             }
         }
@@ -1122,6 +1162,8 @@ impl SettingsForm {
                 self.index_of(SettingKey::Username)
             } else if error.contains("password") {
                 self.index_of(SettingKey::Password)
+            } else if error.contains("Loudness target") {
+                self.index_of(SettingKey::NormalizeTarget)
             } else {
                 0
             };
@@ -2159,6 +2201,9 @@ impl App {
             disc_prefix_track_numbers: self.cfg.disc_prefix_track_numbers,
             album_artist_for_tracks: self.cfg.album_artist_for_tracks,
             normalize_loudness: self.cfg.normalize_loudness,
+            normalize_target_lufs: self.cfg.normalize_target_lufs,
+            normalize_method: self.cfg.normalize_method,
+            folder_cover: self.cfg.folder_cover,
             audio_quality: self.cfg.audio_quality,
         };
         let request = DownloadRequest {
@@ -2169,6 +2214,7 @@ impl App {
             release_mbid: release.mbid.clone(),
             release_group_mbid: release.release_group_mbid.clone(),
             album_dir: album_dir.clone(),
+            loose_files: release.is_single() || release.title.trim().is_empty(),
             tracks: planned.iter().map(|track| track.meta.clone()).collect(),
             options,
             force: self.force,
@@ -3333,6 +3379,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn opus_layout_uses_opus_filenames() {
+        let config = Config {
+            music_dir: "/tmp/soulsucker-layout".into(),
+            audio_quality: AudioQuality::Opus,
+            ..Config::default()
+        };
+        let tracks = TracksView::build(release_for_test("Album"), &config);
+        assert_eq!(
+            tracks.tracks[0].meta.final_path,
+            PathBuf::from("/tmp/soulsucker-layout/Artist/Album/01 - Song.opus")
+        );
+    }
+
+    #[test]
+    fn the_opus_setting_label_parses_back_to_opus() {
+        let base = configured();
+        let mut form = SettingsForm::from_config(&base);
+        let field = form
+            .fields
+            .iter_mut()
+            .find(|field| field.key == SettingKey::Quality)
+            .unwrap();
+        field.value = AudioQuality::Opus.label().into();
+        assert_eq!(
+            form.to_config(&base).unwrap().audio_quality,
+            AudioQuality::Opus
+        );
+    }
+
+    #[test]
+    fn a_loudness_target_outside_the_range_is_rejected_on_its_field() {
+        let base = configured();
+        let mut form = SettingsForm::from_config(&base);
+        let index = form.index_of(SettingKey::NormalizeTarget);
+        form.fields[index].value = "0".into();
+        let error = form.to_config(&base).unwrap_err();
+        assert_eq!(error.0, index);
+    }
+
     fn phase_update(attempt: usize) -> TrackUpdate {
         TrackUpdate {
             job_id: 1,
@@ -3401,6 +3487,21 @@ mod tests {
             .find(|field| field.key == SettingKey::Quality)
             .unwrap()
             .value = "MP3 320".into();
+        form.fields
+            .iter_mut()
+            .find(|field| field.key == SettingKey::NormalizeTarget)
+            .unwrap()
+            .value = "-14".into();
+        form.fields
+            .iter_mut()
+            .find(|field| field.key == SettingKey::NormalizeMethod)
+            .unwrap()
+            .value = "ReplayGain tags".into();
+        form.fields
+            .iter_mut()
+            .find(|field| field.key == SettingKey::FolderCover)
+            .unwrap()
+            .value = "on".into();
 
         let config = form.to_config(&base).unwrap();
         assert_eq!(config.max_concurrent, 8);
@@ -3410,6 +3511,9 @@ mod tests {
         assert!(config.album_artist_for_tracks);
         assert!(config.normalize_loudness);
         assert_eq!(config.audio_quality, AudioQuality::Mp3);
+        assert_eq!(config.normalize_target_lufs, -14.0);
+        assert_eq!(config.normalize_method, NormalizeMethod::ReplayGain);
+        assert!(config.folder_cover);
         assert_eq!(config.username, "user");
     }
 
@@ -3432,10 +3536,7 @@ mod tests {
         form.move_selection(1);
         assert_eq!(form.selected_field().unwrap().key, SettingKey::Quality);
         form.select_last();
-        assert_eq!(
-            form.selected_field().unwrap().key,
-            SettingKey::NormalizeLoudness
-        );
+        assert_eq!(form.selected_field().unwrap().key, SettingKey::FolderCover);
 
         form.switch_tab(1);
         assert_eq!(form.tab, SettingsTab::Downloading);

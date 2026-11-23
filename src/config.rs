@@ -19,12 +19,14 @@ pub const APP_NAME: &str = "soulsucker";
 /// Format written to the music folder.
 ///
 /// MP3 mode still accepts FLAC sources and converts them after verification;
-/// FLAC mode only downloads FLAC.
+/// FLAC mode only downloads FLAC. Opus mode only ever downloads FLAC (nobody
+/// shares Opus on Soulseek) and encodes it to Opus after verification.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AudioQuality {
     #[default]
     Flac,
     Mp3,
+    Opus,
 }
 
 impl AudioQuality {
@@ -32,6 +34,7 @@ impl AudioQuality {
         match self {
             Self::Flac => "flac",
             Self::Mp3 => "mp3",
+            Self::Opus => "opus",
         }
     }
 
@@ -39,6 +42,16 @@ impl AudioQuality {
         match self {
             Self::Flac => "FLAC",
             Self::Mp3 => "MP3 320",
+            Self::Opus => "Opus 128 VBR",
+        }
+    }
+
+    /// The format's short name, for status text.
+    pub fn format_name(self) -> &'static str {
+        match self {
+            Self::Flac => "FLAC",
+            Self::Mp3 => "MP3",
+            Self::Opus => "Opus",
         }
     }
 
@@ -47,6 +60,7 @@ impl AudioQuality {
         match self {
             Self::Flac => "FLAC",
             Self::Mp3 => "MP3 320 or FLAC",
+            Self::Opus => "FLAC",
         }
     }
 
@@ -54,11 +68,18 @@ impl AudioQuality {
         matches!(self, Self::Mp3)
     }
 
+    /// Whether finished files are encoded by us (so downloads go through a
+    /// conversion step) rather than kept as downloaded FLAC.
+    pub fn is_lossy(self) -> bool {
+        !matches!(self, Self::Flac)
+    }
+
     /// Serialized config value.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Flac => "flac",
             Self::Mp3 => "mp3_320",
+            Self::Opus => "opus_128",
         }
     }
 
@@ -68,6 +89,7 @@ impl AudioQuality {
         match value.as_str() {
             "flac" | "lossless" => Some(Self::Flac),
             "mp3" | "mp3_320" | "320" | "mp3_320kbps" => Some(Self::Mp3),
+            "opus" | "opus_128" | "opus_128_vbr" | "opus_128kbps" => Some(Self::Opus),
             _ => None,
         }
     }
@@ -88,6 +110,61 @@ impl<'de> Deserialize<'de> for AudioQuality {
     }
 }
 
+/// How loudness normalization reaches the player.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NormalizeMethod {
+    /// Re-encode every track with the album gain applied (the audio changes).
+    #[default]
+    Gain,
+    /// Leave the audio alone and write ReplayGain tags (R128 tags for Opus).
+    ReplayGain,
+}
+
+impl NormalizeMethod {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Gain => "Apply gain",
+            Self::ReplayGain => "ReplayGain tags",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Gain => "gain",
+            Self::ReplayGain => "replaygain",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+        match value.as_str() {
+            "gain" | "apply" | "apply_gain" | "hardcoded" | "hardcode" | "bake" => Some(Self::Gain),
+            "replaygain" | "replay_gain" | "replaygain_tags" | "tags" | "tag" | "rg" => {
+                Some(Self::ReplayGain)
+            }
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for NormalizeMethod {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for NormalizeMethod {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Ok(Self::parse(&value).unwrap_or_default())
+    }
+}
+
+/// Bounds for the normalization target, in LUFS.
+pub const MIN_TARGET_LUFS: f64 = -30.0;
+pub const MAX_TARGET_LUFS: f64 = -6.0;
+pub const DEFAULT_TARGET_LUFS: f64 = -16.0;
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -97,7 +174,7 @@ pub struct Config {
 
     /// Root folder that album folders are created inside.
     pub music_dir: String,
-    /// Output format: lossless FLAC or 320 kbps MP3.
+    /// Output format: lossless FLAC, 320 kbps MP3 or 128 kbps VBR Opus.
     pub audio_quality: AudioQuality,
 
     /// Maximum number of tracks downloading at once.
@@ -134,6 +211,12 @@ pub struct Config {
     pub album_artist_for_tracks: bool,
     /// Two-pass EBU R128 normalize downloaded tracks before tagging.
     pub normalize_loudness: bool,
+    /// Integrated loudness the album should play at, in LUFS.
+    pub normalize_target_lufs: f64,
+    /// Apply the gain to the audio, or only write ReplayGain tags.
+    pub normalize_method: NormalizeMethod,
+    /// Save the album cover as a 500x500 `cover.jpg` in each album folder.
+    pub folder_cover: bool,
 
     /// Runtime-only: enable verbose logging from the Soulseek library.
     #[serde(skip)]
@@ -164,6 +247,9 @@ impl Default for Config {
             disc_prefix_track_numbers: false,
             album_artist_for_tracks: false,
             normalize_loudness: false,
+            normalize_target_lufs: DEFAULT_TARGET_LUFS,
+            normalize_method: NormalizeMethod::Gain,
+            folder_cover: false,
             verbose_lib: false,
         }
     }
@@ -229,6 +315,11 @@ impl Config {
         if !(1..=100).contains(&self.mb_limit) {
             self.mb_limit = defaults.mb_limit;
         }
+        if !self.normalize_target_lufs.is_finite()
+            || !(MIN_TARGET_LUFS..=MAX_TARGET_LUFS).contains(&self.normalize_target_lufs)
+        {
+            self.normalize_target_lufs = defaults.normalize_target_lufs;
+        }
     }
 
     pub fn music_dir_path(&self) -> PathBuf {
@@ -282,6 +373,13 @@ impl Config {
         }
         if !(1..=100).contains(&self.mb_limit) {
             errors.push("MusicBrainz result limit must be between 1 and 100".to_string());
+        }
+        if !self.normalize_target_lufs.is_finite()
+            || !(MIN_TARGET_LUFS..=MAX_TARGET_LUFS).contains(&self.normalize_target_lufs)
+        {
+            errors.push(format!(
+                "Loudness target must be between {MIN_TARGET_LUFS} and {MAX_TARGET_LUFS} LUFS"
+            ));
         }
         errors
     }
@@ -542,12 +640,54 @@ mod tests {
         assert_eq!(AudioQuality::parse("mp3"), Some(AudioQuality::Mp3));
         assert_eq!(AudioQuality::parse("MP3 320"), Some(AudioQuality::Mp3));
         assert_eq!(AudioQuality::parse("mp3_320"), Some(AudioQuality::Mp3));
+        assert_eq!(
+            AudioQuality::parse("Opus 128 VBR"),
+            Some(AudioQuality::Opus)
+        );
+        assert_eq!(AudioQuality::parse("opus"), Some(AudioQuality::Opus));
         assert_eq!(AudioQuality::parse("nonsense"), None);
+        assert_eq!(
+            AudioQuality::parse(AudioQuality::Opus.label()),
+            Some(AudioQuality::Opus)
+        );
 
         let config: Config =
             toml::from_str("username = \"u\"\npassword = \"p\"\naudio_quality = \"nonsense\"\n")
                 .unwrap();
         assert_eq!(config.audio_quality, AudioQuality::Flac);
+    }
+
+    #[test]
+    fn loudness_options_round_trip_and_are_clamped() {
+        let config = Config {
+            normalize_loudness: true,
+            normalize_target_lufs: -14.0,
+            normalize_method: NormalizeMethod::ReplayGain,
+            folder_cover: true,
+            audio_quality: AudioQuality::Opus,
+            ..Config::default()
+        };
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert!(text.contains("normalize_method = \"replaygain\""), "{text}");
+        assert!(text.contains("audio_quality = \"opus_128\""), "{text}");
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.normalize_target_lufs, -14.0);
+        assert_eq!(back.normalize_method, NormalizeMethod::ReplayGain);
+        assert!(back.folder_cover);
+        assert_eq!(back.audio_quality, AudioQuality::Opus);
+
+        let mut wild: Config =
+            toml::from_str("normalize_target_lufs = 3.0\nnormalize_method = \"nonsense\"\n")
+                .unwrap();
+        assert_eq!(wild.normalize_method, NormalizeMethod::Gain);
+        assert!(!wild.validate().is_empty());
+        wild.normalize();
+        assert_eq!(wild.normalize_target_lufs, DEFAULT_TARGET_LUFS);
+
+        let defaults = Config::default();
+        assert_eq!(defaults.normalize_target_lufs, -16.0);
+        assert_eq!(defaults.normalize_method, NormalizeMethod::Gain);
+        assert!(!defaults.folder_cover);
     }
 
     #[cfg(unix)]

@@ -46,11 +46,11 @@ jobs:
 
       - name: Install FFmpeg build tools (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y nasm libclang-dev
+        run: sudo apt-get update && sudo apt-get install -y nasm libclang-dev cmake
 
       - name: Install FFmpeg build tools (macOS)
         if: runner.os == 'macOS'
-        run: brew install nasm
+        run: brew install nasm cmake
 
       - name: Install LLVM (Windows)
         if: runner.os == 'Windows'

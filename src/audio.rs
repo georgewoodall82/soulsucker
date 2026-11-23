@@ -1,11 +1,13 @@
 //! Reading duration and writing clean track metadata with `lofty`.
 
+use std::fs::File;
 use std::io::Cursor;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
-use lofty::config::WriteOptions;
+use lofty::config::{ParseOptions, WriteOptions};
 use lofty::file::{AudioFile, FileType, TaggedFile, TaggedFileExt};
+use lofty::ogg::OpusFile;
 use lofty::picture::{Picture, PictureType};
 use lofty::tag::{Accessor, ItemKey, Tag, TagType};
 
@@ -35,13 +37,59 @@ fn ensure_supported(path: &Path, file_type: FileType) -> Result<()> {
         .unwrap_or_default();
     let is_flac = extension.eq_ignore_ascii_case("flac");
     let is_mp3 = extension.eq_ignore_ascii_case("mp3");
+    let is_opus = extension.eq_ignore_ascii_case("opus");
     match file_type {
         FileType::Flac if is_flac => Ok(()),
         FileType::Mpeg if is_mp3 => Ok(()),
+        FileType::Opus if is_opus => Ok(()),
         FileType::Flac => Err(anyhow!("FLAC file does not use a .flac extension")),
         FileType::Mpeg => Err(anyhow!("MP3 file does not use a .mp3 extension")),
-        _ => Err(anyhow!("not a FLAC or MP3 file")),
+        FileType::Opus => Err(anyhow!("Opus file does not use a .opus extension")),
+        _ => Err(anyhow!("not a FLAC, MP3 or Opus file")),
     }
+}
+
+/// Loudness values written as tags, for players to apply on playback. Gains
+/// are in dB relative to the loudness target the album was measured against;
+/// peaks are linear (1.0 is full scale). Missing values are left out.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ReplayGain {
+    pub track_gain_db: Option<f64>,
+    pub track_peak: Option<f64>,
+    pub album_gain_db: Option<f64>,
+    pub album_peak: Option<f64>,
+}
+
+/// ReplayGain 2.0 references -18 LUFS; the Opus `R128_*_GAIN` tags reference
+/// -23 LUFS. Players that read both (Rockbox, foobar2000, ...) add this to an
+/// R128 gain to make it comparable to a ReplayGain one.
+const R128_TO_REPLAYGAIN_DB: f64 = 5.0;
+
+const REPLAYGAIN_KEYS: [ItemKey; 4] = [
+    ItemKey::ReplayGainTrackGain,
+    ItemKey::ReplayGainTrackPeak,
+    ItemKey::ReplayGainAlbumGain,
+    ItemKey::ReplayGainAlbumPeak,
+];
+
+fn format_gain(gain_db: f64) -> String {
+    format!("{gain_db:.2} dB")
+}
+
+fn format_peak(peak: f64) -> String {
+    format!("{peak:.6}")
+}
+
+/// An Opus `R128_*_GAIN` value: a Q7.8 fixed-point integer in dB.
+///
+/// `gain_db` is the gain that brings the audio to the loudness target (as for
+/// ReplayGain). The R128 tags reference -23 LUFS and players add
+/// [`R128_TO_REPLAYGAIN_DB`], so that offset is taken off here: the player
+/// then lands on the target.
+fn r128_gain_value(gain_db: f64) -> i16 {
+    ((gain_db - R128_TO_REPLAYGAIN_DB) * 256.0)
+        .round()
+        .clamp(i16::MIN as f64, i16::MAX as f64) as i16
 }
 
 pub struct TrackTags<'a> {
@@ -62,6 +110,9 @@ pub struct TrackTags<'a> {
     pub recording_mbid: &'a str,
     pub track_mbid: &'a str,
     pub cover: Option<&'a [u8]>,
+    /// ReplayGain tags to write. `None` leaves any existing ones alone;
+    /// `Some` replaces them (stale values from the source are dropped).
+    pub replay_gain: Option<ReplayGain>,
 }
 
 /// Overwrite the source's track metadata with the MusicBrainz values.
@@ -107,7 +158,84 @@ pub fn write_tags(path: &Path, tags: &TrackTags<'_>) -> Result<()> {
         replace_pictures(tag, cover);
     }
 
-    save(tagged, path)
+    let is_opus = tagged.file_type() == FileType::Opus;
+    if let Some(gain) = tags.replay_gain.as_ref()
+        && !is_opus
+    {
+        set_replay_gain(editable_tag(&mut tagged)?, gain);
+    }
+    save(tagged, path)?;
+    if let Some(gain) = tags.replay_gain.as_ref()
+        && is_opus
+    {
+        write_opus_gain(path, gain)?;
+    }
+    Ok(())
+}
+
+/// FLAC (Vorbis comments) and MP3 (ID3v2 TXXX frames) carry the standard
+/// `REPLAYGAIN_*` fields; lofty maps them to the right frame per format.
+fn set_replay_gain(tag: &mut Tag, gain: &ReplayGain) {
+    for key in REPLAYGAIN_KEYS {
+        tag.remove_key(key);
+    }
+    let values = [
+        gain.track_gain_db.map(format_gain),
+        gain.track_peak.map(format_peak),
+        gain.album_gain_db.map(format_gain),
+        gain.album_peak.map(format_peak),
+    ];
+    for (key, value) in REPLAYGAIN_KEYS.into_iter().zip(values) {
+        if let Some(value) = value {
+            tag.insert_text(key, value);
+        }
+    }
+}
+
+/// Opus stores loudness as `R128_TRACK_GAIN` / `R128_ALBUM_GAIN` (RFC 7845);
+/// `REPLAYGAIN_*_GAIN` must not be used there. The peaks are not part of the
+/// spec but harmless, and Rockbox uses them to prevent clipping.
+///
+/// lofty's generic tag has no field for the R128 names, so this edits the
+/// file's Vorbis comments directly.
+fn write_opus_gain(path: &Path, gain: &ReplayGain) -> Result<()> {
+    let mut file = File::options()
+        .read(true)
+        .open(path)
+        .with_context(|| format!("could not open {}", path.display()))?;
+    let mut opus = OpusFile::read_from(&mut file, ParseOptions::new())
+        .with_context(|| format!("could not read {}", path.display()))?;
+    drop(file);
+    let comments = opus.vorbis_comments_mut();
+    for name in [
+        "R128_TRACK_GAIN",
+        "R128_ALBUM_GAIN",
+        "REPLAYGAIN_TRACK_GAIN",
+        "REPLAYGAIN_ALBUM_GAIN",
+        "REPLAYGAIN_TRACK_PEAK",
+        "REPLAYGAIN_ALBUM_PEAK",
+    ] {
+        comments.remove(name).for_each(drop);
+    }
+    let entries = [
+        (
+            "R128_TRACK_GAIN",
+            gain.track_gain_db.map(|db| r128_gain_value(db).to_string()),
+        ),
+        (
+            "R128_ALBUM_GAIN",
+            gain.album_gain_db.map(|db| r128_gain_value(db).to_string()),
+        ),
+        ("REPLAYGAIN_TRACK_PEAK", gain.track_peak.map(format_peak)),
+        ("REPLAYGAIN_ALBUM_PEAK", gain.album_peak.map(format_peak)),
+    ];
+    for (name, value) in entries {
+        if let Some(value) = value {
+            comments.insert(name.to_string(), value);
+        }
+    }
+    opus.save_to_path(path, WriteOptions::default())
+        .with_context(|| format!("could not write loudness tags to {}", path.display()))
 }
 
 /// Copy embedded pictures from one audio file to another.
@@ -255,6 +383,7 @@ mod tests {
             recording_mbid: "wrong-recording",
             track_mbid: "wrong-track",
             cover: Some(b"\x89PNG\r\n\x1a\nold-art"),
+            replay_gain: None,
         };
         write_tags(&path, &stale).unwrap();
 
@@ -275,6 +404,7 @@ mod tests {
             recording_mbid: "recording-id",
             track_mbid: "track-id",
             cover: Some(cover),
+            replay_gain: None,
         };
         write_tags(&path, &tags).unwrap();
 
@@ -342,6 +472,7 @@ mod tests {
             recording_mbid: "recording-id",
             track_mbid: "track-id",
             cover: Some(cover),
+            replay_gain: None,
         };
         write_tags(&path, &tags).unwrap();
 

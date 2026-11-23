@@ -1,9 +1,10 @@
 # soulsucker ♫
 
 A terminal album downloader that is actually pleasant to use. Pick an album, EP
-or single from **MusicBrainz**, and soulsucker finds matching **FLAC** or **320
-kbps MP3** files on **Soulseek**, downloads them, verifies what it got, and
-files cleanly numbered tracks into an artist/album library.
+or single from **MusicBrainz**, and soulsucker finds matching **FLAC** (or
+**320 kbps MP3**) files on **Soulseek**, downloads them, verifies what it got,
+and files cleanly numbered **FLAC**, **MP3 320** or **Opus** tracks into an
+artist/album library.
 
 Built in Rust with [`ratatui`](https://ratatui.rs/) for the TUI,
 [`clap`](https://clap.rs/) for the command line, and
@@ -72,19 +73,26 @@ duration/fingerprint verification, and automatic retries:
   writes tags like `101…113` and `201…213` for players that ignore the disc tag
   (Tesla's USB player, for example).
 - **Clean output.** Files are named `01 - Title.flac` (or `1-01 - Title.flac`
-  for multi-disc releases; `.mp3` in MP3 mode).
-- **FLAC or MP3 320.** Choose lossless FLAC or 320 kbps MP3 in Settings. MP3
+  for multi-disc releases; `.mp3` in MP3 mode, `.opus` in Opus mode).
+- **FLAC, MP3 320 or Opus 128.** Choose lossless FLAC, 320 kbps MP3 or 128 kbps
+  variable-bitrate Opus in Settings. MP3
   mode prefers a verified 320 kbps MP3 source; when none is available it takes
-  a FLAC source and converts it after verification. With loudness
-  normalization on, the conversion and the album gain share one encode.
-  Encoded MP3s carry an accurate
-  LAME gapless header (encoder delay and padding), so gapless players join
-  tracks sample-exactly.
+  a FLAC source and converts it after verification. Opus mode only downloads
+  FLAC (nobody shares Opus on Soulseek) and encodes it after verification. With
+  loudness normalization on, the conversion and the album gain share one
+  encode. Encoded MP3s carry an accurate LAME gapless header (encoder delay and
+  padding), and Opus files carry the standard pre-skip and end trimming, so
+  gapless players join tracks sample-exactly.
 - **Album loudness normalization.** An optional EBU R128 album gain brings
-  each album to -16 LUFS with a -1.5 dBTP true-peak ceiling, so quiet and loud
-  albums sit at a similar level in a car or on a portable player. Every track
-  of an album gets the same gain, so the balance between tracks and gapless
-  transitions are left exactly as mastered.
+  each album to a loudness target (-16 LUFS by default, adjustable) so quiet
+  and loud albums sit at a similar level in a car or on a portable player.
+  Every track of an album gets the same gain, so the balance between tracks
+  and gapless transitions are left exactly as mastered. Either bake the gain
+  into the audio (with a -1.5 dBTP true-peak ceiling) or leave the audio alone
+  and write ReplayGain tags (R128 tags for Opus) for the player to apply.
+- **Folder cover.** An optional setting saves the album cover as a 500×500
+  `cover.jpg` next to the tracks, which Rockbox, car stereos and file managers
+  pick up.
 - **Skip or force.** Valid existing tracks are skipped by default; `--force`
   downloads them again. A stray/empty file with the right name is validated and
   replaced rather than trusted.
@@ -97,8 +105,9 @@ duration/fingerprint verification, and automatic retries:
 - Rust **1.91+** (edition 2024).
 - A Soulseek account.
 - FFmpeg **8.x** development libraries to build from source. Prebuilt release
-  binaries link FFmpeg and the bundled LAME MP3 encoder statically and need no
-  runtime libraries.
+  binaries link FFmpeg and the bundled LAME MP3 and libopus Opus encoders
+  statically and need no runtime libraries. Building from source also needs
+  `cmake` and a C compiler (libopus is compiled from the bundled source).
 - A terminal at least **60×20** cells (the TUI asks for this if it is too small).
 - Recommended: a free AcoustID API key from <https://acoustid.org/api> for
   fingerprint verification. Fingerprinting is built in; without a key,
@@ -274,17 +283,20 @@ soulsucker --no-fingerprint
    other peers' copies of that track). If every source fails, the list is retried in
    last-resort passes with longer patience.
 9. Only after verification, an accepted file is converted and/or normalized.
-   In MP3 mode a FLAC source becomes a 320 kbps MP3 here. With loudness
-   normalization on, each verified track is measured and held until every
-   track of the album is in; then one album gain is applied to all of them,
-   in the same encode as any MP3 conversion.
+   In MP3 mode a FLAC source becomes a 320 kbps MP3 here, in Opus mode a
+   128 kbps VBR Opus. With loudness normalization on, each verified track is
+   measured and held until every track of the album is in; then one album gain
+   is applied to all of them (in the same encode as any conversion), or, in
+   ReplayGain mode, written to the tags.
 10. Accepted files are renamed, then retagged from the chosen MusicBrainz
     release: title, track artist, album artist, album, release date,
     track/disc numbers, and MusicBrainz IDs. Cover art is fetched from the
     iTunes Search API first, with the Cover Art Archive as a fallback.
     Embedded art from the source is replaced, so a file cannot keep a cover
     from a different edition. If **disc-prefixed track numbers** is enabled,
-    multi-disc track tags become `101…113`, `201…213`, and so on.
+    multi-disc track tags become `101…113`, `201…213`, and so on. With
+    **Folder cover.jpg** on, the cover is also saved as `cover.jpg`
+    (500×500) in the album folder.
 
 ## Keys
 
@@ -351,8 +363,9 @@ Settings is split into four tabs:
 
 - **Account** — Soulseek credentials, AcoustID key, fingerprint checking and
   score.
-- **Library** — music folder, FLAC/MP3 320 output, Tesla-friendly tags and
-  loudness normalization.
+- **Library** — music folder, FLAC/MP3 320/Opus 128 output, Tesla-friendly
+  tags, loudness normalization (on/off, target level and method) and the folder
+  `cover.jpg`.
 - **Downloading** — parallel downloads, parallel processing (checking and
   converting), search/queue/stall timeouts, length tolerance, retry passes and
   sources per track.
@@ -392,14 +405,18 @@ mb_limit = 25
 disc_prefix_track_numbers = false
 album_artist_for_tracks = false
 normalize_loudness = false
+normalize_target_lufs = -16.0
+normalize_method = "gain"
+folder_cover = false
 ```
 
 `listen_port = 0` asks the OS for a free port, which is friendlier than a
 fixed port when several apps use the network. If you need port forwarding,
 set a specific port and forward it on your router.
 
-`audio_quality = "flac"` keeps lossless output. Set it to `"mp3_320"` to write
-320 kbps MP3 files instead. MP3 mode prefers a Soulseek source whose reported
+`audio_quality = "flac"` keeps lossless output. Set it to `"opus_128"` for
+128 kbps variable-bitrate Opus (see below), or to `"mp3_320"` to write 320 kbps
+MP3 files instead. MP3 mode prefers a Soulseek source whose reported
 bitrate or size/duration identifies a 320 kbps MP3; every downloaded MP3 is
 also checked after transfer so a mislabeled 128 kbps file is rejected. If no
 320 kbps MP3 source is available, soulsucker downloads a FLAC and converts it
@@ -408,6 +425,16 @@ normalization is off; with normalization on they are decoded and re-encoded at
 320 kbps to apply the album gain (unless the gain rounds to 0 dB). If
 conversion fails for a
 FLAC-to-MP3 track, that source is rejected and the next source is tried.
+
+`audio_quality = "opus_128"` writes `.opus` files. Soulseek has essentially no
+Opus files, so this mode only downloads FLAC and encodes it after the duration
+and AcoustID checks, with the bundled libopus encoder at 128 kbps VBR
+(unconstrained variable bitrate, music tuning, stereo; multichannel sources are
+downmixed). The stream is a standard Ogg Opus file: the encoder look-ahead is
+written as pre-skip and the last page trims the padding, so a decoder returns
+exactly the source's samples and gapless playback works. The header's output
+gain stays 0; loudness is never hidden in the header. If the encode fails the
+source is rejected and the next one is tried.
 
 `disc_prefix_track_numbers = false` keeps standard per-disc track tags. Set it
 to `true` for players that ignore the disc tag (notably Tesla's USB player):
@@ -423,7 +450,8 @@ inside the album instead of creating a second artist entry. This also applies
 when tags are written, so enable it and rerun with `--force` to retag an
 existing download.
 
-`normalize_loudness = true` applies an EBU R128 **album gain**. Each verified
+`normalize_loudness = true` turns on EBU R128 album normalization (by default
+an **album gain** applied to the audio; see `normalize_method` below). Each verified
 track's integrated loudness and true peak are measured with FFmpeg's `ebur128`
 filter, and the track waits in staging ("verified · waiting for the rest of
 the album") until every track has finished or given up. The album loudness is
@@ -442,8 +470,50 @@ instead matched to the level the rest of the album ends up at (still within
 the -1.5 dBTP ceiling). That way one loud outlier neither sticks out nor holds
 the whole album's gain down.
 
-FLAC output is re-encoded losslessly. In MP3 320 mode the album gain and any
-FLAC-to-MP3 conversion happen in one encode. The processed file replaces the
+`normalize_target_lufs` sets the integrated loudness the album should play at
+(default **-16**, range -30 to -6). -16 is fairly quiet; many people prefer
+something like -14. A louder target also needs more headroom: with
+`normalize_method = "gain"` the true-peak ceiling still applies, so a very
+dynamic album simply ends up a bit below the target rather than being
+clipped or limited.
+
+`normalize_method` chooses how the loudness reaches your player:
+
+- `"gain"` (default, "Apply gain" in Settings) re-encodes every track with the
+  album gain baked in, as described above. It works in every player, but the
+  audio is changed (FLAC is re-encoded losslessly).
+- `"replaygain"` ("ReplayGain tags" in Settings) leaves the audio exactly as
+  downloaded and writes **ReplayGain** tags instead, for the player to apply.
+  Nothing is re-encoded (unless the format conversion needs it) and the
+  true-peak ceiling is not applied: the gains are exactly `target - loudness`,
+  and a peak tag lets the player prevent clipping. Tags written: for FLAC,
+  `REPLAYGAIN_TRACK_GAIN`, `REPLAYGAIN_TRACK_PEAK`, `REPLAYGAIN_ALBUM_GAIN` and
+  `REPLAYGAIN_ALBUM_PEAK` (as Vorbis comments); for MP3 the same names as
+  ID3v2 `TXXX` frames; for Opus `R128_TRACK_GAIN` and `R128_ALBUM_GAIN`
+  (RFC 7845), plus the two peak tags. A player must have ReplayGain switched on
+  (track or album mode) to use them; without it the music plays as
+  downloaded.
+
+**Rockbox.** Rockbox reads all of the above. For Opus it uses the
+`R128_*_GAIN` tags, which are stored relative to -23 LUFS, and adds 5 dB to
+match ReplayGain's -18 LUFS reference; soulsucker takes that 5 dB off when it
+writes them, so Rockbox (and other players that do the same) land on your
+target. A player that applies R128 gains literally, to -23 LUFS, will play Opus
+files 5 dB quieter than the target. Turn on *Settings → Playback Settings → ReplayGain*
+in Rockbox, and set its pre-amp to taste. Rockbox also shows the folder
+`cover.jpg` (baseline JPEG, 500×500) as album art.
+
+**Folder cover.** `folder_cover = true` saves the album cover as a 500×500
+baseline `cover.jpg` in the album folder, from the same iTunes / Cover Art
+Archive image that is embedded in the tracks. A non-square image is scaled to
+fit inside 500×500 (never stretched or cropped). An existing `cover.jpg` is
+left alone unless you use `--force`. Singles, which are saved as loose files
+in the artist folder, get none (it would replace the artist folder's cover).
+If every track of an album is already on disk, the missing `cover.jpg` is
+still fetched and saved.
+
+FLAC output is re-encoded losslessly. In MP3 320 and Opus modes the album gain
+and the FLAC conversion happen in one encode. The processed file replaces the
 original only after the entire encode succeeds. If processing fails, an
 already-correct source is kept and saved at its original level; a FLAC source
 that still needs MP3 conversion is rejected so another source can be tried. A
@@ -528,5 +598,6 @@ users, and only download material you have the rights to.
 This project is not affiliated with Soulseek, MusicBrainz or AcoustID.
 
 MP3 encoding uses the bundled [LAME](https://lame.sourceforge.io/) library,
-which is licensed under the LGPL. The project source is available in this
-repository.
+which is licensed under the LGPL. Opus encoding uses the bundled
+[libopus](https://opus-codec.org/) library (BSD licensed). The project source
+is available in this repository.

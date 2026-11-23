@@ -1,4 +1,4 @@
-//! Album-wide EBU R128 loudness normalization and FLAC/MP3 output.
+//! Album-wide EBU R128 loudness normalization and FLAC/MP3/Opus output.
 //!
 //! Every verified track is measured on its own (integrated loudness and true
 //! peak). Once the whole album is in, [`album_gain`] turns those measurements
@@ -9,9 +9,13 @@
 //! temporary file beside the source and only promoted after the whole encode
 //! succeeds.
 //!
+//! As an alternative to changing the audio, [`replay_gain`] turns the same
+//! measurements into ReplayGain values that are only written as tags.
+//!
 //! FLAC output is lossless. MP3 output is 320 kbps CBR, encoded with the
-//! bundled LAME library; FFmpeg still handles decoding, resampling, channel
-//! conversion and the loudness filter.
+//! bundled LAME library. Opus output is 128 kbps VBR, encoded with the bundled
+//! libopus and written into an Ogg container by this module. FFmpeg still
+//! handles decoding, resampling, channel conversion and the loudness filter.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -27,15 +31,21 @@ use ffmpeg::{ChannelLayout, Rational, codec, filter, format, frame, media};
 use ffmpeg_next as ffmpeg;
 use mp3lame_encoder::{Bitrate, Builder, FlushGap, InterleavedPcm, Quality, VbrMode};
 
+use crate::audio::ReplayGain;
 use crate::config::AudioQuality;
 
-/// Integrated loudness target. -16 LUFS leaves headroom for car systems and
-/// keeps most albums from being squashed.
-pub const TARGET_LUFS: f64 = -16.0;
-/// True-peak ceiling. -1.5 dBTP avoids clipping after lossy car playback.
+/// True-peak ceiling when the gain is applied to the audio. -1.5 dBTP avoids
+/// clipping after lossy car playback. (The integrated-loudness target is a
+/// setting; see `Config::normalize_target_lufs`.)
 pub const TARGET_TRUE_PEAK_DB: f64 = -1.5;
 /// MP3 output bitrate.
 pub const MP3_BITRATE_KBPS: u32 = 320;
+/// Opus output: average bitrate of the variable-bitrate encode.
+pub const OPUS_BITRATE_BPS: i32 = 128_000;
+/// Opus always decodes at 48 kHz, whatever the source rate was.
+const OPUS_SAMPLE_RATE: u32 = 48_000;
+/// 20 ms frames: the best quality/latency trade-off for music.
+const OPUS_FRAME_SAMPLES: usize = 960;
 /// Sanity bounds for the album gain, in dB, in case of bogus measurements.
 const MAX_ALBUM_CUT_DB: f64 = -30.0;
 const MAX_ALBUM_BOOST_DB: f64 = 30.0;
@@ -71,15 +81,10 @@ pub struct AlbumGain {
     pub true_peak: f64,
 }
 
-/// One gain for the whole album: bring the album's integrated loudness to
-/// [`TARGET_LUFS`], unless that would push the loudest true peak above
-/// [`TARGET_TRUE_PEAK_DB`]. No limiter is used, so a single peaky track can
-/// leave the album a little below the target rather than squash it.
-///
-/// Album loudness is the duration-weighted energy mean of the tracks' gated
-/// integrated loudness, a close approximation of measuring the album as one
-/// stream. Returns `None` when no track could be measured.
-pub fn album_gain(tracks: &[Loudness]) -> Option<AlbumGain> {
+/// Album loudness and loudest true peak: the duration-weighted energy mean of
+/// the tracks' gated integrated loudness, a close approximation of measuring
+/// the album as one stream. Returns `None` when no track could be measured.
+pub fn album_loudness(tracks: &[Loudness]) -> Option<(f64, f64)> {
     let measured: Vec<&Loudness> = tracks
         .iter()
         .filter(|track| {
@@ -104,7 +109,16 @@ pub fn album_gain(tracks: &[Loudness]) -> Option<AlbumGain> {
         .iter()
         .map(|track| track.true_peak)
         .fold(f64::NEG_INFINITY, f64::max);
-    let gain_db = (TARGET_LUFS - integrated)
+    Some((integrated, true_peak))
+}
+
+/// One gain for the whole album: bring the album's integrated loudness to
+/// `target_lufs`, unless that would push the loudest true peak above
+/// [`TARGET_TRUE_PEAK_DB`]. No limiter is used, so a single peaky track can
+/// leave the album a little below the target rather than squash it.
+pub fn album_gain(tracks: &[Loudness], target_lufs: f64) -> Option<AlbumGain> {
+    let (integrated, true_peak) = album_loudness(tracks)?;
+    let gain_db = (target_lufs - integrated)
         .min(TARGET_TRUE_PEAK_DB - true_peak)
         .clamp(MAX_ALBUM_CUT_DB, MAX_ALBUM_BOOST_DB);
     Some(AlbumGain {
@@ -121,6 +135,33 @@ pub fn matched_gain(track: &Loudness, target_lufs: f64) -> f64 {
     (target_lufs - track.integrated)
         .min(TARGET_TRUE_PEAK_DB - track.true_peak)
         .clamp(MAX_ALBUM_CUT_DB, MAX_ALBUM_BOOST_DB)
+}
+
+/// ReplayGain values for one track: the gain that makes it play at
+/// `target_lufs`, with the album gain from `album` (the measured loudness and
+/// peak of the album, see [`album_loudness`]). Nothing is capped: players
+/// compare the peaks to prevent clipping themselves, which is what the format
+/// expects. A missing measurement leaves those fields out.
+pub fn replay_gain(
+    track: Option<&Loudness>,
+    album: Option<(f64, f64)>,
+    target_lufs: f64,
+) -> ReplayGain {
+    let gain =
+        |integrated: f64| (target_lufs - integrated).clamp(MAX_ALBUM_CUT_DB, MAX_ALBUM_BOOST_DB);
+    let linear = |true_peak: f64| {
+        if true_peak.is_finite() {
+            10f64.powf(true_peak / 20.0)
+        } else {
+            0.0
+        }
+    };
+    ReplayGain {
+        track_gain_db: track.map(|track| gain(track.integrated)),
+        track_peak: track.map(|track| linear(track.true_peak)),
+        album_gain_db: album.map(|(integrated, _)| gain(integrated)),
+        album_peak: album.map(|(_, true_peak)| linear(true_peak)),
+    }
 }
 
 /// Turn the filter's last integrated reading (LUFS) and loudest linear true
@@ -150,21 +191,29 @@ pub fn source_is_mp3(path: &Path) -> bool {
 
 pub fn source_compatible(path: &Path, quality: AudioQuality) -> bool {
     match quality {
-        AudioQuality::Flac => extension(path).eq_ignore_ascii_case("flac"),
+        // Nobody shares Opus on Soulseek: Opus output is always made from
+        // FLAC.
+        AudioQuality::Flac | AudioQuality::Opus => extension(path).eq_ignore_ascii_case("flac"),
         AudioQuality::Mp3 => source_is_mp3(path) || extension(path).eq_ignore_ascii_case("flac"),
     }
 }
 
 /// Whether the source is in the wrong format for the selected quality.
 pub fn needs_conversion(path: &Path, quality: AudioQuality) -> bool {
-    quality.is_mp3() && !source_is_mp3(path)
+    match quality {
+        AudioQuality::Flac => false,
+        AudioQuality::Mp3 => !source_is_mp3(path),
+        AudioQuality::Opus => true,
+    }
 }
 
 pub fn processing_phase(path: &Path, quality: AudioQuality, normalize: bool) -> &'static str {
-    match (needs_conversion(path, quality), normalize) {
-        (true, true) => "applying album gain and converting to MP3 320…",
-        (true, false) => "converting to MP3 320…",
-        (false, true) => "applying album gain…",
+    match (needs_conversion(path, quality), normalize, quality) {
+        (true, true, AudioQuality::Opus) => "applying album gain and encoding Opus…",
+        (true, true, _) => "applying album gain and converting to MP3 320…",
+        (true, false, AudioQuality::Opus) => "encoding Opus…",
+        (true, false, _) => "converting to MP3 320…",
+        (false, true, _) => "applying album gain…",
         _ => "preparing audio…",
     }
 }
@@ -216,6 +265,7 @@ pub fn process_file(path: &Path, quality: AudioQuality, gain_db: Option<f64>) ->
         match quality {
             AudioQuality::Flac => apply_flac(path, &output, filter.as_deref())?,
             AudioQuality::Mp3 => apply_mp3(path, &output, filter.as_deref())?,
+            AudioQuality::Opus => apply_opus(path, &output, filter.as_deref())?,
         }
         crate::audio::copy_pictures(path, &output)
             .context("could not preserve embedded cover art")?;
@@ -410,6 +460,263 @@ fn apply_mp3(input: &Path, output: &Path, filter: Option<&str>) -> Result<()> {
         |filtered| sink.push(filtered),
     )?;
     sink.finish(output)
+}
+
+fn apply_opus(input: &Path, output: &Path, filter: Option<&str>) -> Result<()> {
+    let mut ictx =
+        format::input(input).with_context(|| format!("could not reopen {}", input.display()))?;
+    let stream = ictx
+        .streams()
+        .best(media::Type::Audio)
+        .ok_or_else(|| anyhow!("{} has no audio stream", input.display()))?;
+    let stream_index = stream.index();
+    let mut decoder = codec::context::Context::from_parameters(stream.parameters())?
+        .decoder()
+        .audio()?;
+    decoder.set_parameters(stream.parameters())?;
+
+    let channels = if decoder.channel_layout().channels() == 1 {
+        1
+    } else {
+        2
+    };
+    let layout = if channels == 1 {
+        ChannelLayout::MONO
+    } else {
+        ChannelLayout::STEREO
+    };
+    let mut graph = build_graph(
+        &decoder,
+        Sample::F32(format::sample::Type::Packed),
+        OPUS_SAMPLE_RATE,
+        layout,
+        filter,
+    )?;
+    let mut sink = OpusSink::new(output, decoder.rate(), channels)?;
+    run_decode(
+        &mut ictx,
+        stream_index,
+        &mut decoder,
+        &mut graph,
+        |filtered| sink.push(filtered),
+    )?;
+    sink.finish()
+}
+
+/// Encodes 48 kHz float PCM to Opus and writes it as an Ogg stream
+/// (RFC 7845). The header's output gain stays 0: loudness is either baked into
+/// the audio or carried by `R128_*_GAIN` tags, never by the header, so players
+/// that ignore tags still play the audio as encoded.
+struct OpusSink {
+    encoder: opus::Encoder,
+    writer: ogg::PacketWriter<'static, std::io::BufWriter<File>>,
+    serial: u32,
+    channels: usize,
+    /// Samples (all channels interleaved) waiting for a full frame.
+    pending: Vec<f32>,
+    /// Samples per channel that went into the encoder, padding excluded.
+    input_samples: u64,
+    /// Samples per channel the encoder has produced packets for.
+    encoded_samples: u64,
+    /// Decoder samples to drop at the start: the encoder's look-ahead.
+    pre_skip: u64,
+    /// The newest packet is held back so the last one can end the stream.
+    held: Option<(Vec<u8>, u64)>,
+    packets_in_page: u32,
+}
+
+/// Roughly one second of audio per Ogg page.
+const OPUS_PACKETS_PER_PAGE: u32 = 50;
+
+impl OpusSink {
+    fn new(output: &Path, source_rate: u32, channels: usize) -> Result<Self> {
+        let layout = if channels == 1 {
+            opus::Channels::Mono
+        } else {
+            opus::Channels::Stereo
+        };
+        let mut encoder = opus::Encoder::new(OPUS_SAMPLE_RATE, layout, opus::Application::Audio)
+            .map_err(|err| anyhow!("could not create an Opus encoder: {err}"))?;
+        encoder
+            .set_bitrate(opus::Bitrate::Bits(OPUS_BITRATE_BPS))
+            .map_err(|err| anyhow!("could not set the Opus bitrate: {err}"))?;
+        encoder
+            .set_vbr(true)
+            .map_err(|err| anyhow!("could not enable Opus VBR: {err}"))?;
+        // Unconstrained VBR: the bitrate follows the music, averaging the
+        // target.
+        encoder
+            .set_vbr_constraint(false)
+            .map_err(|err| anyhow!("could not configure Opus VBR: {err}"))?;
+        encoder
+            .set_signal(opus::Signal::Music)
+            .map_err(|err| anyhow!("could not configure the Opus signal type: {err}"))?;
+        encoder
+            .set_complexity(10)
+            .map_err(|err| anyhow!("could not set the Opus complexity: {err}"))?;
+        let pre_skip = encoder
+            .get_lookahead()
+            .map_err(|err| anyhow!("could not read the Opus look-ahead: {err}"))?
+            .max(0) as u64;
+
+        let file = File::create(output)
+            .with_context(|| format!("could not create {}", output.display()))?;
+        let mut writer = ogg::PacketWriter::new(std::io::BufWriter::new(file));
+        let serial = ogg_serial();
+        writer
+            .write_packet(
+                opus_head(channels as u8, pre_skip as u16, source_rate),
+                serial,
+                ogg::PacketWriteEndInfo::EndPage,
+                0,
+            )
+            .context("could not write the Opus header")?;
+        writer
+            .write_packet(opus_tags(), serial, ogg::PacketWriteEndInfo::EndPage, 0)
+            .context("could not write the Opus tags")?;
+        Ok(Self {
+            encoder,
+            writer,
+            serial,
+            channels,
+            pending: Vec::new(),
+            input_samples: 0,
+            encoded_samples: 0,
+            pre_skip,
+            held: None,
+            packets_in_page: 0,
+        })
+    }
+
+    fn push(&mut self, filtered: &frame::Audio) -> Result<()> {
+        if filtered.format() != Sample::F32(format::sample::Type::Packed) {
+            bail!("the Opus filter produced an unexpected sample format");
+        }
+        if filtered.channels() as usize != self.channels {
+            bail!("the Opus filter produced an unexpected channel layout");
+        }
+        let samples = filtered.samples();
+        let values = samples
+            .checked_mul(self.channels)
+            .ok_or_else(|| anyhow!("the Opus frame is too large"))?;
+        let needed = values
+            .checked_mul(4)
+            .ok_or_else(|| anyhow!("the Opus frame is too large"))?;
+        let data = filtered.data(0);
+        if data.len() < needed {
+            bail!("the Opus filter produced a truncated frame");
+        }
+        self.pending.extend(
+            data[..needed]
+                .chunks_exact(4)
+                .map(|bytes| f32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
+        );
+        self.input_samples += samples as u64;
+        let frame_values = OPUS_FRAME_SAMPLES * self.channels;
+        while self.pending.len() >= frame_values {
+            let frame: Vec<f32> = self.pending.drain(..frame_values).collect();
+            self.encode_frame(&frame)?;
+        }
+        Ok(())
+    }
+
+    fn encode_frame(&mut self, frame: &[f32]) -> Result<()> {
+        let mut packet = vec![0u8; 4000];
+        let size = self
+            .encoder
+            .encode_float(frame, &mut packet)
+            .map_err(|err| anyhow!("Opus encoding failed: {err}"))?;
+        packet.truncate(size);
+        self.encoded_samples += OPUS_FRAME_SAMPLES as u64;
+        self.write_held()?;
+        self.held = Some((packet, self.encoded_samples));
+        Ok(())
+    }
+
+    fn write_held(&mut self) -> Result<()> {
+        let Some((packet, granule)) = self.held.take() else {
+            return Ok(());
+        };
+        self.packets_in_page += 1;
+        let end = if self.packets_in_page >= OPUS_PACKETS_PER_PAGE {
+            self.packets_in_page = 0;
+            ogg::PacketWriteEndInfo::EndPage
+        } else {
+            ogg::PacketWriteEndInfo::NormalPacket
+        };
+        self.writer
+            .write_packet(packet, self.serial, end, granule)
+            .context("could not write the Opus audio")
+    }
+
+    fn finish(mut self) -> Result<()> {
+        if self.input_samples == 0 {
+            bail!("the source has no audio");
+        }
+        // Zero-pad the last partial frame, then keep encoding silence until
+        // the look-ahead delay has been flushed out as well: the decoder must
+        // be able to produce every input sample after skipping `pre_skip`.
+        let frame_values = OPUS_FRAME_SAMPLES * self.channels;
+        let total = self.input_samples + self.pre_skip;
+        while !self.pending.is_empty() || self.encoded_samples < total {
+            self.pending.resize(frame_values, 0.0);
+            let frame: Vec<f32> = self.pending.drain(..frame_values).collect();
+            self.encode_frame(&frame)?;
+        }
+        // The last packet carries the true end: players trim the padding by
+        // it.
+        let Some((packet, _)) = self.held.take() else {
+            bail!("the Opus encoder produced no audio");
+        };
+        self.writer
+            .write_packet(
+                packet,
+                self.serial,
+                ogg::PacketWriteEndInfo::EndStream,
+                total,
+            )
+            .context("could not finish the Opus stream")?;
+        let file = self
+            .writer
+            .into_inner()
+            .into_inner()
+            .map_err(|err| anyhow!("could not flush the Opus file: {err}"))?;
+        file.sync_all().context("could not sync the Opus file")?;
+        Ok(())
+    }
+}
+
+fn ogg_serial() -> u32 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.subsec_nanos() ^ duration.as_secs() as u32)
+        .unwrap_or(0);
+    nanos ^ std::process::id().rotate_left(16)
+}
+
+/// The `OpusHead` identification header (RFC 7845 §5.1).
+fn opus_head(channels: u8, pre_skip: u16, input_rate: u32) -> Vec<u8> {
+    let mut head = Vec::with_capacity(19);
+    head.extend_from_slice(b"OpusHead");
+    head.push(1); // version
+    head.push(channels);
+    head.extend_from_slice(&pre_skip.to_le_bytes());
+    head.extend_from_slice(&input_rate.to_le_bytes());
+    head.extend_from_slice(&0i16.to_le_bytes()); // output gain
+    head.push(0); // channel mapping family 0: mono or stereo
+    head
+}
+
+/// An `OpusTags` comment header with no comments; the real tags are written
+/// afterwards (and may carry the R128 gain).
+fn opus_tags() -> Vec<u8> {
+    let vendor = format!("soulsucker, libopus {}", opus::version());
+    let mut tags = Vec::new();
+    tags.extend_from_slice(b"OpusTags");
+    tags.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+    tags.extend_from_slice(vendor.as_bytes());
+    tags.extend_from_slice(&0u32.to_le_bytes());
+    tags
 }
 
 fn mp3_sample_rate(rate: u32) -> u32 {
@@ -763,7 +1070,7 @@ mod tests {
     #[test]
     fn an_outlier_track_is_matched_to_the_album_level_without_moving_the_album() {
         let own = [track(-23.0, -8.0, 200.0), track(-21.0, -5.0, 200.0)];
-        let album = album_gain(&own).unwrap();
+        let album = album_gain(&own, TARGET).unwrap();
         let level = album.integrated + album.gain_db;
         // A much louder master of another song on the album.
         let loud = track(-11.8, -1.6, 130.0);
@@ -772,7 +1079,7 @@ mod tests {
         assert!((loud.integrated + gain - level).abs() < 0.01);
         // Including it in the album gain instead would cap the album: its
         // peak holds everything else down.
-        let mixed = album_gain(&[own[0], own[1], loud]).unwrap();
+        let mixed = album_gain(&[own[0], own[1], loud], TARGET).unwrap();
         assert!(mixed.gain_db < album.gain_db - 1.0);
         // The ceiling still applies to a very peaky track.
         let peaky = track(-30.0, -0.5, 100.0);
@@ -781,10 +1088,14 @@ mod tests {
 
     #[test]
     fn targets_are_safe_defaults() {
-        assert_eq!(TARGET_LUFS, -16.0);
+        assert_eq!(crate::config::DEFAULT_TARGET_LUFS, -16.0);
         assert_eq!(TARGET_TRUE_PEAK_DB, -1.5);
         assert_eq!(MP3_BITRATE_KBPS, 320);
+        assert_eq!(OPUS_BITRATE_BPS, 128_000);
     }
+
+    /// The loudness target the tests use.
+    const TARGET: f64 = -16.0;
 
     #[test]
     fn flac_and_mp3_conversion_rules_match_the_selected_quality() {
@@ -813,39 +1124,53 @@ mod tests {
     fn album_gain_is_one_gain_from_the_duration_weighted_album_loudness() {
         // Two equal-length tracks 10 dB apart: the album is ~2.6 dB below the
         // louder one (energy mean), not the arithmetic mean of -25.
-        let gain = album_gain(&[track(-20.0, -10.0, 100.0), track(-30.0, -20.0, 100.0)]).unwrap();
+        let gain = album_gain(
+            &[track(-20.0, -10.0, 100.0), track(-30.0, -20.0, 100.0)],
+            TARGET,
+        )
+        .unwrap();
         assert!((gain.integrated - -22.596).abs() < 0.01, "{gain:?}");
-        assert!((gain.gain_db - (TARGET_LUFS - gain.integrated)).abs() < 1e-9);
+        assert!((gain.gain_db - (TARGET - gain.integrated)).abs() < 1e-9);
         assert_eq!(gain.true_peak, -10.0);
 
         // A long quiet track counts for more than a short loud one.
-        let weighted =
-            album_gain(&[track(-20.0, -10.0, 10.0), track(-30.0, -20.0, 300.0)]).unwrap();
+        let weighted = album_gain(
+            &[track(-20.0, -10.0, 10.0), track(-30.0, -20.0, 300.0)],
+            TARGET,
+        )
+        .unwrap();
         assert!(weighted.integrated < -28.0, "{weighted:?}");
     }
 
     #[test]
     fn album_gain_never_pushes_the_loudest_peak_over_the_ceiling() {
         // A quiet album with one peaky track: the boost stops at the ceiling.
-        let gain = album_gain(&[track(-24.0, -3.0, 200.0), track(-24.0, -9.0, 200.0)]).unwrap();
+        let gain = album_gain(
+            &[track(-24.0, -3.0, 200.0), track(-24.0, -9.0, 200.0)],
+            TARGET,
+        )
+        .unwrap();
         assert!(
             (gain.gain_db - (TARGET_TRUE_PEAK_DB - -3.0)).abs() < 1e-9,
             "{gain:?}"
         );
         // A loud album is turned down, whatever its peaks.
-        let gain = album_gain(&[track(-8.0, 0.5, 200.0)]).unwrap();
+        let gain = album_gain(&[track(-8.0, 0.5, 200.0)], TARGET).unwrap();
         assert!((gain.gain_db - -8.0).abs() < 1e-9, "{gain:?}");
     }
 
     #[test]
     fn album_gain_ignores_unmeasurable_tracks() {
-        assert!(album_gain(&[]).is_none());
-        assert!(album_gain(&[track(f64::NEG_INFINITY, -70.0, 30.0)]).is_none());
-        let gain = album_gain(&[
-            track(f64::NEG_INFINITY, -70.0, 30.0),
-            track(-16.0, -6.0, 0.0),
-            track(-20.0, -6.0, 120.0),
-        ])
+        assert!(album_gain(&[], TARGET).is_none());
+        assert!(album_gain(&[track(f64::NEG_INFINITY, -70.0, 30.0)], TARGET).is_none());
+        let gain = album_gain(
+            &[
+                track(f64::NEG_INFINITY, -70.0, 30.0),
+                track(-16.0, -6.0, 0.0),
+                track(-20.0, -6.0, 120.0),
+            ],
+            TARGET,
+        )
         .unwrap();
         assert!((gain.integrated - -20.0).abs() < 1e-9);
     }
@@ -1028,5 +1353,296 @@ mod tests {
             "{before:?} -> {after:?}"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn a_louder_target_means_more_gain_up_to_the_peak_ceiling() {
+        let tracks = [track(-24.0, -12.0, 200.0)];
+        let quiet = album_gain(&tracks, -16.0).unwrap();
+        let loud = album_gain(&tracks, -14.0).unwrap();
+        assert!((loud.gain_db - quiet.gain_db - 2.0).abs() < 1e-9);
+        // The ceiling still wins over a very loud target.
+        let capped = album_gain(&tracks, -6.0).unwrap();
+        assert!((capped.gain_db - (TARGET_TRUE_PEAK_DB - -12.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn replay_gain_is_uncapped_and_relative_to_the_target() {
+        let tracks = [track(-24.0, -3.0, 100.0), track(-20.0, -1.0, 100.0)];
+        let album = album_loudness(&tracks);
+        let tags = replay_gain(Some(&tracks[0]), album, -14.0);
+        // Track gain: -14 - -24 = +10 dB, even though that would clip: the
+        // peak tag lets the player decide.
+        assert!((tags.track_gain_db.unwrap() - 10.0).abs() < 1e-9);
+        assert!((tags.track_peak.unwrap() - 10f64.powf(-3.0 / 20.0)).abs() < 1e-9);
+        let (album_loudness, album_peak) = album.unwrap();
+        assert!((tags.album_gain_db.unwrap() - (-14.0 - album_loudness)).abs() < 1e-9);
+        assert!((tags.album_peak.unwrap() - 10f64.powf(album_peak / 20.0)).abs() < 1e-9);
+        // Nothing measured, nothing written.
+        assert_eq!(replay_gain(None, None, -14.0), ReplayGain::default());
+    }
+
+    #[test]
+    fn opus_conversion_rules() {
+        let flac = Path::new("track.flac");
+        let mp3 = Path::new("track.mp3");
+        assert!(source_compatible(flac, AudioQuality::Opus));
+        // Nobody shares Opus, and lossy sources are not re-encoded to Opus.
+        assert!(!source_compatible(mp3, AudioQuality::Opus));
+        assert!(!source_compatible(
+            Path::new("track.opus"),
+            AudioQuality::Opus
+        ));
+        assert!(needs_conversion(flac, AudioQuality::Opus));
+    }
+
+    #[test]
+    fn opus_headers_follow_rfc_7845() {
+        let head = opus_head(2, 312, 44_100);
+        assert_eq!(&head[..8], b"OpusHead");
+        assert_eq!(head[8], 1);
+        assert_eq!(head[9], 2);
+        assert_eq!(u16::from_le_bytes([head[10], head[11]]), 312);
+        assert_eq!(u32::from_le_bytes(head[12..16].try_into().unwrap()), 44_100);
+        assert_eq!(i16::from_le_bytes([head[16], head[17]]), 0, "output gain");
+        assert_eq!(head[18], 0, "mapping family");
+        assert_eq!(head.len(), 19);
+        let tags = opus_tags();
+        assert_eq!(&tags[..8], b"OpusTags");
+    }
+
+    #[test]
+    fn opus_output_is_sample_exact_and_taggable() {
+        init();
+        let dir = std::env::temp_dir().join(format!("soulsucker-opus-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("tone.wav");
+        let opus = dir.join("tone.opus");
+        // Not a multiple of the 960-sample Opus frame, and a rate that needs
+        // resampling to Opus' 48 kHz.
+        let frames = 44_100 + 777;
+        write_tone_wav(&wav, 44_100, frames);
+
+        apply_opus(&wav, &opus, None).unwrap();
+
+        // Ogg + Opus layout: OpusHead and OpusTags each on their own page.
+        let bytes = fs::read(&opus).unwrap();
+        assert_eq!(&bytes[..4], b"OggS");
+        assert_eq!(&bytes[28..36], b"OpusHead");
+        let pre_skip = u64::from(u16::from_le_bytes([bytes[38], bytes[39]]));
+        assert!(pre_skip > 0);
+        assert_eq!(i16::from_le_bytes([bytes[44], bytes[45]]), 0, "output gain");
+        assert!(bytes.windows(8).any(|window| window == b"OpusTags"));
+
+        // The decoder trims the look-ahead and the padding: the length is the
+        // source's, resampled.
+        let (decoded, head) = decode_samples(&opus);
+        let expected = u64::from(frames) * 48_000 / 44_100;
+        assert!(
+            decoded.abs_diff(expected) <= 4,
+            "decoded {decoded} samples, expected about {expected}"
+        );
+        assert!(
+            head.iter().take(16).any(|&sample| sample.abs() > 1000),
+            "audio must start immediately"
+        );
+
+        // Our own reader agrees on the duration and format.
+        let duration = crate::audio::duration_secs(&opus).unwrap();
+        assert!(
+            (duration - frames as f64 / 44_100.0).abs() < 0.01,
+            "{duration}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opus_gain_is_applied_to_the_audio() {
+        init();
+        let dir = std::env::temp_dir().join(format!("soulsucker-opusgain-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("tone.wav");
+        let flac = dir.join("tone.flac");
+        write_tone_wav(&wav, 44_100, 44_100 * 3);
+        apply_flac(&wav, &flac, None).unwrap();
+        let before = measure_loudness(&flac).unwrap();
+
+        let plain = dir.join("plain.opus");
+        fs::rename(
+            process_file(&flac, AudioQuality::Opus, None).unwrap(),
+            &plain,
+        )
+        .unwrap();
+        let quieter = dir.join("quieter.opus");
+        fs::rename(
+            process_file(&flac, AudioQuality::Opus, Some(-6.0)).unwrap(),
+            &quieter,
+        )
+        .unwrap();
+
+        let plain = measure_loudness(&plain).unwrap();
+        let quieter = measure_loudness(&quieter).unwrap();
+        // Lossy coding and resampling move the reading a little.
+        assert!(
+            (plain.integrated - before.integrated).abs() < 0.5,
+            "{before:?} {plain:?}"
+        );
+        assert!(
+            (quieter.integrated - (plain.integrated - 6.0)).abs() < 0.3,
+            "{plain:?} -> {quieter:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opus_loudness_tags_use_r128_and_survive_later_tag_edits() {
+        use crate::audio::{self, TrackTags};
+        init();
+        let dir = std::env::temp_dir().join(format!("soulsucker-opustags-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("tone.wav");
+        let opus = dir.join("tone.opus");
+        write_tone_wav(&wav, 44_100, 44_100 * 2);
+        apply_opus(&wav, &opus, None).unwrap();
+
+        let tags = TrackTags {
+            title: "Song",
+            artist: "Artist",
+            track_artists: None,
+            album_artist: "Artist",
+            album: "Album",
+            date: Some("2001"),
+            track: 1,
+            track_total: 1,
+            disc: 1,
+            disc_total: 1,
+            release_mbid: "",
+            release_group_mbid: "",
+            recording_mbid: "",
+            track_mbid: "",
+            cover: None,
+            replay_gain: Some(ReplayGain {
+                track_gain_db: Some(-3.0),
+                track_peak: Some(0.5),
+                album_gain_db: Some(-2.0),
+                album_peak: Some(0.75),
+            }),
+        };
+        audio::write_tags(&opus, &tags).unwrap();
+
+        let comments = |path: &Path| {
+            use lofty::file::AudioFile;
+            let mut file = fs::File::open(path).unwrap();
+            let opus =
+                lofty::ogg::OpusFile::read_from(&mut file, lofty::config::ParseOptions::new())
+                    .unwrap();
+            opus.vorbis_comments()
+                .items()
+                .map(|(key, value)| (key.to_ascii_uppercase(), value.to_string()))
+                .collect::<Vec<_>>()
+        };
+        let get = |items: &[(String, String)], key: &str| {
+            items
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+        };
+        let items = comments(&opus);
+        // Q7.8, relative to -23 LUFS: players add the usual +5 dB, so the
+        // stored value is the wanted gain minus 5 dB.
+        assert_eq!(get(&items, "R128_TRACK_GAIN").as_deref(), Some("-2048"));
+        assert_eq!(get(&items, "R128_ALBUM_GAIN").as_deref(), Some("-1792"));
+        assert_eq!(
+            get(&items, "REPLAYGAIN_TRACK_PEAK").as_deref(),
+            Some("0.500000")
+        );
+        assert_eq!(get(&items, "TITLE").as_deref(), Some("Song"));
+        // RFC 7845: no ReplayGain *gain* fields in Opus.
+        assert!(get(&items, "REPLAYGAIN_TRACK_GAIN").is_none());
+        assert!(get(&items, "REPLAYGAIN_ALBUM_GAIN").is_none());
+        // The header's output gain is untouched.
+        let bytes = fs::read(&opus).unwrap();
+        assert_eq!(i16::from_le_bytes([bytes[44], bytes[45]]), 0);
+
+        // A later retag and a late cover keep the loudness tags.
+        let retag = TrackTags {
+            replay_gain: None,
+            title: "Song (retagged)",
+            ..tags
+        };
+        audio::write_tags(&opus, &retag).unwrap();
+        let mut jpeg = vec![0xff, 0xd8, 0xff, 0xe0];
+        jpeg.extend_from_slice(b"fake-cover");
+        audio::write_cover(&opus, &jpeg).unwrap();
+        let items = comments(&opus);
+        assert_eq!(get(&items, "TITLE").as_deref(), Some("Song (retagged)"));
+        assert_eq!(get(&items, "R128_TRACK_GAIN").as_deref(), Some("-2048"));
+        assert_eq!(get(&items, "R128_ALBUM_GAIN").as_deref(), Some("-1792"));
+        let tagged = lofty::read_from_path(&opus).unwrap();
+        let tag = lofty::file::TaggedFileExt::primary_tag(&tagged).unwrap();
+        assert_eq!(tag.pictures().len(), 1);
+        // And the file still plays to the end.
+        assert!(audio::duration_secs(&opus).unwrap() > 1.9);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flac_and_mp3_loudness_tags_are_standard_replaygain() {
+        use crate::audio::{self, TrackTags};
+        let flac = std::env::temp_dir().join(format!("soulsucker-rg-{}.flac", std::process::id()));
+        let mp3 = std::env::temp_dir().join(format!("soulsucker-rg-{}.mp3", std::process::id()));
+        fs::write(&flac, include_bytes!("../tests/fixtures/silence.flac")).unwrap();
+        fs::write(&mp3, include_bytes!("../tests/fixtures/silence.mp3")).unwrap();
+        let gain = ReplayGain {
+            track_gain_db: Some(-4.5),
+            track_peak: Some(0.98),
+            album_gain_db: Some(-3.25),
+            album_peak: Some(1.02),
+        };
+        for path in [&flac, &mp3] {
+            let tags = TrackTags {
+                title: "Song",
+                artist: "Artist",
+                track_artists: None,
+                album_artist: "Artist",
+                album: "Album",
+                date: None,
+                track: 1,
+                track_total: 1,
+                disc: 1,
+                disc_total: 1,
+                release_mbid: "",
+                release_group_mbid: "",
+                recording_mbid: "",
+                track_mbid: "",
+                cover: None,
+                replay_gain: Some(gain),
+            };
+            audio::write_tags(path, &tags).unwrap();
+            let tagged = lofty::read_from_path(path).unwrap();
+            let tag = lofty::file::TaggedFileExt::primary_tag(&tagged).unwrap();
+            use lofty::tag::ItemKey;
+            assert_eq!(
+                tag.get_string(ItemKey::ReplayGainTrackGain),
+                Some("-4.50 dB")
+            );
+            assert_eq!(
+                tag.get_string(ItemKey::ReplayGainAlbumGain),
+                Some("-3.25 dB")
+            );
+            assert_eq!(
+                tag.get_string(ItemKey::ReplayGainTrackPeak),
+                Some("0.980000")
+            );
+            assert_eq!(
+                tag.get_string(ItemKey::ReplayGainAlbumPeak),
+                Some("1.020000")
+            );
+            let _ = fs::remove_file(path);
+        }
     }
 }

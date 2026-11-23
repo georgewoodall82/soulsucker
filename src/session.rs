@@ -17,8 +17,9 @@ use std::time::{Duration, Instant};
 use soulseek_rs::{Client, ClientSettings, DownloadStatus, PeerAddress, SoulseekRs};
 
 use crate::acoustid::{self, VerifyResult, VerifySpec};
-use crate::audio::{self, TrackTags};
-use crate::config::{AudioQuality, Config};
+use crate::audio::{self, ReplayGain, TrackTags};
+use crate::config::{AudioQuality, Config, NormalizeMethod};
+use crate::cover;
 use crate::matcher::{
     self, AlbumSource, Candidate, CandidateOptions, RemoteFile, SearchHit, TrackQuery,
 };
@@ -123,6 +124,12 @@ pub struct DownloadOptions {
     pub disc_prefix_track_numbers: bool,
     pub album_artist_for_tracks: bool,
     pub normalize_loudness: bool,
+    /// Loudness the album should play at, in LUFS.
+    pub normalize_target_lufs: f64,
+    /// Whether the gain changes the audio or only becomes ReplayGain tags.
+    pub normalize_method: NormalizeMethod,
+    /// Save a 500x500 `cover.jpg` beside the tracks.
+    pub folder_cover: bool,
     pub audio_quality: AudioQuality,
 }
 
@@ -148,6 +155,9 @@ pub struct DownloadRequest {
     pub release_mbid: String,
     pub release_group_mbid: String,
     pub album_dir: PathBuf,
+    /// The tracks are loose files in the artist folder (a single), so the
+    /// folder does not belong to this release and gets no `cover.jpg`.
+    pub loose_files: bool,
     pub tracks: Vec<TrackMeta>,
     pub options: DownloadOptions,
     pub force: bool,
@@ -170,6 +180,9 @@ impl std::fmt::Debug for DownloadOptions {
             .field("disc_prefix_track_numbers", &self.disc_prefix_track_numbers)
             .field("album_artist_for_tracks", &self.album_artist_for_tracks)
             .field("normalize_loudness", &self.normalize_loudness)
+            .field("normalize_target_lufs", &self.normalize_target_lufs)
+            .field("normalize_method", &self.normalize_method)
+            .field("folder_cover", &self.folder_cover)
             .field("audio_quality", &self.audio_quality)
             .finish()
     }
@@ -234,8 +247,16 @@ enum SessionCommand {
     },
     CoverReady {
         job_id: u64,
-        result: Result<Option<musicbrainz::CoverArt>, String>,
+        result: Result<Option<FetchedCover>, String>,
     },
+}
+
+/// A downloaded cover, plus the `cover.jpg` made from it when that option is
+/// on (the resize happens in the cover worker, off the session loop).
+#[derive(Debug)]
+struct FetchedCover {
+    art: musicbrainz::CoverArt,
+    folder_jpeg: Option<Result<Vec<u8>, String>>,
 }
 
 pub struct SessionHandle {
@@ -749,6 +770,9 @@ impl Session {
         let release_mbid = request.release_mbid.clone();
         let cover_artist = request.artist.clone();
         let cover_album = request.album.clone();
+        let wants_folder_cover = request.options.folder_cover && !request.loose_files;
+        let folder_cover_missing = wants_folder_cover
+            && (request.force || !request.album_dir.join(cover::FOLDER_COVER_NAME).exists());
         let mut tracks: Vec<TrackState> = request
             .tracks
             .iter()
@@ -792,7 +816,10 @@ impl Session {
             source_mode: SourceMode::Mixed,
             peer_activity: HashMap::new(),
             album_gain: None,
+            replay_album: None,
             off_source_level: None,
+            folder_cover: None,
+            folder_cover_done: false,
             observed_secs: Vec::new(),
             pressings: None,
             pressing_search_running: false,
@@ -818,13 +845,23 @@ impl Session {
                 LogLevel::Success,
                 "All tracks were already on disk; nothing to download.",
             );
+            if folder_cover_missing {
+                // The tracks are there but the folder cover is not.
+                self.fetch_cover(job_id, cover_artist, cover_album, release_mbid, true);
+            }
             return;
         }
 
         let wanted_extras = album.job.options.max_concurrent.max(1) - 1;
         self.album = Some(album);
         self.set_wanted_extras(wanted_extras);
-        self.fetch_cover(job_id, cover_artist, cover_album, release_mbid);
+        self.fetch_cover(
+            job_id,
+            cover_artist,
+            cover_album,
+            release_mbid,
+            wants_folder_cover,
+        );
         self.begin_search();
     }
 
@@ -965,13 +1002,28 @@ impl Session {
         }
     }
 
-    fn fetch_cover(&self, job_id: u64, artist: String, album: String, release_mbid: String) {
+    fn fetch_cover(
+        &self,
+        job_id: u64,
+        artist: String,
+        album: String,
+        release_mbid: String,
+        folder_cover: bool,
+    ) {
         let tx = self.inner_tx.clone();
         let spawned = thread::Builder::new()
             .name("cover-art".to_string())
             .spawn(move || {
                 let result = musicbrainz::fetch_cover(&artist, &album, &release_mbid)
-                    .map_err(|err| err.to_string());
+                    .map_err(|err| err.to_string())
+                    .map(|art| {
+                        art.map(|art| {
+                            let folder_jpeg = folder_cover.then(|| {
+                                cover::folder_jpeg(&art.data).map_err(|err| format!("{err:#}"))
+                            });
+                            FetchedCover { art, folder_jpeg }
+                        })
+                    });
                 let _ = tx.send(SessionCommand::CoverReady { job_id, result });
             });
         if let Err(err) = spawned {
@@ -1680,7 +1732,7 @@ impl Session {
             let deadline = verification_deadline(
                 Instant::now(),
                 track.meta.expected_secs,
-                album.job.options.normalize_loudness || album.job.options.audio_quality.is_mp3(),
+                album.job.options.normalize_loudness || album.job.options.audio_quality.is_lossy(),
             );
             track.verifying = Some(VerifyingAttempt {
                 attempt_no,
@@ -1865,6 +1917,7 @@ impl Session {
                 note: result.note,
                 loudness,
                 from_album_source,
+                replay_gain: None,
                 deadline: None,
             };
             self.hold_for_album_gain(album, index, pending);
@@ -1876,6 +1929,7 @@ impl Session {
             normalized_path,
             verifying.staging,
             result.note,
+            None,
         );
     }
 
@@ -1918,6 +1972,7 @@ impl Session {
         normalized_path: PathBuf,
         staging: PathBuf,
         note: String,
+        replay_gain: Option<ReplayGain>,
     ) {
         let events = self.events.clone();
         let job_id = album.job.job_id;
@@ -1953,6 +2008,7 @@ impl Session {
             track.note = "existing file kept".to_string();
             let _ = events.send(SlskEvent::Track(track.update(job_id)));
             self.album = Some(album);
+            self.save_folder_cover();
             self.check_completion();
             return;
         }
@@ -1965,9 +2021,13 @@ impl Session {
         }
         track.downloaded = true;
 
-        if let Err(err) =
-            write_track_tags(&album.job, &track.meta, album.cover.as_deref(), &final_path)
-        {
+        if let Err(err) = write_track_tags(
+            &album.job,
+            &track.meta,
+            album.cover.as_deref(),
+            replay_gain,
+            &final_path,
+        ) {
             let _ = events.send(SlskEvent::Log(
                 LogLevel::Warn,
                 format!(
@@ -1996,6 +2056,7 @@ impl Session {
             commit_album_source(&mut album, &events);
         }
         self.album = Some(album);
+        self.save_folder_cover();
         self.check_completion();
     }
 
@@ -2189,7 +2250,9 @@ impl Session {
     }
 
     /// Once every track is verified (or has given up), work out one gain for
-    /// the album and apply it to each held track in a worker.
+    /// the album. Gain mode applies it to each held track in a worker;
+    /// ReplayGain mode leaves the audio alone and writes it as tags (the
+    /// worker then only converts, when the output format needs it).
     fn run_album_gain(&mut self) {
         let events = self.events.clone();
         let tx = self.inner_tx.clone();
@@ -2202,6 +2265,8 @@ impl Session {
         if !album_ready_for_gain(album) {
             return;
         }
+        let target = album.job.options.normalize_target_lufs;
+        let tags_only = album.job.options.normalize_method == NormalizeMethod::ReplayGain;
         let gain_db = match album.album_gain {
             Some(gain) => gain,
             None => {
@@ -2228,36 +2293,74 @@ impl Session {
                     .filter_map(|track| track.pending.as_ref())
                     .filter(|pending| !pending.from_album_source && pending.loudness.is_some())
                     .count();
-                let gain_db = match normalize::album_gain(&measured) {
-                    Some(gain) => {
-                        if split && off_source > 0 {
-                            album.off_source_level = Some(gain.integrated + gain.gain_db);
+                let gain_db = if tags_only {
+                    // Nothing is changed in the audio, so there is no gain to
+                    // apply; the album values only go into the tags.
+                    match normalize::album_loudness(&measured) {
+                        Some((integrated, true_peak)) => {
+                            album.replay_album = Some((integrated, true_peak));
+                            if split && off_source > 0 {
+                                let _ = events.send(SlskEvent::Log(
+                                    LogLevel::Info,
+                                    format!(
+                                        "{off_source} track(s) came from another source; their album gain follows their own level."
+                                    ),
+                                ));
+                            }
                             let _ = events.send(SlskEvent::Log(
                                 LogLevel::Info,
                                 format!(
-                                    "{off_source} track(s) came from another source; matching them to the album's level instead."
+                                    "Album loudness {:.1} LUFS, peak {:.1} dBTP over {} track(s): writing ReplayGain tags for {:.1} LUFS (album {:+.1} dB).",
+                                    integrated,
+                                    true_peak,
+                                    measured.len(),
+                                    target,
+                                    target - integrated
                                 ),
                             ));
                         }
-                        let _ = events.send(SlskEvent::Log(
-                            LogLevel::Info,
-                            format!(
-                                "Album loudness {:.1} LUFS, peak {:.1} dBTP over {} track(s): applying {:+.1} dB to every track.",
-                                gain.integrated,
-                                gain.true_peak,
-                                measured.len(),
-                                gain.gain_db
-                            ),
-                        ));
-                        gain.gain_db
+                        None => {
+                            let _ = events.send(SlskEvent::Log(
+                                LogLevel::Warn,
+                                "Could not measure the album's loudness; no ReplayGain tags written."
+                                    .to_string(),
+                            ));
+                        }
                     }
-                    None => {
-                        let _ = events.send(SlskEvent::Log(
-                            LogLevel::Warn,
-                            "Could not measure the album's loudness; saving tracks at their original level."
-                                .to_string(),
-                        ));
-                        0.0
+                    0.0
+                } else {
+                    match normalize::album_gain(&measured, target) {
+                        Some(gain) => {
+                            if split && off_source > 0 {
+                                album.off_source_level = Some(gain.integrated + gain.gain_db);
+                                let _ = events.send(SlskEvent::Log(
+                                    LogLevel::Info,
+                                    format!(
+                                        "{off_source} track(s) came from another source; matching them to the album's level instead."
+                                    ),
+                                ));
+                            }
+                            let _ = events.send(SlskEvent::Log(
+                                LogLevel::Info,
+                                format!(
+                                    "Album loudness {:.1} LUFS, peak {:.1} dBTP over {} track(s): applying {:+.1} dB to every track (target {:.1} LUFS).",
+                                    gain.integrated,
+                                    gain.true_peak,
+                                    measured.len(),
+                                    gain.gain_db,
+                                    target
+                                ),
+                            ));
+                            gain.gain_db
+                        }
+                        None => {
+                            let _ = events.send(SlskEvent::Log(
+                                LogLevel::Warn,
+                                "Could not measure the album's loudness; saving tracks at their original level."
+                                    .to_string(),
+                            ));
+                            0.0
+                        }
                     }
                 };
                 album.album_gain = Some(gain_db);
@@ -2269,6 +2372,7 @@ impl Session {
         let quality = album.job.options.audio_quality;
         let max = album.job.options.max_processing.max(1);
         let off_source_level = album.off_source_level;
+        let replay_album = album.replay_album;
         let mut running = processing_in_use(album);
         for (index, track) in album.tracks.iter_mut().enumerate() {
             if running >= max {
@@ -2281,17 +2385,43 @@ impl Session {
                 continue;
             }
             running += 1;
-            let matched = match (
-                pending.from_album_source,
-                off_source_level,
-                pending.loudness,
-            ) {
-                (false, Some(level), Some(loudness)) => {
-                    Some(normalize::matched_gain(&loudness, level))
-                }
-                _ => None,
+            let converts = normalize::needs_conversion(&pending.path, quality);
+            let (gain_db, label) = if tags_only {
+                // A track from another master has its own album gain: the
+                // album's would be wrong for it.
+                let album_values = if pending.from_album_source {
+                    replay_album
+                } else {
+                    pending
+                        .loudness
+                        .map(|loudness| (loudness.integrated, loudness.true_peak))
+                };
+                let tags = normalize::replay_gain(pending.loudness.as_ref(), album_values, target);
+                let label = match tags.track_gain_db {
+                    Some(gain) => format!("ReplayGain {gain:+.1} dB"),
+                    None => "no loudness measured".to_string(),
+                };
+                pending.replay_gain = Some(tags);
+                (0.0, label)
+            } else {
+                let matched = match (
+                    pending.from_album_source,
+                    off_source_level,
+                    pending.loudness,
+                ) {
+                    (false, Some(level), Some(loudness)) => {
+                        Some(normalize::matched_gain(&loudness, level))
+                    }
+                    _ => None,
+                };
+                let gain_db = matched.unwrap_or(gain_db);
+                let label = if matched.is_some() {
+                    "matched to album"
+                } else {
+                    "album gain"
+                };
+                (gain_db, format!("{label} {gain_db:+.1} dB"))
             };
-            let gain_db = matched.unwrap_or(gain_db);
             pending.deadline = Some(verification_deadline(
                 Instant::now(),
                 track.meta.expected_secs,
@@ -2323,15 +2453,10 @@ impl Session {
                 // Let the deadline check handle it on the next tick.
                 pending.deadline = Some(Instant::now());
             }
-            let label = if matched.is_some() {
-                "matched to album"
+            track.note = if converts {
+                format!("{label} → {}", quality.format_name())
             } else {
-                "album gain"
-            };
-            track.note = if normalize::needs_conversion(&pending.path, quality) {
-                format!("{label} {gain_db:+.1} dB → MP3")
-            } else {
-                format!("{label} {gain_db:+.1} dB")
+                label
             };
             let _ = events.send(SlskEvent::Track(track.update(job_id)));
         }
@@ -2364,14 +2489,21 @@ impl Session {
             return;
         };
         match result {
-            Ok(path) => self.finish_track(album, index, path, pending.staging, pending.note),
+            Ok(path) => self.finish_track(
+                album,
+                index,
+                path,
+                pending.staging,
+                pending.note,
+                pending.replay_gain,
+            ),
             Err(err) => self.album_gain_failed(album, index, pending, &err),
         }
     }
 
     /// Processing is best-effort: a file already in the right format is kept
-    /// at its original level; a FLAC that still needs MP3 conversion is
-    /// rejected so another source can be tried.
+    /// at its original level; a file that still needs converting is rejected
+    /// so another source can be tried.
     fn album_gain_failed(
         &mut self,
         album: AlbumState,
@@ -2389,9 +2521,16 @@ impl Session {
         if !normalize::needs_conversion(&pending.path, quality) {
             self.log(
                 LogLevel::Warn,
-                format!("{label}: album gain not applied ({reason}); saved unchanged"),
+                format!("{label}: loudness step failed ({reason}); saved unchanged"),
             );
-            self.finish_track(album, index, pending.path, pending.staging, pending.note);
+            self.finish_track(
+                album,
+                index,
+                pending.path,
+                pending.staging,
+                pending.note,
+                pending.replay_gain,
+            );
             return;
         }
         let _ = fs::remove_dir_all(&pending.staging);
@@ -2435,7 +2574,7 @@ impl Session {
         }
     }
 
-    fn cover_ready(&mut self, job_id: u64, result: Result<Option<musicbrainz::CoverArt>, String>) {
+    fn cover_ready(&mut self, job_id: u64, result: Result<Option<FetchedCover>, String>) {
         let mut messages = Vec::new();
         {
             let Some(album) = self.album.as_mut() else {
@@ -2445,9 +2584,18 @@ impl Session {
                 return;
             }
             match result {
-                Ok(Some(cover)) => {
-                    let source = cover.source.label();
-                    let cover = Arc::new(cover.data);
+                Ok(Some(fetched)) => {
+                    let FetchedCover { art, folder_jpeg } = fetched;
+                    match folder_jpeg {
+                        Some(Ok(jpeg)) => album.folder_cover = Some(Arc::new(jpeg)),
+                        Some(Err(err)) => messages.push((
+                            LogLevel::Warn,
+                            format!("Could not make {}: {err}", cover::FOLDER_COVER_NAME),
+                        )),
+                        None => {}
+                    }
+                    let source = art.source.label();
+                    let cover = Arc::new(art.data);
                     album.cover = Some(cover.clone());
                     let mut updated = 0;
                     let mut failed = 0;
@@ -2492,6 +2640,50 @@ impl Session {
         for (level, message) in messages {
             self.log(level, message);
         }
+        self.save_folder_cover();
+    }
+
+    /// Write `cover.jpg` into the album folder once both the image and the
+    /// folder (with at least one finished track in it) exist. An existing
+    /// `cover.jpg` is kept unless the album is being forced.
+    fn save_folder_cover(&mut self) {
+        let Some(album) = self.album.as_mut() else {
+            return;
+        };
+        if album.folder_cover_done || album.job.loose_files || !album.job.options.folder_cover {
+            return;
+        }
+        let Some(jpeg) = album.folder_cover.clone() else {
+            return;
+        };
+        let has_tracks = album
+            .tracks
+            .iter()
+            .any(|track| track.status == TrackStatus::Done);
+        if !has_tracks || !album.job.album_dir.is_dir() {
+            return;
+        }
+        album.folder_cover_done = true;
+        let dir = album.job.album_dir.clone();
+        let force = album.job.force;
+        let message = match cover::write_folder_cover(&dir, jpeg.as_slice(), force) {
+            Ok(cover::FolderCoverResult::Written) => (
+                LogLevel::Success,
+                format!("Saved {} in the album folder.", cover::FOLDER_COVER_NAME),
+            ),
+            Ok(cover::FolderCoverResult::Kept) => (
+                LogLevel::Info,
+                format!(
+                    "{} already exists; kept it (use --force to replace).",
+                    cover::FOLDER_COVER_NAME
+                ),
+            ),
+            Err(err) => (
+                LogLevel::Warn,
+                format!("Could not save {}: {err:#}", cover::FOLDER_COVER_NAME),
+            ),
+        };
+        self.log(message.0, message.1);
     }
 
     fn cancel_track(&mut self, job_id: u64, index: usize) {
@@ -2892,11 +3084,18 @@ struct AlbumState {
     /// The one gain applied to every track, once computed. Tracks finished
     /// later (a retry) reuse it so the album stays consistent.
     album_gain: Option<f64>,
+    /// ReplayGain mode: the album's loudness (LUFS) and loudest true peak
+    /// (dBTP), measured once like `album_gain`.
+    replay_album: Option<(f64, f64)>,
     /// Loudness (LUFS, after the album gain) that tracks from outside the
     /// chosen album copy are matched to. Another master of a song can be many
     /// dB louder, and one static gain would leave it sticking out and let its
     /// peak hold the whole album down. Set together with `album_gain`.
     off_source_level: Option<f64>,
+    /// The 500x500 `cover.jpg` for the album folder, once fetched.
+    folder_cover: Option<Arc<Vec<u8>>>,
+    /// `cover.jpg` was written (or deliberately kept); do not look again.
+    folder_cover_done: bool,
     /// Actual lengths of the chosen full-album copy's files, per track, from
     /// verification (including files rejected only on length).
     observed_secs: Vec<Option<f64>>,
@@ -3013,10 +3212,12 @@ fn retag_saved_tracks(album: &AlbumState, events: &Sender<SlskEvent>) {
         if track.status != TrackStatus::Done || !track.downloaded {
             continue;
         }
+        // Loudness tags written when the track was saved stay as they are.
         if let Err(err) = write_track_tags(
             &album.job,
             &track.meta,
             album.cover.as_deref(),
+            None,
             &track.meta.final_path,
         ) {
             let _ = events.send(SlskEvent::Log(
@@ -3041,6 +3242,8 @@ struct PendingAlbumGain {
     /// Whether the file is the chosen full-album copy's own file. Only those
     /// tracks share the album gain; see `AlbumState::off_source_level`.
     from_album_source: bool,
+    /// ReplayGain mode: the tags to write, set when the worker starts.
+    replay_gain: Option<ReplayGain>,
     /// Set when the gain worker starts.
     deadline: Option<Instant>,
 }
@@ -3259,6 +3462,7 @@ fn write_track_tags(
     job: &DownloadRequest,
     meta: &TrackMeta,
     cover: Option<&Vec<u8>>,
+    replay_gain: Option<ReplayGain>,
     path: &Path,
 ) -> anyhow::Result<()> {
     let date = (!job.date.trim().is_empty()).then_some(job.date.as_str());
@@ -3292,6 +3496,7 @@ fn write_track_tags(
         recording_mbid: &meta.recording_mbid,
         track_mbid: &meta.track_mbid,
         cover: cover.map(|cover| cover.as_slice()),
+        replay_gain,
     };
     audio::write_tags(path, &tags)
 }
@@ -3950,8 +4155,12 @@ mod tests {
                     disc_prefix_track_numbers: false,
                     album_artist_for_tracks: false,
                     normalize_loudness: false,
+                    normalize_target_lufs: -16.0,
+                    normalize_method: NormalizeMethod::Gain,
+                    folder_cover: false,
                     audio_quality: AudioQuality::Flac,
                 },
+                loose_files: false,
                 force: false,
             },
             phase: AlbumPhase::Downloading,
@@ -3972,7 +4181,10 @@ mod tests {
             source_mode: SourceMode::Mixed,
             peer_activity: HashMap::new(),
             album_gain: None,
+            replay_album: None,
             off_source_level: None,
+            folder_cover: None,
+            folder_cover_done: false,
             observed_secs: vec![None],
             pressings: None,
             pressing_search_running: false,
@@ -4301,6 +4513,7 @@ mod tests {
                 duration_secs: 180.0,
             }),
             from_album_source: true,
+            replay_gain: None,
             deadline: None,
         });
     }
@@ -4327,10 +4540,13 @@ mod tests {
         let (mut album, staging) = album_waiting_for_gain(AudioQuality::Flac);
         hold(&mut album.tracks[2], -10.0, &staging);
         album.tracks[2].pending.as_mut().unwrap().from_album_source = false;
-        let own_only = normalize::album_gain(&[
-            album.tracks[0].pending.as_ref().unwrap().loudness.unwrap(),
-            album.tracks[1].pending.as_ref().unwrap().loudness.unwrap(),
-        ])
+        let own_only = normalize::album_gain(
+            &[
+                album.tracks[0].pending.as_ref().unwrap().loudness.unwrap(),
+                album.tracks[1].pending.as_ref().unwrap().loudness.unwrap(),
+            ],
+            -16.0,
+        )
         .unwrap();
         let (mut session, _events) = offline_session(album);
         session.run_album_gain();
@@ -4700,10 +4916,13 @@ mod tests {
         session.album.as_mut().unwrap().tracks[2].status = TrackStatus::Failed;
         session.run_album_gain();
         let album = session.album.as_ref().unwrap();
-        let expected = normalize::album_gain(&[
-            album.tracks[0].pending.as_ref().unwrap().loudness.unwrap(),
-            album.tracks[1].pending.as_ref().unwrap().loudness.unwrap(),
-        ])
+        let expected = normalize::album_gain(
+            &[
+                album.tracks[0].pending.as_ref().unwrap().loudness.unwrap(),
+                album.tracks[1].pending.as_ref().unwrap().loudness.unwrap(),
+            ],
+            -16.0,
+        )
         .unwrap()
         .gain_db;
         assert_eq!(album.album_gain, Some(expected));
@@ -4719,6 +4938,128 @@ mod tests {
             })
             .count();
         assert_eq!(started, 1);
+    }
+
+    #[test]
+    fn replaygain_mode_writes_tags_for_the_target_and_leaves_the_audio_alone() {
+        let (mut album, staging) = album_waiting_for_gain(AudioQuality::Flac);
+        album.job.options.normalize_method = NormalizeMethod::ReplayGain;
+        album.job.options.normalize_target_lufs = -14.0;
+        album.job.options.max_processing = 8;
+        // The third track comes from another master of the song.
+        hold(&mut album.tracks[2], -10.0, &staging);
+        album.tracks[2].pending.as_mut().unwrap().from_album_source = false;
+        let (mut session, _events) = offline_session(album);
+
+        session.run_album_gain();
+
+        let album = session.album.as_ref().unwrap();
+        // No gain is baked into the audio.
+        assert_eq!(album.album_gain, Some(0.0));
+        let (album_integrated, _) = album.replay_album.unwrap();
+        let own = normalize::album_loudness(&[
+            album.tracks[0].pending.as_ref().unwrap().loudness.unwrap(),
+            album.tracks[1].pending.as_ref().unwrap().loudness.unwrap(),
+        ])
+        .unwrap();
+        assert!((album_integrated - own.0).abs() < 1e-9);
+
+        let first = album.tracks[0]
+            .pending
+            .as_ref()
+            .unwrap()
+            .replay_gain
+            .unwrap();
+        assert!((first.track_gain_db.unwrap() - (-14.0 - -20.0)).abs() < 1e-9);
+        assert!((first.album_gain_db.unwrap() - (-14.0 - own.0)).abs() < 1e-9);
+        // The off-source track's album gain follows its own level.
+        let third = album.tracks[2]
+            .pending
+            .as_ref()
+            .unwrap()
+            .replay_gain
+            .unwrap();
+        assert!((third.track_gain_db.unwrap() - (-14.0 - -10.0)).abs() < 1e-9);
+        assert_eq!(third.track_gain_db, third.album_gain_db);
+        assert!(album.off_source_level.is_none());
+        assert!(album.tracks[0].note.starts_with("ReplayGain +6.0 dB"));
+    }
+
+    #[test]
+    fn opus_mode_converts_flac_even_when_only_tagging() {
+        let (mut album, _) = album_waiting_for_gain(AudioQuality::Opus);
+        album.job.options.normalize_method = NormalizeMethod::ReplayGain;
+        let (session, _events) = offline_session(album);
+        let path = session.album.as_ref().unwrap().tracks[0]
+            .pending
+            .as_ref()
+            .unwrap()
+            .path
+            .clone();
+        assert!(normalize::needs_conversion(&path, AudioQuality::Opus));
+        assert!(normalize::source_compatible(&path, AudioQuality::Opus));
+    }
+
+    fn folder_cover_album(name: &str) -> (AlbumState, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "soulsucker-folder-cover-{}-{name}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (mut album, _, _) = album_after_search();
+        album.job.album_dir = dir.clone();
+        album.job.options.folder_cover = true;
+        album.folder_cover = Some(Arc::new(b"jpeg-bytes".to_vec()));
+        album.tracks[0].status = TrackStatus::Done;
+        (album, dir)
+    }
+
+    #[test]
+    fn the_folder_cover_is_saved_once_a_track_is_in_the_folder() {
+        let (mut album, dir) = folder_cover_album("saved");
+        album.tracks[0].status = TrackStatus::Downloading;
+        let (mut session, _events) = offline_session(album);
+        session.save_folder_cover();
+        assert!(!dir.join("cover.jpg").exists(), "no finished track yet");
+
+        session.album.as_mut().unwrap().tracks[0].status = TrackStatus::Done;
+        session.save_folder_cover();
+        assert_eq!(fs::read(dir.join("cover.jpg")).unwrap(), b"jpeg-bytes");
+        assert!(session.album.as_ref().unwrap().folder_cover_done);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_existing_folder_cover_is_kept_unless_forced() {
+        let (album, dir) = folder_cover_album("kept");
+        fs::write(dir.join("cover.jpg"), b"mine").unwrap();
+        let (mut session, _events) = offline_session(album);
+        session.save_folder_cover();
+        assert_eq!(fs::read(dir.join("cover.jpg")).unwrap(), b"mine");
+
+        let (mut album, _) = folder_cover_album("kept");
+        album.job.force = true;
+        let (mut session, _events) = offline_session(album);
+        session.save_folder_cover();
+        assert_eq!(fs::read(dir.join("cover.jpg")).unwrap(), b"jpeg-bytes");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn singles_and_a_disabled_option_get_no_folder_cover() {
+        let (mut album, dir) = folder_cover_album("single");
+        album.job.loose_files = true;
+        let (mut session, _events) = offline_session(album);
+        session.save_folder_cover();
+        assert!(!dir.join("cover.jpg").exists());
+
+        let (mut album, _) = folder_cover_album("single");
+        album.job.options.folder_cover = false;
+        let (mut session, _events) = offline_session(album);
+        session.save_folder_cover();
+        assert!(!dir.join("cover.jpg").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

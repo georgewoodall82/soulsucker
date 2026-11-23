@@ -20,7 +20,7 @@ cargo build --release
 cargo build --release --features ffmpeg-static
 ```
 
-- `ffmpeg-static` compiles FFmpeg from source and statically links it. Use it for release artifacts; it needs `git`, `make`, `nasm`, and a C compiler. The normal build links the system FFmpeg development libraries. MP3 encoding uses the bundled LAME source from `mp3lame-encoder`, so no system LAME library is needed.
+- `ffmpeg-static` compiles FFmpeg from source and statically links it. Use it for release artifacts; it needs `git`, `make`, `nasm`, and a C compiler. The normal build links the system FFmpeg development libraries. MP3 encoding uses the bundled LAME source from `mp3lame-encoder` and Opus encoding the bundled libopus source from `opus`/`opusic-sys` (built with `cmake`), so no system LAME or Opus library is needed.
 
 - Rust **1.91+**, edition **2024**.
 - FFmpeg **8.x** development libraries are required (`ffmpeg-devel` on Fedora, `libavcodec-dev libavformat-dev libavfilter-dev libavutil-dev libswresample-dev` on Debian/Ubuntu). `ffmpeg-next` links the system libraries.
@@ -44,7 +44,8 @@ cargo build --release --features ffmpeg-static
 │   ├── musicbrainz.rs   release search/ranking, release details, cover lookup
 │   ├── matcher.rs       local fuzzy matching and source selection
 │   ├── acoustid.rs      built-in Chromaprint + AcoustID verification
-│   ├── normalize.rs     EBU R128 album gain + FLAC/MP3 output
+│   ├── normalize.rs     EBU R128 album gain/ReplayGain values + FLAC/MP3/Opus output
+│   ├── cover.rs         500x500 folder cover.jpg (resize, JPEG, atomic write)
 │   ├── audio.rs         FLAC/MP3 inspection, metadata tagging, cover embedding
 │   ├── config.rs        TOML config, normalization, secure atomic saves
 │   ├── cli.rs           clap arguments and persistence semantics
@@ -95,7 +96,7 @@ Owns all UI state: `Screen`, `SearchView`, `TracksView`, `DownloadView`, `Settin
 Important patterns:
 
 - Screens: `Setup`, `Search`, `Tracks`, `Download`, `Settings`.
-- `TracksView::build` owns destination paths: album releases go to `<music_dir>/<Artist>/<Album>/`, while MusicBrainz release-group type `Single` is saved as loose files in `<music_dir>/<Artist>/`. The extension comes from `audio_quality` (`.flac` or `.mp3`). Changing this layout means changing `TracksView::build` and its path tests.
+- `TracksView::build` owns destination paths: album releases go to `<music_dir>/<Artist>/<Album>/`, while MusicBrainz release-group type `Single` is saved as loose files in `<music_dir>/<Artist>/`. The extension comes from `audio_quality` (`.flac`, `.mp3` or `.opus`). Changing this layout means changing `TracksView::build` and its path tests.
 - `UiEvent` includes a `generation`; ignore stale results when the generation no longer matches.
 - `App::run` drains events, renders, polls keys, then ticks. Don't do blocking work here.
 - MusicBrainz search/release requests are spawned as named threads.
@@ -104,6 +105,7 @@ Important patterns:
 - `pending_start` holds a download request while waiting for Soulseek login.
 - `cfg` is the runtime config (includes CLI overrides); `persisted_cfg` is what Settings edits and saves. Do not accidentally persist runtime-only CLI overrides.
 - Settings are edited through `SettingsForm`; saving validates and calls `config::save`, then may respawn the session if credentials/listener settings changed. Settings are grouped into **Account**, **Library**, **Downloading**, and **Advanced** tabs; `SettingKey::tab` decides placement.
+- `DownloadRequest::loose_files` marks singles (no `cover.jpg`: the folder is the artist's).
 - `DownloadRequest` snapshots download options at start. Changing settings mid-download does not affect the active album.
 
 ### `ui.rs`
@@ -131,7 +133,7 @@ Main flow:
 5. `poll_downloads` watches queue/stall/progress, rejects bad attempts, and queues completed files for verification.
 6. `begin_verification` removes the library download record, finds the staged non-`.part` file, and queues it (`queue_verification`); a worker verifies it once a processing slot is free. Duration and AcoustID checks always run before any normalization or conversion. With `normalize_loudness`, the worker only measures (`normalize::measure_loudness`) and returns the untouched staged file plus its `Loudness`. Without it, a FLAC that needs MP3 conversion is converted here (`process_file(.., None)`).
 7. `verified` either holds the track for the album gain (`hold_for_album_gain`: status stays `Verifying`, the staged file is kept in `TrackState::pending`) or calls `finish_track`, which promotes the file to its final name, writes MusicBrainz tags and cover art, and marks the track done. A conversion failure for a FLAC-to-MP3 track rejects that source and tries the next one.
-7a. Album gain: `run_album_gain` runs from `tick` (even without a Soulseek session) once `album_ready_for_gain` holds (every track is held or terminal). It computes `AlbumState::album_gain` once with `normalize::album_gain`, then starts `album-gain` workers (up to `max_processing`) running `process_file(.., Some(gain))`. Results arrive as `SessionCommand::AlbumGainDone` and are checked against `attempt_no`. `album_gain_failed` keeps an already-correct file at its original level, or rejects a FLAC that still needs MP3 conversion. `check_album_gain_deadlines` treats a hung worker as a failure. `fail_active_tracks(.., keep_verified = true)` (session loss, reconnect) keeps held tracks; cancelling drops them. Only a live transfer (`current` set, status `Downloading`) uses a `max_concurrent` download slot (`uses_download_slot`); a downloaded file waits as `TrackState::queued_check` and is checked by `run_verification_queue`, which together with the album-gain workers is limited by `max_processing` (`processing_in_use`). Counting checks or held tracks as downloads would stall the album.
+7a. Album gain (and ReplayGain mode): `run_album_gain` runs from `tick` (even without a Soulseek session) once `album_ready_for_gain` holds (every track is held or terminal). It computes `AlbumState::album_gain` once with `normalize::album_gain(.., target)`, then starts `album-gain` workers (up to `max_processing`) running `process_file(.., Some(gain))`. With `normalize_method = ReplayGain` no gain is applied (`album_gain` is set to 0 as the "computed" marker; the album's loudness lives in `AlbumState::replay_album`) and each `PendingAlbumGain::replay_gain` is computed with `normalize::replay_gain`; the worker then only converts when needed and `finish_track` writes the tags (a track from another master gets its own track gain as album gain). Results arrive as `SessionCommand::AlbumGainDone` and are checked against `attempt_no`. `album_gain_failed` keeps an already-correct file at its original level, or rejects a FLAC that still needs MP3 conversion. `check_album_gain_deadlines` treats a hung worker as a failure. `fail_active_tracks(.., keep_verified = true)` (session loss, reconnect) keeps held tracks; cancelling drops them. Only a live transfer (`current` set, status `Downloading`) uses a `max_concurrent` download slot (`uses_download_slot`); a downloaded file waits as `TrackState::queued_check` and is checked by `run_verification_queue`, which together with the album-gain workers is limited by `max_processing` (`processing_in_use`). Counting checks or held tracks as downloads would stall the album.
 7b. Parallel accounts: peers serve one transfer per username, so `Session::extras` holds `ExtraAccount` logins (`<username>1`, `<username>2`, …, same password; `extra_username`). Slot 0 is the main `client`, slot `n` is `extras[n-1]`. `start_album` sizes them (`set_wanted_extras(max_concurrent - 1)`); `manage_extras` (from `tick`) connects them in `soulseek-connect-N` workers once the main login is up, retries transient failures, marks auth rejections, and fails tracks on a lost extra. Search, cover and `forget_search` stay on the main client. Each `DownloadActive` records its `slot`; `free_slot` gives every live download its own account, `tracks_to_start` is capped by the number of connected slots, and `poll_downloads`/`cancel_transfer` talk to the owning client. `find_live_download` must be run against that slot's `get_all_downloads()`. Extras listen on `listen_port + slot` (falling back to any port).
 8. Failures go through `fail_attempt` and then `advance_after_failure`: next candidate, last-resort rounds, or `Failed`.
 9. `check_completion` fires when every track is `Done`, `Failed`, or `Cancelled`.
@@ -166,7 +168,7 @@ Album phases: `Searching`, `Downloading`, `Complete`.
 
 Turns Soulseek search hits into ranked per-track candidates.
 
-- In FLAC mode, filters non-FLAC, tiny/huge files, samples/previews/snippets, and bad durations.
+- In FLAC and Opus modes (Opus is encoded from FLAC), filters non-FLAC, tiny/huge files, samples/previews/snippets, and bad durations.
 - In MP3 320 mode, accepts FLAC as a fallback and only MP3 files identified as 320 kbps from Soulseek's bitrate attribute or size/duration (or an explicit `320` filename when attributes are missing). Low-bitrate MP3s are ignored.
 - Candidate ranking still puts match score first; equal score bands prefer MP3 over FLAC in MP3 mode, then free slots, peer speed, duration closeness and file size.
 - Scores title similarity, duration closeness, track/disc numbers, free slots, peer speed, and file size.
@@ -190,7 +192,7 @@ Turns Soulseek search hits into ranked per-track candidates.
 
 ### `audio.rs`
 
-- `duration_secs` accepts FLAC and MP3, requires a positive duration, and rejects a file whose actual format does not match its extension.
+- `duration_secs` accepts FLAC, MP3 and Opus (`.opus`), requires a positive duration, and rejects a file whose actual format does not match its extension.
 - `bitrate_kbps` reads the MP3 audio bitrate; MP3 320 mode uses it to reject mislabeled lossy sources after download.
 - `write_tags` overwrites canonical MusicBrainz fields and strips non-primary tag blocks (e.g. stray ID3v2/APE on FLAC, ID3v1/APE on MP3) so old source metadata cannot survive.
 - When a cover is supplied, all embedded pictures are replaced with it.
@@ -202,14 +204,21 @@ Turns Soulseek search hits into ranked per-track candidates.
 ### `normalize.rs`
 
 - `normalize_loudness` (opt-in) is **album-wide**: every track of an album gets one static gain. Per-track gain or `loudnorm`'s dynamic mode changes the level where tracks run into each other and breaks gapless albums; do not reintroduce it. In MP3 320 mode the album gain and any FLAC-to-MP3 conversion share one encode, so audio is encoded once.
-- Targets: **-16 LUFS** integrated, **-1.5 dBTP** true-peak ceiling. Keep these safe defaults unless the user asks otherwise. `album_gain` = min(target − album loudness, ceiling − loudest track peak), clamped to ±30 dB; album loudness is the duration-weighted energy mean of the per-track integrated values. No limiter. Exception: tracks whose file is not the chosen album copy's own (`PendingAlbumGain::from_album_source == false`, e.g. a fallback source after a length mismatch) are excluded from `album_gain` once at least two tracks are from the album copy, and each is instead given `normalize::matched_gain` to the album's post-gain level (`AlbumState::off_source_level`); another master can be many dB louder and would otherwise cap the whole album through its peak.
-- `measure_loudness` builds an `abuffer -> ebur128=peak=true:metadata=1` graph and reads `lavfi.r128.I` (last value = whole-track integrated loudness) and the loudest `lavfi.r128.true_peak` from the frame metadata. This is ~7x faster than `loudnorm`'s analysis pass with the same readings; do not go back to `loudnorm` for measuring. `process_file` applies the gain with a `volume=…dB:precision=double` filter (stateless, so joins stay seamless) and writes a temporary FLAC or 320 kbps MP3 beside the source.
+- Targets: the integrated target is the `normalize_target_lufs` setting (default **-16 LUFS**, clamped to -30…-6); the true-peak ceiling is a constant **-1.5 dBTP** that only applies when the gain is baked in. `album_gain` = min(target − album loudness, ceiling − loudest track peak), clamped to ±30 dB; album loudness is the duration-weighted energy mean of the per-track integrated values. No limiter. Exception: tracks whose file is not the chosen album copy's own (`PendingAlbumGain::from_album_source == false`, e.g. a fallback source after a length mismatch) are excluded from `album_gain` once at least two tracks are from the album copy, and each is instead given `normalize::matched_gain` to the album's post-gain level (`AlbumState::off_source_level`); another master can be many dB louder and would otherwise cap the whole album through its peak.
+- `measure_loudness` builds an `abuffer -> ebur128=peak=true:metadata=1` graph and reads `lavfi.r128.I` (last value = whole-track integrated loudness) and the loudest `lavfi.r128.true_peak` from the frame metadata. This is ~7x faster than `loudnorm`'s analysis pass with the same readings; do not go back to `loudnorm` for measuring. `process_file` applies the gain with a `volume=…dB:precision=double` filter (stateless, so joins stay seamless) and writes a temporary FLAC, 320 kbps MP3 or 128 kbps VBR Opus beside the source.
+- `normalize_method = ReplayGain` never changes the audio: `replay_gain` gives uncapped `target − loudness` gains (plus linear peaks) that `audio::write_tags` writes. FLAC uses `REPLAYGAIN_*` Vorbis comments, MP3 `TXXX` frames (both via lofty `ItemKey`s), Opus `R128_TRACK_GAIN`/`R128_ALBUM_GAIN` as Q7.8 integers with **5 dB subtracted** (RFC 7845 references -23 LUFS; Rockbox, foobar2000 and others add 5 dB to reach ReplayGain's -18, so the stored value is `target − loudness − 5`) plus `REPLAYGAIN_*_PEAK`. Opus never gets `REPLAYGAIN_*_GAIN` and the OpusHead output gain stays 0. lofty's generic `Tag` has no key for R128, so `write_opus_gain` edits the file's Vorbis comments through `OpusFile`; a later `write_tags`/`write_cover` through `TaggedFile` keeps them (`opus_loudness_tags_use_r128_and_survive_later_tag_edits`). Stale `REPLAYGAIN_*` tags from the source are dropped whenever tags are written.
 - MP3 encoding uses the bundled `mp3lame-encoder`/LAME library (LGPL) at 320 kbps CBR. Finish with `FlushGap` (`lame_encode_flush`), never `FlushNoGap`: the no-gap flush leaves the last buffered PCM unencoded and records zero end padding. LAME writes an all-zero placeholder as the first frame; `install_lame_tag` overwrites it with the finished LAME tag. Prepending the tag instead leaves a silent frame and breaks gapless trimming. `mp3_output_is_sample_exact_for_gapless_playback` guards both. FFmpeg still handles decoding, resampling, channel conversion, `ebur128` measurement and `volume`; high-resolution sources are resampled to 44.1/48 kHz and multichannel sources are downmixed to stereo.
+- Opus: `OpusSink` encodes 48 kHz float PCM in 20 ms frames with the bundled libopus (`opus` crate, 128 kbps, unconstrained VBR, music) and writes the Ogg stream itself with the `ogg` crate (OpusHead + empty OpusTags, then ~1 s pages). The encoder look-ahead is the pre-skip, the encoder keeps getting zero frames until `input + pre_skip` samples are out, and the last packet's granule position is exactly `pre_skip + input samples`, so decoders trim to the source length (checked by `opus_output_is_sample_exact_and_taggable`, and by opusinfo/opusdec by hand). Opus sources are never accepted (Soulseek has none): `source_compatible(Opus)` is FLAC only and `needs_conversion(Opus)` is always true.
 - FLAC output uses an explicit `aformat` stage and fixed encoder frame size; FLAC requires fixed-size frames. `encode_stream` counts encoded samples.
 - FFmpeg's FLAC muxer would store total samples through a zero-size side-data packet, but this FFmpeg build rejects it. `update_flac_total_samples` patches the 36-bit STREAMINFO field after muxing so duration and seeking work.
 - Normalization/processing is best-effort: on failure, keep an already-correct source and tag it; if a FLAC still needs MP3 conversion, reject the attempt. The source is never modified in place; the temp file is returned and promoted by the session thread.
 - Never run normalization or conversion on the UI or session loop. Measurement and conversion belong in the verification worker; the album gain runs in `album-gain` workers.
 - Set FFmpeg's log level to quiet: the TUI owns the terminal and FFmpeg must not write diagnostics to it.
+
+### `cover.rs`
+
+- `folder_jpeg` decodes the downloaded cover (JPEG/PNG via the `image` crate), scales it to fit 500x500 (Lanczos, aspect kept) and encodes a **baseline** JPEG (Rockbox-class decoders); `write_folder_cover` saves it atomically as `cover.jpg` and keeps an existing one unless asked to overwrite.
+- The resize runs in the `cover-art` worker (`FetchedCover`); `Session::save_folder_cover` writes the file once a finished track exists in the album folder. Singles (`DownloadRequest::loose_files`) are skipped. Keep the image work off the session loop.
 
 ### `update.rs`
 
@@ -223,7 +232,7 @@ Turns Soulseek search hits into ranked per-track candidates.
 
 - TOML config contains the Soulseek password and AcoustID key in plaintext. Use `config::save`; it validates, writes atomically, tightens permissions to `0600` on Unix, and handles replacement safely. Do not add a plain `fs::write` path.
 - `Config::normalize` clamps hand-edited/CLI values into usable ranges. Any new numeric setting needs a sensible normalize rule.
-- `audio_quality` is `"flac"` (default) or `"mp3_320"`; unknown hand-edited values fall back to FLAC rather than discarding the whole config.
+- `audio_quality` is `"flac"` (default), `"mp3_320"` or `"opus_128"`; unknown hand-edited values fall back to FLAC rather than discarding the whole config. `normalize_method` (`"gain"`/`"replaygain"`) falls back the same way; `normalize_target_lufs` is clamped to -30…-6 by `normalize`; `folder_cover` toggles `cover.jpg`.
 - `Config`'s `Debug` implementation redacts secrets. Keep it that way.
 - Config path: `SOULSUCKER_CONFIG` if set, otherwise the platform config dir from `directories::ProjectDirs` (normally `~/.config/soulsucker/config.toml`). `--config FILE` overrides for the run.
 
