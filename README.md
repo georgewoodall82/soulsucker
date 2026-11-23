@@ -234,7 +234,9 @@ soulsucker --no-fingerprint
    first: only the first needed track is downloaded from it and verified (step
    7). When it passes, every other track comes from that same folder; while
    that peer is busy sending other tracks, tracks waiting in its queue keep
-   waiting instead of timing out. When the check fails, the next full-album
+   waiting instead of timing out (this holds for any peer, also when tracks
+   are taken from different sources: a peer's queue is only slow because of
+   your own other downloads from it). When the check fails, the next full-album
    peer is checked the same way. Only when no full-album copy passes are
    tracks taken from the best source for each track individually. Tracks
    download one at a time by default (`max_concurrent`). Each attempt gets its
