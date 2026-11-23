@@ -5,6 +5,7 @@
 //! verified, optionally normalized/converted, tagged and moved to their final
 //! numbered names.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -789,7 +790,7 @@ impl Session {
             album_sources: Vec::new(),
             fallback: Vec::new(),
             source_mode: SourceMode::Mixed,
-            source_activity: None,
+            peer_activity: HashMap::new(),
             album_gain: None,
             off_source_level: None,
             observed_secs: Vec::new(),
@@ -1176,8 +1177,29 @@ impl Session {
             let job_id = album.job.job_id;
             let mut finished = Vec::new();
             let mut rejected: Vec<(usize, String)> = Vec::new();
-            let committed_user = album.committed_username().map(str::to_string);
-            let mut source_activity = album.source_activity;
+            let now = Instant::now();
+            // A peer that is busy sending us one of this album's tracks is not
+            // ignoring the others waiting in its queue; those only wait on our
+            // own transfers. Note this first so the order of the tracks does
+            // not matter.
+            for track in &album.tracks {
+                let Some(active) = track.current.as_ref() else {
+                    continue;
+                };
+                let busy = downloads
+                    .get(active.slot)
+                    .and_then(|list| find_live_download(list, &active.username, &active.path))
+                    .is_some_and(|download| {
+                        matches!(
+                            download.status,
+                            DownloadStatus::InProgress { .. } | DownloadStatus::Completed
+                        )
+                    });
+                if busy {
+                    album.peer_activity.insert(active.username.clone(), now);
+                }
+            }
+            let peer_activity = album.peer_activity.clone();
 
             for (index, track) in album.tracks.iter_mut().enumerate() {
                 let Some(active) = track.current.as_mut() else {
@@ -1193,8 +1215,6 @@ impl Session {
                     rejected.push((index, "transfer vanished".to_string()));
                     continue;
                 };
-                let now = Instant::now();
-                let from_committed = committed_user.as_deref() == Some(active.username.as_str());
                 match &download.status {
                     DownloadStatus::Queued => {
                         track.note = match download.queue_position {
@@ -1202,14 +1222,10 @@ impl Session {
                             Some(place) => format!("in peer queue · {place} ahead"),
                         };
                         track.speed = 0.0;
-                        // A peer that is busy sending us the album's other
-                        // tracks is not ignoring us; wait for it rather than
-                        // mixing in another rip.
-                        let waiting_since = if from_committed {
-                            source_activity.map_or(active.started, |at| at.max(active.started))
-                        } else {
-                            active.started
-                        };
+                        let waiting_since = queue_wait_started(
+                            active.started,
+                            peer_activity.get(&active.username).copied(),
+                        );
                         if now.duration_since(waiting_since) >= active.queue_patience {
                             rejected.push((
                                 index,
@@ -1233,9 +1249,6 @@ impl Session {
                         } else if *bytes_downloaded != active.last_bytes {
                             active.last_bytes = *bytes_downloaded;
                             active.last_progress = now;
-                            if from_committed {
-                                source_activity = Some(now);
-                            }
                         }
                         track.bytes_done = *bytes_downloaded;
                         track.total = (*total_bytes).max(track.total);
@@ -1250,12 +1263,7 @@ impl Session {
                             track.emit_if_due(&events, job_id);
                         }
                     }
-                    DownloadStatus::Completed => {
-                        if from_committed {
-                            source_activity = Some(now);
-                        }
-                        finished.push(index);
-                    }
+                    DownloadStatus::Completed => finished.push(index),
                     DownloadStatus::Failed(reason) => rejected.push((
                         index,
                         reason
@@ -1273,7 +1281,6 @@ impl Session {
                     }
                 }
             }
-            album.source_activity = source_activity;
             (finished, rejected)
         };
 
@@ -2878,8 +2885,10 @@ struct AlbumState {
     /// copy works out.
     fallback: Vec<Vec<Candidate>>,
     source_mode: SourceMode,
-    /// Last time the committed album source made progress for any track.
-    source_activity: Option<Instant>,
+    /// Last time each peer (by username) was sending us a track of this album.
+    /// A track waiting in a peer's queue is only waiting for our own other
+    /// downloads from that peer, so its queue timeout runs from this moment.
+    peer_activity: HashMap<String, Instant>,
     /// The one gain applied to every track, once computed. Tracks finished
     /// later (a retry) reuse it so the album stays consistent.
     album_gain: Option<f64>,
@@ -3063,18 +3072,6 @@ enum SourceMode {
     Mixed,
     Probing { source: usize, track: usize },
     Committed { source: usize },
-}
-
-impl AlbumState {
-    fn committed_username(&self) -> Option<&str> {
-        match self.source_mode {
-            SourceMode::Committed { source } => self
-                .album_sources
-                .get(source)
-                .map(|source| source.username.as_str()),
-            _ => None,
-        }
-    }
 }
 
 struct DownloadActive {
@@ -3309,7 +3306,7 @@ fn plan_sources(
     album.album_sources = album_sources;
     album.fallback = fallback;
     album.source_mode = SourceMode::Mixed;
-    album.source_activity = None;
+    album.peer_activity.clear();
     let job_id = album.job.job_id;
     let rounds = album.job.options.last_resort_rounds;
     let needed: Vec<usize> = album
@@ -3460,7 +3457,6 @@ fn commit_album_source(album: &mut AlbumState, events: &Sender<SlskEvent>) {
     };
     let job_id = album.job.job_id;
     album.source_mode = SourceMode::Committed { source };
-    album.source_activity = Some(Instant::now());
     for (index, track) in album.tracks.iter_mut().enumerate() {
         if index == probe || !waiting_for_sources(track) {
             continue;
@@ -3669,6 +3665,12 @@ fn staging_session_id() -> u64 {
             .map(|duration| duration.as_nanos() as u64)
             .unwrap_or(0)
     })
+}
+
+/// When a queued transfer's timeout starts counting: when it began, or later
+/// if the same peer was last seen sending us another track.
+fn queue_wait_started(started: Instant, peer_activity: Option<Instant>) -> Instant {
+    peer_activity.map_or(started, |at| at.max(started))
 }
 
 fn find_live_download<'a>(
@@ -3968,7 +3970,7 @@ mod tests {
             album_sources: Vec::new(),
             fallback: Vec::new(),
             source_mode: SourceMode::Mixed,
-            source_activity: None,
+            peer_activity: HashMap::new(),
             album_gain: None,
             off_source_level: None,
             observed_secs: vec![None],
@@ -4073,7 +4075,7 @@ mod tests {
         commit_album_source(&mut album, &tx);
 
         assert_eq!(album.source_mode, SourceMode::Committed { source: 0 });
-        assert_eq!(album.committed_username(), Some("first"));
+        assert_eq!(album.album_sources[0].username, "first");
         for track in &album.tracks[1..] {
             let users: Vec<&str> = track
                 .candidates
@@ -4561,6 +4563,18 @@ mod tests {
             attempt_no: 1,
         });
         assert!(tracks_to_start(&album, Instant::now(), usize::MAX).is_empty());
+    }
+
+    #[test]
+    fn queue_timeout_runs_from_the_peers_last_activity() {
+        let started = Instant::now();
+        let later = started + Duration::from_secs(30);
+        // No other transfer from this peer: the timeout counts from the start.
+        assert_eq!(queue_wait_started(started, None), started);
+        // The peer was sending us another track after this one was queued.
+        assert_eq!(queue_wait_started(started, Some(later)), later);
+        // Activity from before this attempt began does not shorten the wait.
+        assert_eq!(queue_wait_started(later, Some(started)), later);
     }
 
     #[test]
